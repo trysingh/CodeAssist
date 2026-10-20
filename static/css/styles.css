@@ -1,0 +1,32 @@
+/*
+CodeRAG Engine Dashboard - Custom Styles
+Complements Tailwind CSS with smooth transitions and custom scrollbars
+*/
+body {
+font-family: 'Inter', sans-serif;
+}
+
+code, pre {
+font-family: 'JetBrains Mono', monospace;
+}
+
+/* Custom Dark Scrollbar */
+::-webkit-scrollbar {
+width: 6px;
+height: 6px;
+}
+::-webkit-scrollbar-track {
+background: #0b0f19;
+}
+::-webkit-scrollbar-thumb {
+background: #1f2937;
+border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+background: #374151;
+}
+
+/* Sidebar Toggle Transition */
+aside {
+transition: width 0.3s cubic-bezier(0.4, 0, 0.2, 1), transform 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+}

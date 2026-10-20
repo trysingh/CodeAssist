@@ -1,0 +1,270 @@
+import hashlib
+import os
+import sys
+import time
+import orjson
+from pathlib import Path
+from typing import List, Tuple
+from config.settings import settings
+from models.database import DatabaseManager
+from models.schemas import JobStatus, RepoInfo
+from services.chunking.registry import ChunkingRegistry, parallel_chunk_files
+from services.vector_store import VectorStoreService
+from services.rag_graph import RAGWorkflowManager
+from services.notifier import notifier
+
+class EngineController:
+    """MVC Controller coordinating Repository Ingestion, Job Resumption, and Conversational RAG."""
+    
+    def __init__(self):
+        self.db = DatabaseManager()
+        self.vector_service = VectorStoreService()
+        self.rag_manager = RAGWorkflowManager(self.db, self.vector_service)
+
+    @staticmethod
+    def compute_repo_id(root_path: Path) -> str:
+        resolved = str(root_path.resolve())
+        return hashlib.sha1(resolved.encode("utf-8")).hexdigest()[:12]
+
+    @staticmethod
+    def compute_file_hash(file_path: Path) -> str:
+        hasher = hashlib.sha256()
+        with open(file_path, "rb") as f:
+            while chunk := f.read(65536):
+                hasher.update(chunk)
+        return hasher.hexdigest()
+
+    def is_excluded(self, fpath: Path, root_path: Path) -> bool:
+        """Checks if a file or folder matches Pydantic exclusion rules."""
+        rel_parts = fpath.relative_to(root_path).parts
+        
+        # Check excluded directories
+        for part in rel_parts:
+            if part in settings.exclude_dirs or part.startswith("."):
+                return True
+                
+        # Check file exclusion glob patterns
+        for pattern in settings.exclude_patterns:
+            if fpath.match(pattern):
+                return True
+                
+        return False
+
+    def scan_supported_files(self, root_path: Path) -> List[Path]:
+        supported_exts = set(ChunkingRegistry.supported_extensions())
+        matched_files: List[Path] = []
+        for dirpath, dirnames, filenames in os.walk(root_path):
+            # Prune excluded directories in-place during os.walk
+            dirnames[:] = [d for d in dirnames if d not in settings.exclude_dirs and not d.startswith(".")]
+            for fname in filenames:
+                fpath = Path(dirpath) / fname
+                if fpath.suffix.lower() in supported_exts and not self.is_excluded(fpath, root_path):
+                    matched_files.append(fpath)
+        return matched_files
+
+    async def restore_all_watchers(self):
+        """
+        Interactive startup prompt with a non-blocking 5-second timeout.
+        Automatically defaults to ALL repositories if no input is given.
+        """
+        from services.watcher_service import watcher_manager
+        from services.notifier import notifier
+        
+        repos = await self.list_ingested_repos()
+        if not repos:
+            return
+
+        sys.stdout.write("\n[CodeRAG Engine] Ingested Repositories:\n")
+        for idx, r in enumerate(repos, 1):
+            sys.stdout.write(f"  [{idx}] {r.title} (ID: {r.repo_id}) — Path: {r.root_path}\n")
+        
+        sys.stdout.write(
+            "\n[?] Would you like to watch ALL repositories or select specific ones?\n"
+            "    Enter space-separated numbers (e.g., '1 2') or wait 5s to watch ALL: "
+        )
+        sys.stdout.flush()
+
+        # Non-blocking Windows/Unix console input reader with 5s timeout
+        def get_input_with_timeout(timeout: float = 5.0) -> str:
+            start_t = time.time()
+            buffer = []
+            while time.time() - start_t < timeout:
+                if os.name == 'nt':
+                    import msvcrt
+                    if msvcrt.kbhit():
+                        char = msvcrt.getch()
+                        if char in (b'\r', b'\n'):
+                            sys.stdout.write('\n')
+                            sys.stdout.flush()
+                            return ''.join(b.decode('utf-8', errors='ignore') for b in buffer).strip()
+                        elif char == b'\x08': # Backspace
+                            if buffer:
+                                buffer.pop()
+                                sys.stdout.write('\b \b')
+                                sys.stdout.flush()
+                        else:
+                            buffer.append(char)
+                            sys.stdout.write(char.decode('utf-8', errors='ignore'))
+                            sys.stdout.flush()
+                else:
+                    import select
+                    rlist, _, _ = select.select([sys.stdin], [], [], 0.1)
+                    if rlist:
+                        return sys.stdin.readline().strip()
+                time.sleep(0.05)
+            raise TimeoutError()
+
+        selected_repos = repos
+        try:
+            user_input = get_input_with_timeout(5.0)
+            if user_input:
+                chosen = []
+                for part in user_input.split():
+                    if part.isdigit():
+                        i = int(part) - 1
+                        if 0 <= i < len(repos):
+                            chosen.append(repos[i])
+                if chosen:
+                    selected_repos = chosen
+                    sys.stdout.write(f"[INFO] Selected {len(selected_repos)} repository/repositories for monitoring.\n")
+                else:
+                    sys.stdout.write("[INFO] Invalid selection. Defaulting to ALL repositories.\n")
+            else:
+                sys.stdout.write("[INFO] No input detected. Defaulting to watching ALL repositories.\n")
+        except TimeoutError:
+            sys.stdout.write("\n[TIMEOUT] 5-second limit reached. Automatically defaulting to watching ALL repositories.\n")
+            sys.stdout.flush()
+
+        # Perform reconciliation and start live watchers
+        for repo in selected_repos:
+            root_path = Path(repo.root_path)
+            if repo.status.value != "COMPLETED" or not root_path.exists():
+                continue
+
+            notifier.notify("Syncing Repository", f"Checking for offline updates in '{repo.title}'...", level="INFO")
+            completed_hashes = await self.db.get_completed_file_hashes(repo.repo_id)
+            current_files = self.scan_supported_files(root_path)
+            
+            offline_updates_count = 0
+            for fpath in current_files:
+                rel_path = str(fpath.relative_to(root_path))
+                current_hash = self.compute_file_hash(fpath)
+                
+                if completed_hashes.get(rel_path) != current_hash:
+                    offline_updates_count += 1
+                    notifier.notify("Offline Change Detected", f"Catching up on modified file: {rel_path}")
+                    await self.incremental_reingest_file(repo.repo_id, root_path, rel_path)
+
+            if offline_updates_count > 0:
+                notifier.notify("Sync Complete", f"Caught up on {offline_updates_count} file(s) changed while offline.", level="SUCCESS")
+            else:
+                notifier.notify("Repo Up-to-Date", f"No offline changes detected for '{repo.title}'.", level="INFO")
+
+            watcher_manager.start_watching(repo.repo_id, str(root_path))
+
+    async def incremental_reingest_file(self, repo_id: str, root_path: Path, rel_path: str):
+        full_path = root_path / rel_path
+        if not full_path.exists() or self.is_excluded(full_path, root_path):
+            return
+
+        fhash = self.compute_file_hash(full_path)
+        completed_hashes = await self.db.get_completed_file_hashes(repo_id)
+
+        if completed_hashes.get(rel_path) == fhash:
+            return
+
+        notifier.notify("Code Change Detected", f"Re-chunking and refreshing vectors for: {rel_path}")
+
+        ext = full_path.suffix.lower()
+        content = full_path.read_text(encoding="utf-8", errors="replace")
+        
+        strategy = ChunkingRegistry.get_strategy(ext)
+        chunk_docs = strategy.chunk_file(repo_id, rel_path, fhash, content, settings.chunk_size, settings.chunk_overlap)
+
+        sqlite_rows = []
+        for ch in chunk_docs:
+            sqlite_rows.append((
+                ch.chunk_id, repo_id, rel_path, ch.metadata.chunk_index,
+                ch.metadata.prev_chunk_id, ch.metadata.next_chunk_id,
+                ch.metadata.sibling_group_id, ch.metadata.structural_context,
+                ch.content, orjson.dumps(ch.metadata.model_dump()).decode("utf-8")
+            ))
+
+        if chunk_docs:
+            self.vector_service.delete_chunks_by_file(repo_id, rel_path)
+            self.vector_service.embed_and_persist_chunks(repo_id, chunk_docs)
+            await self.db.save_chunks_batch(repo_id, sqlite_rows)
+
+        await self.db.record_file_job(repo_id, rel_path, fhash, JobStatus.COMPLETED)
+        
+        notifier.notify(
+            "Vectors Refreshed Successfully", 
+            f"'{rel_path}' successfully updated. Old vectors replaced with {len(chunk_docs)} new chunks.", 
+            level="SUCCESS"
+        )
+
+    async def ingest_repository(self, repo_root_str: str) -> RepoInfo:
+        await self.db.init_db()
+        root_path = Path(repo_root_str).resolve()
+        if not root_path.exists() or not root_path.is_dir():
+            raise FileNotFoundError(f"Repository root path does not exist: {root_path}")
+
+        repo_id = self.compute_repo_id(root_path)
+        title = root_path.name
+        all_files = self.scan_supported_files(root_path)
+        
+        await self.db.upsert_repo(repo_id, title, str(root_path), JobStatus.PROCESSING, len(all_files))
+        
+        completed_hashes = await self.db.get_completed_file_hashes(repo_id)
+        pending_tasks: List[Tuple[str, str, str, str, int, int]] = []
+        
+        for fpath in all_files:
+            rel_path = str(fpath.relative_to(root_path))
+            fhash = self.compute_file_hash(fpath)
+            if completed_hashes.get(rel_path) == fhash:
+                continue
+            await self.db.record_file_job(repo_id, rel_path, fhash, JobStatus.PROCESSING)
+            pending_tasks.append((repo_id, str(fpath), rel_path, fhash, settings.chunk_size, settings.chunk_overlap))
+
+        batch_size = settings.batch_size
+        for i in range(0, len(pending_tasks), batch_size):
+            batch_tasks = pending_tasks[i : i + batch_size]
+            chunked_results = parallel_chunk_files(batch_tasks, max_workers=settings.max_workers)
+            
+            batch_chunks_for_vector = []
+            sqlite_rows = []
+            
+            for rel_path, fhash, chunk_docs, err in chunked_results:
+                if err:
+                    await self.db.record_file_job(repo_id, rel_path, fhash, JobStatus.FAILED, err)
+                    continue
+                batch_chunks_for_vector.extend(chunk_docs)
+                for ch in chunk_docs:
+                    sqlite_rows.append((
+                        ch.chunk_id, repo_id, rel_path, ch.metadata.chunk_index,
+                        ch.metadata.prev_chunk_id, ch.metadata.next_chunk_id,
+                        ch.metadata.sibling_group_id, ch.metadata.structural_context,
+                        ch.content, orjson.dumps(ch.metadata.model_dump()).decode("utf-8")
+                    ))
+
+            if batch_chunks_for_vector:
+                self.vector_service.embed_and_persist_chunks(repo_id, batch_chunks_for_vector)
+                await self.db.save_chunks_batch(repo_id, sqlite_rows)
+                
+            for rel_path, fhash, chunk_docs, err in chunked_results:
+                if not err:
+                    await self.db.record_file_job(repo_id, rel_path, fhash, JobStatus.COMPLETED)
+
+        await self.db.update_repo_status(repo_id, JobStatus.COMPLETED)
+        return await self.db.get_repo(repo_id)
+
+    async def list_ingested_repos(self) -> List[RepoInfo]:
+        await self.db.init_db()
+        return await self.db.list_repos()
+
+    async def chat_with_repo(self, repo_id: str, thread_id: str, query: str) -> str:
+        await self.db.init_db()
+        repo = await self.db.get_repo(repo_id)
+        if not repo:
+            raise ValueError(f"Repository ID '{repo_id}' not found.")
+        return await self.rag_manager.invoke_chat(repo_id, thread_id, query)

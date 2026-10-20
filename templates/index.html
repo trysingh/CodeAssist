@@ -1,0 +1,494 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CodeRAG Engine Dashboard</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: {
+                extend: {
+                    colors: { darkBg: '#0b0f19', cardBg: '#111827', cardBorder: '#1f2937', accentBlue: '#3b82f6', successGreen: '#10b981' },
+                    fontFamily: { sans: ['Inter', 'system-ui', 'sans-serif'], mono: ['JetBrains Mono', 'ui-monospace', 'monospace'] }
+                }
+            }
+        }
+    </script>
+    <link
+        href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap"
+        rel="stylesheet">
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <link rel="stylesheet" href="/static/css/styles.css">
+    <style>
+        /* ---- Layout shell ---- */
+        #sidebar {
+            width: 14rem;
+            transition: width .2s ease;
+        }
+
+        #sidebar[data-collapsed="true"] {
+            width: 3.5rem;
+        }
+
+        #sidebar[data-collapsed="true"] .lbl {
+            display: none;
+        }
+
+        #sidebar[data-collapsed="true"] .nav-btn {
+            justify-content: center;
+            padding-left: 0;
+            padding-right: 0;
+        }
+
+        #sidebar[data-collapsed="true"] .nav-btn:hover::after,
+        #sidebar[data-collapsed="true"] .nav-btn:focus-visible::after {
+            content: attr(data-tip);
+            position: absolute;
+            left: calc(100% + 10px);
+            top: 50%;
+            transform: translateY(-50%);
+            background: #1e293b;
+            color: #e2e8f0;
+            border: 1px solid #334155;
+            padding: 4px 8px;
+            border-radius: 8px;
+            font-size: 12px;
+            white-space: nowrap;
+            z-index: 60;
+            pointer-events: none;
+        }
+
+        .nav-btn {
+            position: relative;
+            color: #94a3b8;
+        }
+
+        .nav-btn:hover {
+            color: #fff;
+            background: rgba(30, 41, 59, .7);
+        }
+
+        .nav-btn.active {
+            color: #fff;
+            background: rgba(59, 130, 246, .14);
+            box-shadow: inset 2px 0 0 #3b82f6;
+        }
+
+        #thread-panel[data-open="false"] {
+            display: none;
+        }
+
+        body.focus #sidebar,
+        body.focus #thread-panel {
+            display: none;
+        }
+
+        @media (max-width: 1023px) {
+            #sidebar {
+                position: fixed;
+                inset: 0 auto 0 0;
+                z-index: 40;
+                transform: translateX(-100%);
+                width: 14rem !important;
+                transition: transform .2s ease;
+            }
+
+            #sidebar[data-open="true"] {
+                transform: none;
+            }
+
+            #sidebar[data-collapsed="true"] .lbl {
+                display: inline;
+            }
+
+            #sidebar[data-collapsed="true"] .nav-btn {
+                justify-content: flex-start;
+                padding-left: .875rem;
+                padding-right: .875rem;
+            }
+
+            #thread-panel {
+                position: absolute;
+                inset: 0 auto 0 0;
+                z-index: 20;
+                box-shadow: 8px 0 24px rgba(0, 0, 0, .45);
+            }
+        }
+
+        /* ---- Details ---- */
+        .tab-content {
+            min-height: 0;
+        }
+
+        .thread-item.active {
+            background: rgba(59, 130, 246, .16);
+            color: #fff;
+        }
+
+        #conn-status[data-ok="true"] .dot {
+            background: #34d399;
+        }
+
+        #conn-status[data-ok="false"] .dot {
+            background: #f59e0b;
+        }
+
+        #logo-dot[data-ok="true"] {
+            background: #34d399;
+        }
+
+        #logo-dot[data-ok="false"] {
+            background: #f59e0b;
+        }
+
+        .think span {
+            width: 5px;
+            height: 5px;
+            border-radius: 9999px;
+            background: #60a5fa;
+            display: inline-block;
+            animation: bounce 1s infinite;
+        }
+
+        .think span:nth-child(2) {
+            animation-delay: .15s;
+        }
+
+        .think span:nth-child(3) {
+            animation-delay: .3s;
+        }
+
+        @keyframes bounce {
+
+            0%,
+            80%,
+            100% {
+                opacity: .25;
+                transform: translateY(0);
+            }
+
+            40% {
+                opacity: 1;
+                transform: translateY(-3px);
+            }
+        }
+
+        ::-webkit-scrollbar {
+            width: 10px;
+            height: 10px;
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: #1f2937;
+            border-radius: 9999px;
+            border: 2px solid transparent;
+            background-clip: content-box;
+        }
+
+        ::-webkit-scrollbar-thumb:hover {
+            background: #334155;
+            background-clip: content-box;
+            border: 2px solid transparent;
+        }
+
+        :focus-visible {
+            outline: 2px solid #3b82f6;
+            outline-offset: 2px;
+        }
+
+        @media (prefers-reduced-motion: reduce) {
+            * {
+                animation: none !important;
+                transition: none !important;
+            }
+        }
+
+        /* 1. Professional Code Block Styling */
+        #chat-col pre {
+            background-color: #0d1117 !important;
+            /* GitHub-style deep dark */
+            border: 1px solid #30363d !important;
+            /* Subtle border for definition */
+            border-radius: 8px;
+            padding: 12px 16px;
+            margin: 12px 0;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.2);
+            overflow-x: auto;
+        }
+
+        /* 2. Font & Color Optimization */
+        #chat-col code {
+            /* Use a high-quality mono stack */
+            font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace !important;
+            font-size: 0.675rem !important;
+            line-height: 1.6 !important;
+            color: #e6edf3 !important;
+            /* Off-white for reduced eye strain */
+            letter-spacing: -0.02em;
+        }
+
+        /* 3. Inline Code Styling (for words inside sentences) */
+        #chat-col p code {
+            background-color: rgba(59, 130, 246, 0.15) !important;
+            /* Subtle blue tint */
+            color: #7dd3fc !important;
+            /* Light blue text */
+            padding: 2px 5px;
+            border-radius: 4px;
+            font-size: 0.6rem;
+            border: 1px solid rgba(59, 130, 246, 0.2);
+        }
+    </style>
+</head>
+
+<body
+    class="bg-darkBg text-slate-100 h-[100dvh] overflow-hidden font-sans antialiased selection:bg-blue-500 selection:text-white">
+
+    <div id="toast-container" aria-live="polite"
+        class="fixed top-14 right-4 z-50 flex flex-col space-y-2 max-w-sm w-[calc(100%-2rem)] pointer-events-none">
+    </div>
+    <div id="scrim" class="hidden fixed inset-0 bg-black/60 z-30 lg:hidden" onclick="closeMobileNav()"></div>
+
+    <div class="flex h-full">
+        <!-- ============ NAV RAIL ============ -->
+        <aside id="sidebar" data-collapsed="false" data-open="false"
+            class="bg-cardBg border-r border-cardBorder flex flex-col shrink-0 z-20">
+            <div class="h-12 flex items-center gap-2.5 px-3 border-b border-cardBorder shrink-0">
+                <div class="relative w-8 h-8 rounded-lg bg-blue-600/20 border border-blue-500/30 flex items-center justify-center text-accentBlue shrink-0"
+                    title="CodeRAG Engine">
+                    <i data-lucide="cpu" class="w-4 h-4"></i>
+                    <span id="logo-dot" data-ok="true"
+                        class="absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 rounded-full border-2 border-cardBg"></span>
+                </div>
+                <div class="lbl leading-tight min-w-0">
+                    <div class="font-semibold text-sm text-white truncate">CodeRAG</div>
+                    <div class="text-[11px] text-slate-500 truncate">Engine dashboard</div>
+                </div>
+            </div>
+
+            <nav class="p-2 space-y-1 flex-1" aria-label="Main">
+                <button onclick="switchTab('chat')" id="nav-chat" data-tip="Chat (Alt+1)"
+                    class="nav-btn w-full flex items-center gap-3 px-3.5 py-2.5 rounded-lg text-sm font-medium transition-colors">
+                    <i data-lucide="message-square-code" class="w-4 h-4 shrink-0"></i><span class="lbl">Chat</span>
+                </button>
+                <button onclick="switchTab('repos')" id="nav-repos" data-tip="Repositories (Alt+2)"
+                    class="nav-btn w-full flex items-center gap-3 px-3.5 py-2.5 rounded-lg text-sm font-medium transition-colors">
+                    <i data-lucide="database" class="w-4 h-4 shrink-0"></i><span
+                        class="lbl flex-1 text-left">Repositories</span>
+                    <span id="nav-repo-count"
+                        class="lbl text-[11px] font-mono text-slate-400 bg-slate-800 rounded-md px-1.5 py-0.5">–</span>
+                </button>
+                <button onclick="switchTab('ingest')" id="nav-ingest" data-tip="Ingest (Alt+3)"
+                    class="nav-btn w-full flex items-center gap-3 px-3.5 py-2.5 rounded-lg text-sm font-medium transition-colors">
+                    <i data-lucide="folder-git-2" class="w-4 h-4 shrink-0"></i><span class="lbl">Ingest</span>
+                </button>
+                <button onclick="switchTab('telemetry')" id="nav-telemetry" data-tip="Telemetry (Alt+4)"
+                    class="nav-btn w-full flex items-center gap-3 px-3.5 py-2.5 rounded-lg text-sm font-medium transition-colors">
+                    <i data-lucide="activity" class="w-4 h-4 shrink-0"></i><span
+                        class="lbl flex-1 text-left">Telemetry</span>
+                    <span id="telemetry-badge"
+                        class="hidden text-[11px] font-mono text-white bg-blue-600 rounded-full px-1.5 min-w-[1.25rem] text-center"></span>
+                </button>
+            </nav>
+
+            <div class="p-2 border-t border-cardBorder space-y-1 shrink-0">
+                <!-- <div class="flex items-center gap-2 px-2.5 py-1.5 text-xs text-slate-400" title="Ollama model">
+                    <i data-lucide="server" class="w-4 h-4 shrink-0 mx-auto lg:mx-0"></i>
+                    <span class="lbl flex-1">Ollama</span><span class="lbl font-mono text-slate-200">llama3.1</span>
+                </div> -->
+                <button onclick="toggleSidebar()" data-tip="Expand / collapse (Alt+B)"
+                    class="nav-btn hidden lg:flex w-full items-center gap-3 px-3.5 py-2 rounded-lg text-xs transition-colors">
+                    <i data-lucide="panel-left" class="w-4 h-4 shrink-0"></i><span class="lbl">Collapse</span>
+                </button>
+            </div>
+        </aside>
+
+        <!-- ============ MAIN ============ -->
+        <main class="flex-1 flex flex-col min-w-0 min-h-0">
+            <header class="h-12 bg-cardBg border-b border-cardBorder flex items-center gap-2 px-3 shrink-0 z-10">
+                <button onclick="openMobileNav()"
+                    class="lg:hidden p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800"
+                    aria-label="Open menu"><i data-lucide="menu" class="w-5 h-5"></i></button>
+                <h2 id="current-tab-title" class="text-sm font-semibold text-white truncate hidden">Chat</h2>
+
+                <!-- chat context lives in the top bar so the chat canvas keeps every pixel -->
+                <div id="chat-ctx" class="hidden items-center gap-2 min-w-0 flex-1">
+                    <button onclick="toggleThreads()" id="threads-btn"
+                        class="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 shrink-0"
+                        title="Threads (Alt+T)" aria-label="Toggle threads panel"><i data-lucide="messages-square"
+                            class="w-4 h-4"></i></button>
+                    <select id="chat-repo-select" onchange="onRepoChanged()" aria-label="Repository"
+                        class="bg-slate-900 border border-cardBorder text-xs text-white rounded-lg px-2.5 py-1.5 font-mono max-w-[45%] sm:max-w-xs truncate focus:outline-none focus:border-blue-500">
+                        <option value="">Select repository</option>
+                    </select>
+                    <span id="active-thread-badge" class="text-xs text-slate-400 truncate hidden sm:block">No thread
+                        selected</span>
+                </div>
+
+                <div class="ml-auto flex items-center gap-1.5 shrink-0">
+                    <div id="conn-status" data-ok="true"
+                        class="hidden sm:flex items-center gap-1.5 text-xs text-slate-400 px-2 py-1 rounded-lg"
+                        title="Notification stream">
+                        <span class="dot w-1.5 h-1.5 rounded-full"></span><span id="conn-label">Live</span>
+                    </div>
+                    <button id="focus-btn" onclick="toggleFocus()"
+                        class="hidden lg:block p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800"
+                        title="Focus mode (Alt+F, Esc to exit)" aria-label="Toggle focus mode"><i
+                            data-lucide="maximize-2" class="w-4 h-4"></i></button>
+                </div>
+            </header>
+
+            <div class="flex-1 min-h-0 relative bg-darkBg">
+                <!-- TAB: CHAT (full-bleed) -->
+                <section id="tab-chat" class="tab-content hidden h-full">
+                    <div class="flex h-full relative">
+                        <div id="thread-panel" data-open="true"
+                            class="w-60 bg-cardBg/70 border-r border-cardBorder flex flex-col shrink-0">
+                            <div class="p-2.5">
+                                <button onclick="toggleNewThreadForm()"
+                                    class="w-full flex items-center justify-center gap-1.5 py-2 rounded-lg bg-blue-600/15 hover:bg-blue-600/25 text-blue-300 text-xs font-medium border border-blue-500/25 transition-colors">
+                                    <i data-lucide="plus" class="w-3.5 h-3.5"></i>New chat
+                                </button>
+                            </div>
+                            <div id="new-thread-box" class="hidden px-2.5 pb-2.5 space-y-2">
+                                <input type="text" id="new-thread-title-input" placeholder="Thread title"
+                                    aria-label="Thread title"
+                                    onkeydown="if(event.key==='Enter')submitNewThread();if(event.key==='Escape')toggleNewThreadForm()"
+                                    class="w-full bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-white focus:outline-none focus:border-blue-500">
+                                <div class="flex justify-end gap-1.5">
+                                    <button onclick="toggleNewThreadForm()"
+                                        class="px-2 py-1 text-[11px] text-slate-400 hover:text-white">Cancel</button>
+                                    <button onclick="submitNewThread()"
+                                        class="px-2.5 py-1 bg-blue-600 hover:bg-blue-500 text-white rounded-lg text-[11px] font-medium">Create</button>
+                                </div>
+                            </div>
+                            <div id="thread-list" class="flex-1 overflow-y-auto px-2 pb-2 space-y-0.5"></div>
+                        </div>
+
+                        <div class="flex-1 min-w-0 flex flex-col relative">
+                            <div id="chat-messages" class="flex-1 overflow-y-auto scroll-smooth">
+                                <div id="chat-col" class="max-w-3xl mx-auto w-full px-4 py-6 space-y-6"></div>
+                            </div>
+                            <button id="jump-btn" onclick="scrollDown(true)"
+                                class="hidden absolute bottom-28 left-1/2 -translate-x-1/2 z-10 items-center gap-1.5 bg-slate-800 hover:bg-slate-700 border border-slate-600 text-xs text-slate-200 rounded-full px-3 py-1.5 shadow-lg"
+                                aria-label="Jump to latest">
+                                <i data-lucide="arrow-down" class="w-3.5 h-3.5"></i>Latest
+                            </button>
+                            <div class="px-4 pb-3 pt-1 shrink-0">
+                                <form id="chat-form" onsubmit="sendChatMessage(event)"
+                                    class="max-w-3xl mx-auto flex items-end gap-2 bg-cardBg border border-cardBorder focus-within:border-blue-500/70 rounded-2xl p-2 transition-colors">
+                                    <textarea id="chat-input-query" rows="1"
+                                        placeholder="Ask anything about the codebase" aria-label="Message"
+                                        class="flex-1 bg-transparent resize-none px-2.5 py-2 text-sm text-white placeholder-slate-500 focus:outline-none max-h-52 disabled:cursor-not-allowed"></textarea>
+                                    <button id="send-btn" type="submit"
+                                        class="shrink-0 w-9 h-9 rounded-xl bg-blue-600 hover:bg-blue-500 disabled:bg-slate-800 disabled:text-slate-600 text-white flex items-center justify-center transition-colors"
+                                        aria-label="Send">
+                                        <i data-lucide="arrow-up" class="w-4 h-4"></i>
+                                    </button>
+                                </form>
+                                <p class="max-w-3xl mx-auto text-[11px] text-slate-600 mt-1.5 px-2 hidden sm:block">
+                                    Enter to send · Shift+Enter for a new line · / to focus</p>
+                            </div>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- TAB: REPOSITORIES -->
+                <section id="tab-repos" class="tab-content hidden h-full overflow-y-auto p-4 md:p-6">
+                    <div class="max-w-6xl mx-auto space-y-4">
+                        <div class="flex flex-wrap gap-3 justify-between items-center">
+                            <h3 class="text-lg font-semibold text-white">Ingested repositories</h3>
+                            <div class="flex items-center gap-2">
+                                <input id="repo-filter" oninput="renderRepos()" placeholder="Filter repositories"
+                                    aria-label="Filter repositories"
+                                    class="bg-slate-900 border border-cardBorder rounded-xl px-3 py-2 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-blue-500 w-48">
+                                <button onclick="loadRepositories()"
+                                    class="bg-slate-800 hover:bg-slate-700 text-slate-200 px-3.5 py-2 rounded-xl text-xs font-medium flex items-center gap-2 border border-slate-700">
+                                    <i data-lucide="rotate-cw" class="w-3.5 h-3.5"></i>Refresh
+                                </button>
+                            </div>
+                        </div>
+                        <div class="bg-cardBg border border-cardBorder rounded-2xl overflow-x-auto">
+                            <table class="w-full text-left border-collapse min-w-[640px]">
+                                <thead>
+                                    <tr
+                                        class="bg-slate-900/60 border-b border-cardBorder text-xs font-medium text-slate-400">
+                                        <th class="py-3 px-5">Repository</th>
+                                        <th class="py-3 px-5">Status</th>
+                                        <th class="py-3 px-5">Files</th>
+                                        <th class="py-3 px-5">Chunks</th>
+                                        <th class="py-3 px-5">Root path</th>
+                                        <th class="py-3 px-5 text-right">Actions</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="repo-table-body" class="divide-y divide-cardBorder text-sm"></tbody>
+                            </table>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- TAB: INGEST -->
+                <section id="tab-ingest" class="tab-content hidden h-full overflow-y-auto p-4 md:p-6">
+                    <div class="max-w-3xl mx-auto bg-cardBg border border-cardBorder rounded-2xl p-6">
+                        <div class="flex items-center gap-3 mb-5">
+                            <div class="p-2.5 rounded-xl bg-blue-500/10 text-blue-400 border border-blue-500/20"><i
+                                    data-lucide="folder-input" class="w-5 h-5"></i></div>
+                            <div>
+                                <h3 class="text-base font-semibold text-white">Ingest a repository</h3>
+                                <p class="text-xs text-slate-400">Same as <code
+                                        class="text-blue-400 font-mono">python engine.py ingest --repo &lt;path&gt;</code>
+                                </p>
+                            </div>
+                        </div>
+                        <label for="ingest-repo-path" class="block text-xs font-medium text-slate-300 mb-1.5">Absolute
+                            repository path</label>
+                        <div class="flex flex-col sm:flex-row gap-3">
+                            <input type="text" id="ingest-repo-path" placeholder="C:\Projects\my-code-repo"
+                                autocomplete="off" onkeydown="if(event.key==='Enter')triggerIngestion()"
+                                class="flex-1 bg-slate-900 border border-cardBorder rounded-xl px-4 py-2.5 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-blue-500 font-mono">
+                            <button id="ingest-btn" onclick="triggerIngestion()"
+                                class="bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white font-medium px-6 py-2.5 rounded-xl text-sm transition-colors flex items-center justify-center gap-2">
+                                <i data-lucide="play" class="w-4 h-4"></i>Start ingest
+                            </button>
+                        </div>
+                        <div id="recent-paths" class="flex flex-wrap gap-2 mt-3"></div>
+                        <div id="ingest-progress-card"
+                            class="hidden mt-6 bg-slate-900/80 border border-slate-800 rounded-xl p-5 space-y-3">
+                            <div class="flex justify-between items-center text-xs text-slate-400">
+                                <span class="font-medium text-blue-400">Queuing ingestion</span>
+                                <span id="ingest-timer" class="font-mono">0.0s</span>
+                            </div>
+                            <div class="w-full bg-slate-800 rounded-full h-1.5 overflow-hidden">
+                                <div class="bg-blue-500 h-1.5 rounded-full w-full animate-pulse"></div>
+                            </div>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- TAB: TELEMETRY -->
+                <section id="tab-telemetry" class="tab-content hidden h-full flex-col p-4 md:p-6 gap-3">
+                    <div class="max-w-5xl mx-auto w-full flex justify-between items-center">
+                        <h3 class="text-lg font-semibold text-white">Live telemetry</h3>
+                        <div class="flex gap-2">
+                            <button onclick="copyConsole()"
+                                class="bg-slate-800 hover:bg-slate-700 text-slate-300 px-3 py-1.5 rounded-xl text-xs">Copy</button>
+                            <button onclick="clearConsole()"
+                                class="bg-slate-800 hover:bg-slate-700 text-slate-300 px-3 py-1.5 rounded-xl text-xs">Clear</button>
+                        </div>
+                    </div>
+                    <div id="telemetry-console"
+                        class="max-w-5xl mx-auto w-full flex-1 min-h-0 border border-cardBorder rounded-2xl p-4 font-mono text-xs overflow-y-auto space-y-1.5 bg-[#080b12]">
+                        <div class="text-slate-500">[System] Telemetry console active...</div>
+                    </div>
+                </section>
+            </div>
+        </main>
+    </div>
+
+    <script src="/static/js/app.js"></script>
+</body>
+
+</html>
