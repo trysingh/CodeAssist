@@ -13,6 +13,10 @@ from services.vector_store import VectorStoreService
 from services.rag_graph import RAGWorkflowManager
 from services.attachment_service import AttachmentService
 from services.notifier import notifier
+from services.repo_store import RepoStore
+from services.repo_change import RepoChangeService, ChangeResult
+from services.intent_router import route_intent
+from services.patch_service import make_diff
 
 class EngineController:
     """MVC Controller coordinating Repository Ingestion, Job Resumption, and Conversational RAG."""
@@ -22,6 +26,8 @@ class EngineController:
         self.vector_service = VectorStoreService()
         self.attachments = AttachmentService(self.vector_service)
         self.rag_manager = RAGWorkflowManager(self.db, self.vector_service, self.attachments)
+        self.repo_store = RepoStore()
+        self.change_service = RepoChangeService(self.db, self.vector_service, self.repo_store)
 
     @staticmethod
     def compute_repo_id(root_path: Path) -> str:
@@ -164,6 +170,40 @@ class EngineController:
 
             watcher_manager.start_watching(repo.repo_id, str(root_path))
 
+    async def snapshot_raw_files(self, repo_id: str, root_path: Path) -> dict:
+        """Persist verbatim copies of every non-excluded text file (rev 0). Cheap: unchanged files are skipped."""
+        kept, written, skipped, shadowed, batch = set(), 0, 0, [], []
+
+        async def flush():
+            nonlocal written, skipped, batch
+            if not batch:
+                return
+            out = await self.repo_store.upsert_base_files(repo_id, batch)
+            kept.update(out["written"]); kept.update(out["unchanged"])
+            written += len(out["written"]); skipped += len(out["skipped"]); shadowed.extend(out["shadowed"])
+            batch = []
+
+        for dirpath, dirnames, filenames in os.walk(root_path):
+            dirnames[:] = [d for d in dirnames if d not in settings.exclude_dirs and not d.startswith(".")]
+            for fname in filenames:
+                fpath = Path(dirpath) / fname
+                if self.is_excluded(fpath, root_path):
+                    continue
+                try:
+                    batch.append((fpath.relative_to(root_path).as_posix(), fpath.read_bytes()))
+                except OSError:
+                    continue
+                if len(batch) >= 200:
+                    await flush()
+        await flush()
+        pruned = await self.repo_store.prune_base(repo_id, kept)
+        sys.stdout.write(f"[RAW STORE] repo={repo_id} stored={len(kept)} updated={written} skipped={skipped} pruned={pruned}\n")
+        if shadowed:
+            notifier.notify("Pending revision is stale",
+                            f"{len(shadowed)} file(s) changed on disk under a proposed revision (e.g. {shadowed[0]}). Revert or request the change again.",
+                            level="WARNING")
+        return {"stored": len(kept), "updated": written, "skipped": skipped}
+
     async def incremental_reingest_file(self, repo_id: str, root_path: Path, rel_path: str):
         full_path = root_path / rel_path
         if not full_path.exists() or self.is_excluded(full_path, root_path):
@@ -179,6 +219,12 @@ class EngineController:
 
         ext = full_path.suffix.lower()
         content = full_path.read_text(encoding="utf-8", errors="replace")
+
+        raw = await self.repo_store.upsert_base_files(repo_id, [(rel_path.replace("\\", "/"), full_path.read_bytes())])
+        if raw["shadowed"]:
+            notifier.notify("Pending revision is stale",
+                            f"'{rel_path}' changed on disk while a proposed revision overrides it. Revert or request the change again.",
+                            level="WARNING")
         
         strategy = ChunkingRegistry.get_strategy(ext)
         chunk_docs = strategy.chunk_file(repo_id, rel_path, fhash, content, settings.chunk_size, settings.chunk_overlap)
@@ -216,6 +262,7 @@ class EngineController:
         all_files = self.scan_supported_files(root_path)
         
         await self.db.upsert_repo(repo_id, title, str(root_path), JobStatus.PROCESSING, len(all_files))
+        await self.snapshot_raw_files(repo_id, root_path)
         
         completed_hashes = await self.db.get_completed_file_hashes(repo_id)
         pending_tasks: List[Tuple[str, str, str, str, int, int]] = []
@@ -269,7 +316,34 @@ class EngineController:
         repo = await self.db.get_repo(repo_id)
         if not repo:
             raise ValueError(f"Repository ID '{repo_id}' not found.")
-        return await self.rag_manager.invoke_chat(repo_id, thread_id, query)
+        decision = await route_intent(query, repo_id=repo_id)
+        if decision.intent == "change":
+            return (await self.propose_change(repo_id, decision.query)).to_markdown()
+        return await self.rag_manager.invoke_chat(repo_id, thread_id, decision.query)
+
+    async def propose_change(self, repo_id: str, request: str, base_rev: Optional[int] = None) -> ChangeResult:
+        await self.db.init_db()
+        if not await self.db.get_repo(repo_id):
+            raise ValueError(f"Repository ID '{repo_id}' not found.")
+        return await self.change_service.run(repo_id, request, base_rev)
+
+    async def list_revisions(self, repo_id: str) -> list:
+        return await self.repo_store.list_revisions(repo_id)
+
+    async def revision_diff(self, repo_id: str, rev: int) -> Optional[str]:
+        if rev < 1 or not await self.repo_store.get_revision(repo_id, rev):
+            return None
+        changed = await self.repo_store.changed_files(repo_id, rev)
+        return "\n".join(make_diff(p, b, a) for p, (b, a) in changed.items())
+
+    async def revision_zip(self, repo_id: str, rev: int) -> Optional[bytes]:
+        diff = await self.revision_diff(repo_id, rev)
+        if diff is None:
+            return None
+        return await self.repo_store.export_zip(repo_id, rev, extra={"changes.diff": diff.encode("utf-8")})
+
+    async def revert_revision(self, repo_id: str, to_rev: int) -> int:
+        return await self.repo_store.revert_to(repo_id, to_rev)
 
     async def prepare_attachments(self, files: List[Tuple[str, str, bytes]]) -> List[dict]:
         """Extract text (OCR for images) from (filename, mime, bytes) tuples. Raises ValueError if unsupported."""

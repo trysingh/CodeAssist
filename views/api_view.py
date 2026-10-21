@@ -3,7 +3,7 @@ from pathlib import Path
 from typing import List
 from pydantic import BaseModel
 from fastapi import FastAPI, BackgroundTasks, HTTPException, Request, File, Form, UploadFile
-from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.responses import HTMLResponse, FileResponse, PlainTextResponse, Response
 from fastapi.templating import Jinja2Templates
 from sse_starlette.sse import EventSourceResponse
 
@@ -21,6 +21,10 @@ templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 class CreateThreadRequest(BaseModel):
     repo_id: str
     title: str
+
+class ChangeRequest(BaseModel):
+    request: str
+    base_rev: int | None = None
 
 @app.on_event("startup")
 async def startup_event():
@@ -123,6 +127,42 @@ async def chat_with_attachments(
     response = await controller.chat_with_repo(repo_id, thread_id, query or "Please review the attached content.")
     await controller.db.save_chat_message(thread_id, "assistant", response)
     return {"repo_id": repo_id, "thread_id": thread_id, "answer": response, "attachments": saved}
+
+@app.post("/api/v1/repos/{repo_id}/changes")
+async def propose_change(repo_id: str, req: ChangeRequest):
+    """Skips the ask/change router: always runs the change agents. Returns a proposal; writes nothing to disk."""
+    try:
+        res = await controller.propose_change(repo_id, req.request, req.base_rev)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    return {**res.__dict__, "markdown": res.to_markdown()}
+
+@app.get("/api/v1/repos/{repo_id}/revisions")
+async def list_revisions(repo_id: str):
+    return await controller.list_revisions(repo_id)
+
+@app.get("/api/v1/repos/{repo_id}/revisions/{rev}/diff", response_class=PlainTextResponse)
+async def revision_diff(repo_id: str, rev: int):
+    diff = await controller.revision_diff(repo_id, rev)
+    if diff is None:
+        raise HTTPException(status_code=404, detail="Revision not found")
+    return diff
+
+@app.get("/api/v1/repos/{repo_id}/revisions/{rev}/download")
+async def revision_download(repo_id: str, rev: int):
+    data = await controller.revision_zip(repo_id, rev)
+    if data is None:
+        raise HTTPException(status_code=404, detail="Revision not found")
+    return Response(content=data, media_type="application/zip",
+                    headers={"Content-Disposition": f'attachment; filename="{repo_id}_rev{rev}.zip"'})
+
+@app.post("/api/v1/repos/{repo_id}/revisions/revert")
+async def revert_revision(repo_id: str, to_rev: int = 0):
+    """Appends a revision restoring the repo view to `to_rev` (0 = what is on disk)."""
+    try:
+        return {"revision": await controller.revert_revision(repo_id, to_rev)}
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
 
 @app.get("/api/v1/notifications/stream")
 async def notification_stream():

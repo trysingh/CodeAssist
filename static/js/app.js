@@ -13,6 +13,8 @@ const Render = {
             .replace(/\$?\\leftarrow\$?/g, "←")
             .replace(/\$?\\Rightarrow\$?/g, "⇒");
         return cleaned
+            // 1. Markdown Links [text](url)
+            .replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, '<a href="$2" class="text-blue-400 hover:underline inline-flex items-center gap-1" target="_blank" rel="noopener noreferrer">$1</a>')
             .replace(/`([^`\n]+)`/g, "<code class='bg-slate-950 text-emerald-300 px-1.5 py-0.5 rounded font-mono text-xs border border-slate-800'>$1</code>")
             .replace(/\*\*\*([^*\n]+)\*\*\*/g, "<strong class='text-white font-semibold'><em>$1</em></strong>")
             .replace(/\*\*([^*\n]+)\*\*/g, "<strong class='text-white font-semibold'>$1</strong>")
@@ -81,10 +83,10 @@ const Render = {
             if (i % 2 === 0) return this.renderBlock(part);
             const lang = (part.match(/^([^\n]*)\n/) || [, ""])[1].trim();
             const cleaned = part.replace(/^[^\n]*\n/, "").replace(/\n$/, "");
-            return "<div class='codeblock my-3 rounded-xl border border-slate-800 bg-slate-950 overflow-hidden'>" +
-                "<div class='flex items-center justify-between px-3 py-1.5 bg-slate-900/80 border-b border-slate-800 text-[11px] text-slate-500 font-mono'><span>" + this.escapeHtml(lang || "code") + "</span>" +
-                "<button type='button' data-copy='code' class='hover:text-slate-200'><span>Copy</span></button></div>" +
-                "<pre class='p-3.5 font-mono text-xs overflow-x-auto text-emerald-300'><code>" + this.escapeHtml(cleaned) + "</code></pre></div>";
+            return "<div class='codeblock my-3 rounded-xl border border-slate-300 bg-slate-100 overflow-hidden'>" +
+                "<div class='flex items-center justify-between px-3 py-1.5 bg-slate-200/80 border-b border-slate-300 text-[11px] text-slate-600 font-mono'><span>" + this.escapeHtml(lang || "code") + "</span>" +
+                "<button type='button' data-copy='code' class='hover:text-slate-900'><span>Copy</span></button></div>" +
+                "<pre class='p-3.5 font-mono text-xs overflow-x-auto text-slate-800'><code>" + this.escapeHtml(cleaned) + "</code></pre></div>";
         }).join("");
     }
 };
