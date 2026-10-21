@@ -4,13 +4,14 @@ import sys
 import time
 import orjson
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, Optional, Callable
 from config.settings import settings
 from models.database import DatabaseManager
 from models.schemas import JobStatus, RepoInfo
 from services.chunking.registry import ChunkingRegistry, parallel_chunk_files
 from services.vector_store import VectorStoreService
 from services.rag_graph import RAGWorkflowManager
+from services.attachment_service import AttachmentService
 from services.notifier import notifier
 
 class EngineController:
@@ -19,7 +20,8 @@ class EngineController:
     def __init__(self):
         self.db = DatabaseManager()
         self.vector_service = VectorStoreService()
-        self.rag_manager = RAGWorkflowManager(self.db, self.vector_service)
+        self.attachments = AttachmentService(self.vector_service)
+        self.rag_manager = RAGWorkflowManager(self.db, self.vector_service, self.attachments)
 
     @staticmethod
     def compute_repo_id(root_path: Path) -> str:
@@ -268,3 +270,25 @@ class EngineController:
         if not repo:
             raise ValueError(f"Repository ID '{repo_id}' not found.")
         return await self.rag_manager.invoke_chat(repo_id, thread_id, query)
+
+    async def prepare_attachments(self, files: List[Tuple[str, str, bytes]]) -> List[dict]:
+        """Extract text (OCR for images) from (filename, mime, bytes) tuples. Raises ValueError if unsupported."""
+        prepared = []
+        for name, mime, data in files:
+            kind, text = await self.attachments.extract(name, mime, data)
+            prepared.append({"filename": name, "mime": mime, "kind": kind, "size": len(data),
+                             "text": text or "[No text could be extracted from this file.]"})
+        return prepared
+
+    async def store_attachments(self, thread_id: str, message_id: int, prepared: List[dict]) -> List[dict]:
+        """Persist extracted text on the thread and index it so later questions can retrieve it."""
+        saved = []
+        for p in prepared:
+            att_id = await self.db.save_attachment(thread_id, message_id, p["filename"], p["mime"],
+                                                   p["kind"], p["size"], p["text"])
+            try:
+                await self.attachments.index(thread_id, att_id, p["filename"], p["text"])
+            except Exception as exc:  # chat still works; large files fall back to head excerpts
+                notifier.notify("Attachment not indexed", f"{p['filename']}: {exc}", level="WARNING")
+            saved.append({"id": att_id, "filename": p["filename"], "kind": p["kind"], "chars": len(p["text"])})
+        return saved

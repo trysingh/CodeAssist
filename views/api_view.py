@@ -1,13 +1,15 @@
 import uuid
 from pathlib import Path
+from typing import List
 from pydantic import BaseModel
-from fastapi import FastAPI, BackgroundTasks, HTTPException, Request
+from fastapi import FastAPI, BackgroundTasks, HTTPException, Request, File, Form, UploadFile
 from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.templating import Jinja2Templates
 from sse_starlette.sse import EventSourceResponse
 
 from controllers.engine_controller import EngineController
 from models.schemas import ChatRequest
+from config.settings import settings
 from services.notifier import notifier
 
 app = FastAPI(title="CodeRAG Pluggable Chunking & Multi-Thread RAG API")
@@ -86,6 +88,41 @@ async def chat_endpoint(req: ChatRequest):
         return {"repo_id": req.repo_id, "thread_id": req.thread_id, "answer": response}
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
+
+@app.post("/api/v1/chat/attach")
+async def chat_with_attachments(
+    repo_id: str = Form(...),
+    thread_id: str = Form(...),
+    query: str = Form(""),
+    files: List[UploadFile] = File(...),
+):
+    """Chat turn with pasted/uploaded attachments (image, pdf, docx, text). Extracted text is saved on the thread."""
+    if len(files) > settings.max_attachments_per_message:
+        raise HTTPException(status_code=413, detail=f"Max {settings.max_attachments_per_message} attachments per message.")
+    limit = settings.max_attachment_mb * 1024 * 1024
+    raw = []
+    for f in files:
+        data = await f.read()
+        if len(data) > limit:
+            raise HTTPException(status_code=413, detail=f"{f.filename} exceeds {settings.max_attachment_mb} MB.")
+        raw.append((f.filename or "attachment", f.content_type or "", data))
+
+    await controller.db.init_db()
+    if not await controller.db.get_repo(repo_id):
+        raise HTTPException(status_code=404, detail=f"Repository ID '{repo_id}' not found.")
+    try:
+        prepared = await controller.prepare_attachments(raw)   # OCR / text extraction
+    except ValueError as e:
+        raise HTTPException(status_code=415, detail=str(e))
+
+    query = query.strip()
+    await controller.db.create_thread(thread_id, repo_id, thread_id)
+    msg_id = await controller.db.save_chat_message(thread_id, "user", query)
+    saved = await controller.store_attachments(thread_id, msg_id, prepared)
+
+    response = await controller.chat_with_repo(repo_id, thread_id, query or "Please review the attached content.")
+    await controller.db.save_chat_message(thread_id, "assistant", response)
+    return {"repo_id": repo_id, "thread_id": thread_id, "answer": response, "attachments": saved}
 
 @app.get("/api/v1/notifications/stream")
 async def notification_stream():

@@ -379,18 +379,27 @@
                             </button>
                             <div class="px-4 pb-3 pt-1 shrink-0">
                                 <form id="chat-form" onsubmit="sendChatMessage(event)"
-                                    class="max-w-3xl mx-auto flex items-end gap-2 bg-cardBg border border-cardBorder focus-within:border-blue-500/70 rounded-2xl p-2 transition-colors">
-                                    <textarea id="chat-input-query" rows="1"
-                                        placeholder="Ask anything about the codebase" aria-label="Message"
-                                        class="flex-1 bg-transparent resize-none px-2.5 py-2 text-sm text-white placeholder-slate-500 focus:outline-none max-h-52 disabled:cursor-not-allowed"></textarea>
-                                    <button id="send-btn" type="submit"
-                                        class="shrink-0 w-9 h-9 rounded-xl bg-blue-600 hover:bg-blue-500 disabled:bg-slate-800 disabled:text-slate-600 text-white flex items-center justify-center transition-colors"
-                                        aria-label="Send">
-                                        <i data-lucide="arrow-up" class="w-4 h-4"></i>
-                                    </button>
+                                    class="max-w-3xl mx-auto bg-cardBg border border-cardBorder focus-within:border-blue-500/70 rounded-2xl p-2 transition-colors">
+                                    <div id="attach-strip" class="hidden flex-wrap gap-2 px-1.5 pb-2"></div>
+                                    <div class="flex items-end gap-2">
+                                        <input id="attach-input" type="file" multiple class="hidden">
+                                        <button id="attach-btn" type="button" onclick="document.getElementById('attach-input').click()"
+                                            class="shrink-0 w-9 h-9 rounded-xl text-slate-400 hover:text-white hover:bg-slate-800 disabled:opacity-40 disabled:hover:bg-transparent flex items-center justify-center transition-colors"
+                                            aria-label="Attach files" title="Attach files (or paste with Ctrl+V)">
+                                            <i data-lucide="paperclip" class="w-4 h-4"></i>
+                                        </button>
+                                        <textarea id="chat-input-query" rows="1"
+                                            placeholder="Ask anything about the codebase" aria-label="Message"
+                                            class="flex-1 bg-transparent resize-none px-2.5 py-2 text-sm text-white placeholder-slate-500 focus:outline-none max-h-52 disabled:cursor-not-allowed"></textarea>
+                                        <button id="send-btn" type="submit"
+                                            class="shrink-0 w-9 h-9 rounded-xl bg-blue-600 hover:bg-blue-500 disabled:bg-slate-800 disabled:text-slate-600 text-white flex items-center justify-center transition-colors"
+                                            aria-label="Send">
+                                            <i data-lucide="arrow-up" class="w-4 h-4"></i>
+                                        </button>
+                                    </div>
                                 </form>
                                 <p class="max-w-3xl mx-auto text-[11px] text-slate-600 mt-1.5 px-2 hidden sm:block">
-                                    Enter to send · Shift+Enter for a new line · / to focus</p>
+                                    Enter to send · Shift+Enter for a new line · / to focus · Paste images or files with Ctrl+V</p>
                             </div>
                         </div>
                     </div>

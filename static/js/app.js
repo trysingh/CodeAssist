@@ -97,7 +97,7 @@ const LS = {
     get(k, d) { try { const v = localStorage.getItem('crag.' + k); return v === null ? d : JSON.parse(v); } catch { return d; } },
     set(k, v) { try { localStorage.setItem('crag.' + k, JSON.stringify(v)); } catch { /* storage unavailable */ } }
 };
-const S = { repoId: null, threadId: null, repos: [], tab: null, sending: false, unread: 0, collapsed: LS.get('collapsed', null), poll: null };
+const S = { repoId: null, threadId: null, repos: [], tab: null, sending: false, files: [], unread: 0, collapsed: LS.get('collapsed', null), poll: null };
 const TABS = ['chat', 'repos', 'ingest', 'telemetry'];
 const TITLES = { chat: 'Chat', repos: 'Repositories', ingest: 'Ingest repository', telemetry: 'Telemetry & logs' };
 const isMobile = () => window.innerWidth < 1024;
@@ -108,6 +108,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     const panel = $('thread-panel');
     panel.dataset.open = String(isMobile() ? false : LS.get('threads', true));
     setupComposer();
+    setupAttachments();
     setupNotificationStream();
     $('chat-messages').addEventListener('scroll', updateJumpBtn);
     window.addEventListener('hashchange', () => switchTab(location.hash.slice(1)));
@@ -213,19 +214,29 @@ function setupNotificationStream() {
     evtSource.onerror = () => setConn(false);
     evtSource.addEventListener("notification", (event) => {
         setConn(true);
-        const data = JSON.parse(event.data);
-        const level = String(data.level || 'info').toLowerCase();
-        showToast(data.title, data.message, level);
-        const colour = { error: 'text-red-400', warning: 'text-amber-400', success: 'text-emerald-400' }[level] || 'text-blue-300';
-        const consoleDiv = $('telemetry-console');
-        const line = document.createElement('div');
-        line.className = `${colour} border-b border-slate-900 pb-1`;
-        line.textContent = `${new Date().toLocaleTimeString([], { hour12: false })}  [${data.level}] ${data.title} — ${data.message}`;
-        const stick = consoleDiv.scrollHeight - consoleDiv.scrollTop - consoleDiv.clientHeight < 80;
-        consoleDiv.appendChild(line);
-        while (consoleDiv.children.length > 500) consoleDiv.firstChild.remove();
-        if (stick) consoleDiv.scrollTop = consoleDiv.scrollHeight;
-        if (S.tab !== 'telemetry') { S.unread++; renderBadge(); }
+        try{
+            // const data = JSON.parse(event.data);
+            // const level = String(data.level || 'info').toLowerCase();
+            
+            const data = typeof event.data === 'string' ? JSON.parse(event.data) : event.data;
+            console.log(data);
+            const level = String(data.level || 'info').toLowerCase();
+
+            showToast(data.title, data.message, level);
+            const colour = { error: 'text-red-400', warning: 'text-amber-400', success: 'text-emerald-400' }[level] || 'text-blue-300';
+            const consoleDiv = $('telemetry-console');
+            const line = document.createElement('div');
+            line.className = `${colour} border-b border-slate-900 pb-1`;
+            line.textContent = `${new Date().toLocaleTimeString([], { hour12: false })}  [${data.level}] ${data.title} — ${data.message}`;
+            const stick = consoleDiv.scrollHeight - consoleDiv.scrollTop - consoleDiv.clientHeight < 80;
+            // consoleDiv.appendChild(line);
+            consoleDiv.prepend(line); 
+            while (consoleDiv.children.length > 500) consoleDiv.firstChild.remove();
+            if (stick) consoleDiv.scrollTop = consoleDiv.scrollHeight;
+            if (S.tab !== 'telemetry') { S.unread++; renderBadge(); }
+        } catch (err) { 
+            console.error("Failed to parse SSE notification event:", err, event.data);
+        }
     });
 }
 function clearConsole() { $('telemetry-console').innerHTML = ''; }
@@ -430,9 +441,10 @@ async function createThreadRequest(title) {
 }
 
 /* ================= Messages ================= */
-function msgHtml(role, content, meta = '') {
+function msgHtml(role, content, meta = '', atts = []) {
     if (role === 'user') {
-        return `<div class="flex justify-end"><div class="bg-blue-600 text-white rounded-2xl rounded-br-md px-4 py-2.5 text-sm max-w-[85%] whitespace-pre-wrap break-words">${esc(content)}</div></div>`;
+        const chips = atts.length ? `<div class="flex flex-wrap gap-1.5 ${content ? 'mb-2' : ''}">${atts.map(a => `<span class="inline-flex items-center gap-1 bg-blue-800/60 rounded-md px-2 py-0.5 text-xs"><i data-lucide="${a.kind === 'image' ? 'image' : 'file-text'}" class="w-3 h-3"></i>${esc(a.filename)}</span>`).join('')}</div>` : '';
+        return `<div class="flex justify-end"><div class="bg-blue-600 text-white rounded-2xl rounded-br-md px-4 py-2.5 text-sm max-w-[85%] whitespace-pre-wrap break-words">${chips}${esc(content)}</div></div>`;
     }
     return `<div class="flex gap-3 group scroll-mt-4">
         <div class="w-7 h-7 mt-0.5 rounded-lg bg-blue-600/15 border border-blue-500/25 flex items-center justify-center text-blue-400 shrink-0"><i data-lucide="bot" class="w-4 h-4"></i></div>
@@ -482,7 +494,7 @@ async function selectThread(threadId, threadTitle) {
         const messages = await res.json();
         if (S.threadId !== threadId) return; // user switched while loading
         if (!messages.length) return showEmpty('thread', threadTitle);
-        col.innerHTML = messages.map(m => msgHtml(m.role === 'user' ? 'user' : 'assistant', m.content)).join('');
+        col.innerHTML = messages.map(m => msgHtml(m.role === 'user' ? 'user' : 'assistant', m.content, '', m.attachments || [])).join('');
         icons();
         scrollDown(true);
         $('chat-input-query').focus();
@@ -505,6 +517,7 @@ function updateComposer() {
     t.disabled = !ready;
     t.placeholder = ready ? 'Ask anything about the codebase' : (S.repoId ? 'Loading thread…' : 'Select a repository to start chatting');
     $('send-btn').disabled = !ready || S.sending;
+    $('attach-btn').disabled = !ready || S.sending;
 }
 
 function setupComposer() {
@@ -523,6 +536,59 @@ function scrollDown(force) {
     if (force || distFromBottom() < 160) m.scrollTop = m.scrollHeight;
 }
 
+/* ================= Attachments (paste / pick / drop) ================= */
+const MAX_FILES = 5, MAX_MB = 15, PASTE_AS_FILE_CHARS = 4000;
+const isImg = f => (f.type || '').startsWith('image/');
+
+function setupAttachments() {
+    document.addEventListener('paste', e => {
+        if (S.tab !== 'chat' || !S.repoId || !S.threadId || S.sending) return;
+        const el = e.target;
+        if (el.matches?.('input, textarea, [contenteditable]') && el.id !== 'chat-input-query') return;
+        const cd = e.clipboardData; if (!cd) return;
+        if (cd.files.length) { e.preventDefault(); return addFiles([...cd.files]); }
+        const text = cd.getData('text/plain');
+        if (text.length > PASTE_AS_FILE_CHARS) { // heavy text becomes an attachment instead of flooding the box
+            e.preventDefault();
+            addFiles([new File([text], `pasted-text-${S.files.length + 1}.txt`, { type: 'text/plain' })]);
+        }
+    });
+    $('attach-input').addEventListener('change', e => { addFiles([...e.target.files]); e.target.value = ''; });
+    const form = $('chat-form');
+    form.addEventListener('dragover', e => e.preventDefault());
+    form.addEventListener('drop', e => { e.preventDefault(); if (S.repoId && S.threadId && !S.sending) addFiles([...e.dataTransfer.files]); });
+    $('attach-strip').addEventListener('click', e => {
+        const b = e.target.closest('[data-rm-file]'); if (!b) return;
+        const [f] = S.files.splice(+b.dataset.rmFile, 1);
+        if (f?._url) URL.revokeObjectURL(f._url);
+        renderAttachStrip();
+    });
+}
+
+function addFiles(list) {
+    for (const f of list) {
+        if (S.files.length >= MAX_FILES) { showToast('Limit reached', `Max ${MAX_FILES} attachments per message.`, 'warning'); break; }
+        if (f.size > MAX_MB * 1048576) { showToast('File too large', `${f.name} exceeds ${MAX_MB} MB.`, 'warning'); continue; }
+        // clipboard screenshots arrive as "image.png"; give them a unique readable name
+        S.files.push(!f.name || f.name === 'image.png'
+            ? new File([f], `pasted-image-${S.files.length + 1}-${Date.now() % 100000}.${(f.type.split('/')[1] || 'png')}`, { type: f.type })
+            : f);
+    }
+    renderAttachStrip();
+}
+
+function renderAttachStrip() {
+    const strip = $('attach-strip');
+    strip.classList.toggle('hidden', !S.files.length);
+    strip.classList.toggle('flex', !!S.files.length);
+    strip.innerHTML = S.files.map((f, i) => {
+        if (isImg(f)) f._url = f._url || URL.createObjectURL(f);
+        const thumb = isImg(f) ? `<img src="${f._url}" alt="" class="w-8 h-8 rounded object-cover">` : `<i data-lucide="file-text" class="w-4 h-4 text-slate-400 mx-1"></i>`;
+        return `<div class="flex items-center gap-2 bg-slate-800 border border-slate-700 rounded-lg pl-1 pr-1.5 py-1 text-xs text-slate-300 max-w-[220px]">${thumb}<span class="truncate">${esc(f.name)}</span><button type="button" data-rm-file="${i}" class="text-slate-500 hover:text-white px-1" aria-label="Remove ${esc(f.name)}">✕</button></div>`;
+    }).join('');
+    icons();
+}
+
 async function sendChatMessage(e) {
     if (e) e.preventDefault();
     if (S.sending) return;
@@ -532,29 +598,40 @@ async function sendChatMessage(e) {
     }
     const input = $('chat-input-query');
     const query = input.value.trim();
-    if (!query) return;
+    const files = S.files.slice();
+    if (!query && !files.length) return;
 
     const col = $('chat-col');
     col.querySelector('[data-welcome]')?.remove();
-    col.insertAdjacentHTML('beforeend', msgHtml('user', query));
+    col.insertAdjacentHTML('beforeend', msgHtml('user', query, '', files.map(f => ({ filename: f.name, kind: isImg(f) ? 'image' : 'file' }))));
     input.value = ''; autosize();
+    S.files = []; renderAttachStrip();
     S.sending = true; updateComposer();
 
     const id = 'loader_' + Date.now();
     col.insertAdjacentHTML('beforeend', `<div id="${id}" class="flex gap-3"><div class="w-7 h-7 rounded-lg bg-blue-600/15 border border-blue-500/25 flex items-center justify-center text-blue-400 shrink-0"><i data-lucide="bot" class="w-4 h-4"></i></div>
-        <div class="flex items-center gap-2.5 text-sm text-slate-400 pt-0.5"><span class="think flex gap-1"><span></span><span></span><span></span></span>Retrieving relevant chunks <span id="${id}_t" class="font-mono text-xs text-slate-600">0s</span></div></div>`);
+        <div class="flex items-center gap-2.5 text-sm text-slate-400 pt-0.5"><span class="think flex gap-1"><span></span><span></span><span></span></span>${files.length ? 'Reading attachments' : 'Retrieving relevant chunks'} <span id="${id}_t" class="font-mono text-xs text-slate-600">0s</span></div></div>`);
     icons(); scrollDown(true);
     const t0 = performance.now();
     const tick = setInterval(() => { const el = $(id + '_t'); if (el) el.textContent = Math.floor((performance.now() - t0) / 1000) + 's'; }, 1000);
 
     try {
-        const res = await fetch('/api/v1/chat', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ repo_id: S.repoId, thread_id: S.threadId, query })
-        });
-        if (!res.ok) throw new Error(`Server returned ${res.status}`);
+        let res;
+        if (files.length) {
+            const fd = new FormData();
+            fd.append('repo_id', S.repoId); fd.append('thread_id', S.threadId); fd.append('query', query);
+            files.forEach(f => fd.append('files', f, f.name));
+            res = await fetch('/api/v1/chat/attach', { method: 'POST', body: fd });
+        } else {
+            res = await fetch('/api/v1/chat', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ repo_id: S.repoId, thread_id: S.threadId, query })
+            });
+        }
+        if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || `Server returned ${res.status}`);
         const result = await res.json();
+        files.forEach(f => f._url && URL.revokeObjectURL(f._url));
         $(id)?.remove();
         col.insertAdjacentHTML('beforeend', msgHtml('assistant', result.answer, `<span>${((performance.now() - t0) / 1000).toFixed(1)}s</span>`));
         icons();
@@ -562,6 +639,7 @@ async function sendChatMessage(e) {
     } catch (err) {
         $(id)?.remove();
         input.value = query; autosize(); // give the question back so it can be retried
+        S.files = files; renderAttachStrip(); // ...and the attachments
         showToast("Message failed", err.message, "error");
     } finally {
         clearInterval(tick);

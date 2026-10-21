@@ -1,4 +1,5 @@
 import sys
+import json
 from typing import Generator
 from plyer import notification
 from fastapi import APIRouter
@@ -12,6 +13,10 @@ class NotificationDispatcher:
         self.subscribers: list[asyncio.Queue] = []
 
     def notify(self, title: str, message: str, level: str = "INFO"):
+        # Handle cases where message might be passed as a dictionary (e.g. Telemetry payload)
+        if isinstance(message, dict):
+            message = json.dumps(message)
+
         # 1. Logs / Stdout
         timestamp_log = f"\n[NOTIFICATION [{level}]] {title} — {message}\n"
         sys.stdout.write(timestamp_log)
@@ -42,7 +47,7 @@ class NotificationDispatcher:
         try:
             while True:
                 data = await q.get()
-                yield {"event": "notification", "data": data}
+                yield {"event": "notification", "data": json.dumps(data)}
         finally:
             self.subscribers.remove(q)
 

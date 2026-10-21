@@ -22,3 +22,6 @@ tree_sitter_language_pack
 watchdog>=4.0.0
 plyer>=2.1.0
 sse-starlette>=2.1.0    
+python-multipart>=0.0.9
+pypdf>=4.0.0
+python-docx>=1.1.0

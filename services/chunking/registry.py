@@ -23,6 +23,7 @@ class ChunkingRegistry:
         ".css": StylesheetAndConfigStrategy(".css"),
         ".yaml": StylesheetAndConfigStrategy(".yaml"),
         ".yml": StylesheetAndConfigStrategy(".yml"),
+        ".md": StylesheetAndConfigStrategy(".md"),
         ".json": JsonAndJsonlStrategy(".json"),
         ".jsonl": JsonAndJsonlStrategy(".jsonl"),
         ".html": HtmlStrategy(),

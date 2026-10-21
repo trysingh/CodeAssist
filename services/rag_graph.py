@@ -8,21 +8,35 @@ from config.settings import settings
 from models.database import DatabaseManager
 from services.vector_store import VectorStoreService
 from services.telemetry import StdoutTelemetryCallback
+from services.notifier import notifier
+from services.attachment_service import AttachmentService
 import re
 MAX_FILE_CHARS = 70000
 
 class AgentState(TypedDict):
     messages: Annotated[List[BaseMessage], add_messages]
     repo_id: str
+    thread_id: str
     context_str: str
+    attachment_context: str
 
 class RAGWorkflowManager:
     """
     LangGraph state machine with relational chunk expansion and SQLite conversation persistence.
     """
-    def __init__(self, db_manager: DatabaseManager, vector_service: VectorStoreService):
+    def __init__(self, db_manager: DatabaseManager, vector_service: VectorStoreService,
+                 attachment_service: AttachmentService = None):
         self.db_manager = db_manager
         self.vector_service = vector_service
+        self.attachments = attachment_service or AttachmentService(vector_service)
+
+    async def _attachment_context_node(self, state: AgentState) -> dict:
+        thread_id = state.get("thread_id")
+        if not thread_id:
+            return {"attachment_context": ""}
+        atts = await self.db_manager.get_thread_attachments(thread_id)
+        ctx = await self.attachments.build_context(thread_id, str(state["messages"][-1].content), atts)
+        return {"attachment_context": ctx}
 
     async def _retrieve_and_expand_node(self, state: AgentState) -> dict:
         repo_id = state["repo_id"]
@@ -95,7 +109,23 @@ class RAGWorkflowManager:
         return {"context_str": context_str}
 
     async def _generate_answer_node(self, state: AgentState) -> dict:
-        callback = StdoutTelemetryCallback(model_name=settings.llm_model, phase="RAG_GENERATION")
+        repo_id = state.get("repo_id", "unknown_repo")
+        
+        # Define emitter to broadcast live telemetry traces through Server-Sent Events (SSE)
+        def emit_to_ui(data: dict):
+            notifier.notify(
+                "Telemetry Trace",
+                f"Phase: {data['phase']} | Model: {data['model']} | Tokens: {data['total_tokens']} | Time: {data['duration_sec']:.3f}s",
+                level="INFO"
+            )
+        callback = StdoutTelemetryCallback(
+            model_name=settings.llm_model, 
+            repo_id=repo_id,
+            phase="RAG_GENERATION", 
+            emitter=lambda data: notifier.notify("Telemetry Trace", data, level="INFO")
+            # emitter=emit_to_ui
+        )
+        
         llm = ChatOllama(
             model=settings.llm_model,
             base_url=settings.ollama_base_url,
@@ -113,15 +143,26 @@ class RAGWorkflowManager:
             f"=== RETRIEVED REPOSITORY CONTEXT ===\n{state.get('context_str', '')}\n===================================="
         )
         
+        att_ctx = state.get("attachment_context", "")
+        if att_ctx:
+            system_prompt += (
+                "\n\nThe user attached files/images in this conversation; their extracted text (OCR for images) is below. "
+                "Treat it as user-provided material and combine it with the repository context when relevant. "
+                "Blocks marked EXCERPT are partial.\n"
+                f"=== USER ATTACHMENTS ===\n{att_ctx}\n===================="
+            )
+
         messages_for_llm = [SystemMessage(content=system_prompt)] + state["messages"]
         response = await llm.ainvoke(messages_for_llm)
         return {"messages": [response]}
 
     def build_graph(self):
         builder = StateGraph(AgentState)
+        builder.add_node("attachment_context", self._attachment_context_node)
         builder.add_node("retrieve_and_expand", self._retrieve_and_expand_node)
         builder.add_node("generate", self._generate_answer_node)
-        builder.add_edge(START, "retrieve_and_expand")
+        builder.add_edge(START, "attachment_context")
+        builder.add_edge("attachment_context", "retrieve_and_expand")
         builder.add_edge("retrieve_and_expand", "generate")
         builder.add_edge("generate", END)
         return builder
@@ -132,7 +173,7 @@ class RAGWorkflowManager:
             graph = builder.compile(checkpointer=checkpointer)
             config = {"configurable": {"thread_id": f"{repo_id}:{thread_id}"}}
             result = await graph.ainvoke(
-                {"messages": [HumanMessage(content=user_input)], "repo_id": repo_id},
+                {"messages": [HumanMessage(content=user_input)], "repo_id": repo_id, "thread_id": thread_id},
                 config=config
             )
             return result["messages"][-1].content

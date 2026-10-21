@@ -19,6 +19,13 @@ class EngineSettings(BaseSettings):
     llm_model: str = Field(default="llama3.1:latest")
     embedding_model: str = Field(default="nomic-embed-text:latest")
     
+    # Attachments (pasted images / files / large text)
+    vision_model: str = Field(default="")             # multimodal model used for image OCR; empty = llm_model
+    max_attachment_mb: int = Field(default=15)
+    max_attachments_per_message: int = Field(default=5)
+    attachment_inline_chars: int = Field(default=24000)  # thread attachments below this total go in full; above -> retrieval
+    attachment_top_k: int = Field(default=6)
+
     # Chunking & Parallelism Configuration
     chunk_size: int = Field(default=1200)
     chunk_overlap: int = Field(default=200)

@@ -2,7 +2,7 @@ from datetime import datetime
 import aiosqlite
 from typing import List, Dict, Optional, Any
 from config.settings import settings
-from models.schemas import RepoInfo, JobStatus
+from models.schemas import RepoInfo, JobStatus 
 
 class DatabaseManager:
     """Manages SQLite persistence for repository metadata, job states, and multi-thread chat history."""
@@ -77,6 +77,20 @@ class DatabaseManager:
                 )
             """)
             await db.execute("""
+                CREATE TABLE IF NOT EXISTS chat_attachments (
+                    attachment_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    thread_id TEXT NOT NULL,
+                    message_id INTEGER,
+                    filename TEXT NOT NULL,
+                    mime TEXT,
+                    kind TEXT,
+                    size_bytes INTEGER DEFAULT 0,
+                    extracted_text TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_chat_attachments_thread ON chat_attachments(thread_id)")
+            await db.execute("""
                 CREATE TABLE IF NOT EXISTS code_chunks (
                     chunk_id TEXT PRIMARY KEY,
                     repo_id TEXT,
@@ -109,22 +123,49 @@ class DatabaseManager:
                 rows = await cursor.fetchall()
                 return [{"thread_id": r[0], "title": r[1], "created_at": r[2]} for r in rows]
 
-    async def get_thread_messages(self, thread_id: str) -> List[Dict[str, str]]:
+    async def get_thread_messages(self, thread_id: str) -> List[Dict[str, Any]]:
         async with aiosqlite.connect(self.db_path) as db:
             async with db.execute(
-                "SELECT role, content FROM chat_messages WHERE thread_id = ? ORDER BY id ASC",
+                "SELECT id, role, content FROM chat_messages WHERE thread_id = ? ORDER BY id ASC",
                 (thread_id,)
             ) as cursor:
                 rows = await cursor.fetchall()
-                return [{"role": r[0], "content": r[1]} for r in rows]
+            async with db.execute(
+                "SELECT message_id, attachment_id, filename, kind FROM chat_attachments WHERE thread_id = ? ORDER BY attachment_id",
+                (thread_id,)
+            ) as cursor:
+                atts: Dict[int, list] = {}
+                for a in await cursor.fetchall():
+                    atts.setdefault(a[0], []).append({"id": a[1], "filename": a[2], "kind": a[3]})
+        return [{"role": r[1], "content": r[2], "attachments": atts.get(r[0], [])} for r in rows]
 
-    async def save_chat_message(self, thread_id: str, role: str, content: str):
+    async def save_chat_message(self, thread_id: str, role: str, content: str) -> int:
         async with aiosqlite.connect(self.db_path) as db:
-            await db.execute(
+            cur = await db.execute(
                 "INSERT INTO chat_messages (thread_id, role, content) VALUES (?, ?, ?)",
                 (thread_id, role, content)
             )
             await db.commit()
+            return cur.lastrowid
+
+    async def save_attachment(self, thread_id: str, message_id: int, filename: str, mime: str,
+                              kind: str, size_bytes: int, text: str) -> int:
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(
+                "INSERT INTO chat_attachments (thread_id, message_id, filename, mime, kind, size_bytes, extracted_text) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (thread_id, message_id, filename, mime, kind, size_bytes, text)
+            )
+            await db.commit()
+            return cur.lastrowid
+
+    async def get_thread_attachments(self, thread_id: str) -> List[Dict[str, Any]]:
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(
+                "SELECT attachment_id, filename, kind, extracted_text FROM chat_attachments "
+                "WHERE thread_id = ? ORDER BY attachment_id", (thread_id,)
+            ) as cursor:
+                return [{"id": r[0], "filename": r[1], "kind": r[2], "text": r[3] or ""} for r in await cursor.fetchall()]
 
     async def upsert_repo(self, repo_id: str, title: str, root_path: str, status: JobStatus, total_files: int):
         now_iso = datetime.utcnow().isoformat()

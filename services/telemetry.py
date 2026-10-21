@@ -1,7 +1,8 @@
 import time
+import json
 import sys
 import tiktoken
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Callable
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.outputs import LLMResult
 
@@ -10,9 +11,11 @@ class StdoutTelemetryCallback(BaseCallbackHandler):
     Traces every LLM & Embedding request and outputs structured telemetry to stdout.
     Uses Rust-backed tiktoken for fallback token counting when local providers omit metadata.
     """
-    def __init__(self, model_name: str, phase: str = "RAG_CHAT"):
+    def __init__(self, model_name: str, repo_id: str,phase: str = "RAG_CHAT", emitter: Optional[Callable] = None):
         self.model_name = model_name
+        self.repo_id = repo_id
         self.phase = phase
+        self.emitter = emitter # Function to send data to frontend
         self.start_time = 0.0
         self.prompts: List[str] = []
         try:
@@ -60,10 +63,34 @@ class StdoutTelemetryCallback(BaseCallbackHandler):
                     output_tokens += self._count_tokens(gen.text)
 
         total_tokens = input_tokens + output_tokens
-        trace_line = (
-            f"\n[TELEMETRY TRACE] Phase={self.phase} | Model={self.model_name} | "
-            f"InputTokens={input_tokens} | OutputTokens={output_tokens} | "
-            f"TotalTokens={total_tokens} | TimeSpent={elapsed:.3f}s\n"
-        )
-        sys.stdout.write(trace_line)
+
+        telemetry_data = {
+            "timestamp": time.strftime("%H:%M:%S"),
+            "repo_id": self.repo_id,
+            "phase": self.phase,
+            "model": self.model_name,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": total_tokens,
+            "duration_sec": round(elapsed, 3)
+        }
+
+
+        # trace_line = (
+        #     f"\n[TELEMETRY TRACE] Phase={self.phase} | Model={self.model_name} | "
+        #     f"InputTokens={input_tokens} | OutputTokens={output_tokens} | "
+        #     f"TotalTokens={total_tokens} | TimeSpent={elapsed:.3f}s\n"
+        # )
+        # sys.stdout.write(trace_line)
+        # sys.stdout.flush()
+
+        # Keep stdout for logs, but emit for UI
+        trace_line = f"[TELEMETRY] {telemetry_data}"
+        sys.stdout.write(trace_line + "\n")
         sys.stdout.flush()
+        
+        if self.emitter:
+            try:
+                self.emitter(json.dumps(telemetry_data))
+            except Exception:
+                pass
