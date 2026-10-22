@@ -35,6 +35,28 @@ _STRONG_ASK = re.compile(
     r"^\s*(?:what|why|how|where|which|who|when|explain|describe|summari[sz]e|show|list|tell|review|"
     r"is|are|does|do|did|walk)\b", re.IGNORECASE)
 
+
+_HELP_PREFIX = re.compile(r"^\s*/(help|commands|\?)\s*$", re.IGNORECASE)
+_HELP_ASK = re.compile(r"\bcommands?\b", re.IGNORECASE)
+_HELP_HINT = re.compile(r"\bslash\b|/ask\b|/change\b", re.IGNORECASE)
+_ASK_GUARD = 0.9    # read-only opener needs a model "change" at least this sure
+
+COMMANDS_HELP = """**Commands** (start your message with one):
+
+- `/ask <question>`: read-only answer, explanation or search
+- `/change <request>`: propose a code change (nothing is written until you apply it)
+- `/fix <bug>`: same as `/change`, aimed at a bug
+- `/edit <request>`: same as `/change`
+- `/implement <feature>`: same as `/change`, aimed at a new feature
+- `/help` (or `/commands`): show this list
+
+Without a command, the system decides between ask and change on its own."""
+
+
+def is_help(query: str) -> bool:
+    q = query.strip()
+    return bool(_HELP_PREFIX.match(q) or (_STRONG_ASK.match(q) and _HELP_ASK.search(q) and _HELP_HINT.search(q)))
+
 _Q = "Does the user want code or files modified, a bug fixed, or a feature built?"
 _TRUE = "The user wants code or files modified, a bug fixed, or a feature built."
 _FALSE = "The user wants an explanation, search, review, or any read-only answer."
@@ -62,6 +84,8 @@ def route_by_rules(query: str) -> RouteDecision:
 async def route_intent(query: str, *, noul_fn: NoulFn = decide_noul,
                        model: Optional[str] = None, repo_id: str = "") -> RouteDecision:
     m = _PREFIX.match(query)
+    if is_help(query):
+        return RouteDecision("help", query.strip(), "rules", 1.0)
     if m:
         word = m.group(1).lower()
         return RouteDecision("ask" if word == "ask" else "change", query[m.end():].strip(), "prefix", 1.0)
@@ -73,6 +97,8 @@ async def route_intent(query: str, *, noul_fn: NoulFn = decide_noul,
         if p is not None:
             intent, conf = ("change", p) if p >= 0.5 else ("ask", 1.0 - p)
             sys.stdout.write(f"[ROUTER] {intent} (conf={conf:.2f}) via {model}\n")
+            if intent == "change" and _STRONG_ASK.match(q) and conf < _ASK_GUARD:
+                return route_by_rules(q)
             if conf >= settings.router_min_confidence:
                 return RouteDecision(intent, q, "model", round(conf, 4))
     return route_by_rules(q)

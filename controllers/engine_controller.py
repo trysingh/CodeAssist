@@ -15,7 +15,7 @@ from services.attachment_service import AttachmentService
 from services.notifier import notifier
 from services.repo_store import RepoStore
 from services.repo_change import RepoChangeService, ChangeResult
-from services.intent_router import route_intent
+from services.intent_router import COMMANDS_HELP, route_intent
 from services.patch_service import make_diff
 from services.apply_service import apply_revision as apply_revision_to_disk
 
@@ -324,6 +324,8 @@ class EngineController:
         if not repo:
             raise ValueError(f"Repository ID '{repo_id}' not found.")
         decision = await route_intent(query, repo_id=repo_id)
+        if decision.intent == "help":
+            return COMMANDS_HELP
         if decision.intent == "change":
             return (await self.propose_change(repo_id, decision.query)).to_markdown()
         return await self.rag_manager.invoke_chat(repo_id, thread_id, decision.query)

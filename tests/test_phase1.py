@@ -372,3 +372,16 @@ def test_file_tree_pick_rescues_vague_request():
         assert r.ok and r.files[0]["path"] == "static/js/app.js"
         assert any("file-tree pick: 1" in t for t in r.trace)
     run(go())
+
+def test_help_and_ask_guard():
+    from services.intent_router import is_help
+    assert is_help("/help")
+    assert is_help("list all commands like slash-ask, slash-change which gives the system focussed attention to do something")
+    assert not is_help("list the commands in engine_controller.py")   # code question, not help
+
+    async def go():
+        assert (await route_intent("/help", model="m")).intent == "help"
+        async def mild_change(*a, **k): return 0.8
+        d = await route_intent("list the files under services", noul_fn=mild_change, model="m")
+        assert (d.intent, d.source) == ("ask", "rules")
+    run(go())

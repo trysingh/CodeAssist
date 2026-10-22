@@ -72,7 +72,7 @@ class StdoutTelemetryCallback(BaseCallbackHandler):
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
             "total_tokens": total_tokens,
-            "duration_sec": round(elapsed, 3)
+            "duration_sec": int(elapsed)
         }
 
 
