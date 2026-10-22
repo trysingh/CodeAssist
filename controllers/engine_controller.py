@@ -4,7 +4,7 @@ import sys
 import time
 import orjson
 from pathlib import Path
-from typing import List, Tuple, Optional, Callable
+from typing import Dict, List, Tuple, Optional, Callable
 from config.settings import settings
 from models.database import DatabaseManager
 from models.schemas import JobStatus, RepoInfo
@@ -17,6 +17,7 @@ from services.repo_store import RepoStore
 from services.repo_change import RepoChangeService, ChangeResult
 from services.intent_router import route_intent
 from services.patch_service import make_diff
+from services.apply_service import apply_revision as apply_revision_to_disk
 
 class EngineController:
     """MVC Controller coordinating Repository Ingestion, Job Resumption, and Conversational RAG."""
@@ -172,7 +173,7 @@ class EngineController:
 
     async def snapshot_raw_files(self, repo_id: str, root_path: Path) -> dict:
         """Persist verbatim copies of every non-excluded text file (rev 0). Cheap: unchanged files are skipped."""
-        kept, written, skipped, shadowed, batch = set(), 0, 0, [], []
+        kept, written, skipped, shadowed, batch = set(), 0, 0, {}, []
 
         async def flush():
             nonlocal written, skipped, batch
@@ -180,7 +181,8 @@ class EngineController:
                 return
             out = await self.repo_store.upsert_base_files(repo_id, batch)
             kept.update(out["written"]); kept.update(out["unchanged"])
-            written += len(out["written"]); skipped += len(out["skipped"]); shadowed.extend(out["shadowed"])
+            written += len(out["written"]); skipped += len(out["skipped"])
+            shadowed.update({p: b for p, b in batch if p in out["shadowed"]})
             batch = []
 
         for dirpath, dirnames, filenames in os.walk(root_path):
@@ -198,11 +200,17 @@ class EngineController:
         await flush()
         pruned = await self.repo_store.prune_base(repo_id, kept)
         sys.stdout.write(f"[RAW STORE] repo={repo_id} stored={len(kept)} updated={written} skipped={skipped} pruned={pruned}\n")
-        if shadowed:
-            notifier.notify("Pending revision is stale",
-                            f"{len(shadowed)} file(s) changed on disk under a proposed revision (e.g. {shadowed[0]}). Revert or request the change again.",
-                            level="WARNING")
+        await self._record_disk_sync(repo_id, shadowed)
         return {"stored": len(kept), "updated": written, "skipped": skipped}
+
+    async def _record_disk_sync(self, repo_id: str, changed: Dict[str, bytes]) -> None:
+        """Files edited on disk that a proposed revision also touches: new proposals must build on the disk version."""
+        rev = await self.repo_store.record_disk_sync(repo_id, changed)
+        if rev:
+            notifier.notify("Disk edit recorded",
+                            f"{len(changed)} file(s) changed on disk while proposals touched them (e.g. {sorted(changed)[0]}). "
+                            f"Recorded as revision {rev}; new proposals build on your version.",
+                            level="WARNING")
 
     async def incremental_reingest_file(self, repo_id: str, root_path: Path, rel_path: str):
         full_path = root_path / rel_path
@@ -220,11 +228,10 @@ class EngineController:
         ext = full_path.suffix.lower()
         content = full_path.read_text(encoding="utf-8", errors="replace")
 
-        raw = await self.repo_store.upsert_base_files(repo_id, [(rel_path.replace("\\", "/"), full_path.read_bytes())])
+        raw_bytes = full_path.read_bytes()
+        raw = await self.repo_store.upsert_base_files(repo_id, [(rel_path.replace("\\", "/"), raw_bytes)])
         if raw["shadowed"]:
-            notifier.notify("Pending revision is stale",
-                            f"'{rel_path}' changed on disk while a proposed revision overrides it. Revert or request the change again.",
-                            level="WARNING")
+            await self._record_disk_sync(repo_id, {raw["shadowed"][0]: raw_bytes})
         
         strategy = ChunkingRegistry.get_strategy(ext)
         chunk_docs = strategy.chunk_file(repo_id, rel_path, fhash, content, settings.chunk_size, settings.chunk_overlap)
@@ -344,6 +351,13 @@ class EngineController:
 
     async def revert_revision(self, repo_id: str, to_rev: int) -> int:
         return await self.repo_store.revert_to(repo_id, to_rev)
+
+    async def apply_revision(self, repo_id: str, rev: int, force: bool = False) -> dict:
+        """Write a proposed revision into the repo folder (explicit user action)."""
+        repo = await self.db.get_repo(repo_id)
+        if not repo:
+            raise ValueError(f"Repository ID '{repo_id}' not found.")
+        return await apply_revision_to_disk(self.repo_store, repo_id, rev, Path(repo.root_path), force)
 
     async def prepare_attachments(self, files: List[Tuple[str, str, bytes]]) -> List[dict]:
         """Extract text (OCR for images) from (filename, mime, bytes) tuples. Raises ValueError if unsupported."""

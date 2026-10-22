@@ -2,8 +2,12 @@
 
 Order of authority:
   1. explicit prefix:  /ask ...   /change ...   /fix ...   (always wins, no model call)
-  2. decision model:   settings.router_model on Ollama, JSON out, used when confident
-  3. keyword rules:    always available, used if no model is configured or it fails
+  2. decision model:   settings.router_model via Ollama /v1/systemone (services/decision.py)
+  3. keyword rules:    always available; used if no model is set, it is unreachable, or unsure
+
+The decision model answers ONE yes/no question and returns P(true). P >= 0.5 means
+"change"; confidence is how far from a coin flip it is, and must reach
+settings.router_min_confidence, otherwise the rules decide.
 
 "change" only creates a PROPOSAL (nothing is written to the repo on disk), so a
 wrong guess costs one wasted generation, not a damaged file. Ambiguous -> "ask".
@@ -11,11 +15,12 @@ wrong guess costs one wasted generation, not a damaged file. Ambiguous -> "ask".
 from __future__ import annotations
 
 import re
+import sys
 from dataclasses import dataclass
-from typing import Optional
+from typing import Awaitable, Callable, Optional
 
 from config.settings import settings
-from services.model_calls import LLMJson, ask_json
+from services.decision import decide_noul
 
 _PREFIX = re.compile(r"^\s*/(ask|change|fix|edit|implement)\b[:\s]*", re.IGNORECASE)
 
@@ -29,6 +34,12 @@ _BUG_FIX = re.compile(r"\b(fix|resolve|solve|debug)\b.*\b(bug|error|issue|except
 _STRONG_ASK = re.compile(
     r"^\s*(?:what|why|how|where|which|who|when|explain|describe|summari[sz]e|show|list|tell|review|"
     r"is|are|does|do|did|walk)\b", re.IGNORECASE)
+
+_Q = "Does the user want code or files modified, a bug fixed, or a feature built?"
+_TRUE = "The user wants code or files modified, a bug fixed, or a feature built."
+_FALSE = "The user wants an explanation, search, review, or any read-only answer."
+
+NoulFn = Callable[..., Awaitable[Optional[float]]]
 
 
 @dataclass
@@ -48,32 +59,20 @@ def route_by_rules(query: str) -> RouteDecision:
     return RouteDecision("ask", q, "rules", 0.5)
 
 
-_PROMPT = """You route messages sent to a code-repository assistant.
-"change" = the user wants code or files modified, a bug fixed, or a feature built.
-"ask"    = the user wants an explanation, search, review, or any read-only answer.
-Reply with ONLY JSON: {{"intent": "ask" or "change", "confidence": 0.0-1.0}}
-
-Message: {message}"""
-
-
-async def route_intent(query: str, *, llm_json: LLMJson = ask_json,
+async def route_intent(query: str, *, noul_fn: NoulFn = decide_noul,
                        model: Optional[str] = None, repo_id: str = "") -> RouteDecision:
     m = _PREFIX.match(query)
     if m:
         word = m.group(1).lower()
         return RouteDecision("ask" if word == "ask" else "change", query[m.end():].strip(), "prefix", 1.0)
 
+    q = query.strip()
     model = settings.router_model if model is None else model
     if model:
-        data = await llm_json(model, _PROMPT.format(message=query.strip()[:2000]),
-                              phase="ROUTER", repo_id=repo_id)
-        intent = str((data or {}).get("intent", "")).strip().lower()
-        try:
-            conf = float((data or {}).get("confidence", 0))
-        except (TypeError, ValueError):
-            conf = 0.0
-            
-        print(f"Intent: {intent} (conf={conf:.2f}) from model {model}")
-        if intent in ("ask", "change") and conf >= settings.router_min_confidence:
-            return RouteDecision(intent, query.strip(), "model", conf)
-    return route_by_rules(query)
+        p = await noul_fn(model, q, _Q, true=_TRUE, false=_FALSE, phase="ROUTER", repo_id=repo_id)
+        if p is not None:
+            intent, conf = ("change", p) if p >= 0.5 else ("ask", 1.0 - p)
+            sys.stdout.write(f"[ROUTER] {intent} (conf={conf:.2f}) via {model}\n")
+            if conf >= settings.router_min_confidence:
+                return RouteDecision(intent, q, "model", round(conf, 4))
+    return route_by_rules(q)

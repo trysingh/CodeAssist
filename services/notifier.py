@@ -5,7 +5,7 @@ from plyer import notification
 from fastapi import APIRouter
 from sse_starlette.sse import EventSourceResponse
 import asyncio
-
+from config.settings import settings
 class NotificationDispatcher:
     """Dispatches real-time re-ingestion notifications to Logs, Windows OS, and Web Toasts."""
     
@@ -24,12 +24,13 @@ class NotificationDispatcher:
 
         # 2. Windows OS Level Desktop Notification
         try:
-            notification.notify(
-                title=f"CodeRAG Engine: {title}",
-                message=message,
-                app_name="CodeRAG Engine",
-                timeout=5
-            )
+            if settings.notify_at_os_level: 
+                notification.notify(
+                    title=f"CodeRAG Engine: {title}",
+                    message=message,
+                    app_name="CodeRAG Engine",
+                    timeout=5
+                )
         except Exception:
             pass  # Fallback gracefully if running on headless server / container
 

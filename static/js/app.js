@@ -650,3 +650,32 @@ async function sendChatMessage(e) {
 }
 
 renderRecentPaths();
+
+// "Apply to repo" links in change proposals POST to the API instead of navigating.
+document.addEventListener('click', async e => {
+    const a = e.target.closest('a[href$="/apply"]');
+    if (!a) return;
+    e.preventDefault();
+    if (a.dataset.busy) return;
+    a.dataset.busy = '1';
+    const label = a.textContent;
+    const post = async (force) => {
+        const r = await fetch(a.getAttribute('href') + (force ? '?force=true' : ''), { method: 'POST' });
+        return { ok: r.ok, status: r.status, body: await r.json().catch(() => ({})) };
+    };
+    try {
+        a.textContent = 'Applying...';
+        let res = await post(false);
+        if (res.status === 409 && (res.body.conflicts || []).length) {
+            const names = res.body.conflicts.map(c => c.path).join('\n');
+            if (confirm('These files changed on disk since ingest:\n' + names + '\n\nOverwrite them anyway?')) res = await post(true);
+            else { a.textContent = label; return; }
+        }
+        a.textContent = res.ok ? `Applied (${res.body.written.length + res.body.deleted.length} file(s))`
+                               : 'Apply failed: ' + (res.body.detail || res.body.note || res.status);
+    } catch (err) {
+        a.textContent = 'Apply failed';
+    } finally {
+        delete a.dataset.busy;
+    }
+});

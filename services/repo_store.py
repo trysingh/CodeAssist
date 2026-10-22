@@ -266,6 +266,30 @@ class RepoStore:
             await db.commit()
         return rev
 
+    async def record_disk_sync(self, repo_id: str, changes: Dict[str, bytes]) -> Optional[int]:
+        """The user edited files on disk that a revision also changes. Append a revision holding the
+        disk content so new proposals build on what is on disk (history is kept, nothing is deleted)."""
+        if not changes:
+            return None
+        for _ in range(2):
+            latest = await self.latest_rev(repo_id)
+            try:
+                return await self.create_revision(
+                    repo_id, latest, "disk sync: file(s) edited on disk", dict(changes),
+                    {"kind": "disk-sync", "files": sorted(changes)})
+            except StaleRevision:
+                continue
+        return None
+
+    async def newer_revision_for(self, repo_id: str, path: str, after_rev: int) -> Optional[int]:
+        """Newest revision above `after_rev` that changes `path`, if any."""
+        await self._ensure()
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(
+                "SELECT MAX(rev) FROM repo_files WHERE repo_id=? AND file_path=? AND rev>?",
+                (repo_id, safe_rel_path(path), after_rev)) as cur:
+                return (await cur.fetchone())[0]
+
     async def list_revisions(self, repo_id: str) -> List[dict]:
         await self._ensure()
         async with aiosqlite.connect(self.db_path) as db:
@@ -325,6 +349,52 @@ class RepoStore:
         return await self.create_revision(
             repo_id, latest, f"revert to revision {target_rev}", changes,
             {"kind": "revert", "to_rev": target_rev})
+
+    async def index(self, repo_id: str, rev: Optional[int] = None) -> Dict[str, str]:
+        """{path: sha256} of every live file at `rev` (default: latest)."""
+        await self._ensure()
+        if rev is None:
+            rev = await self.latest_rev(repo_id)
+        async with aiosqlite.connect(self.db_path) as db:
+            return await self._index(db, repo_id, rev)
+
+    async def snapshot_bytes(self, repo_id: str, rev: Optional[int] = None) -> Dict[str, bytes]:
+        """{path: bytes} of the whole repo view at `rev`, in one query (used to build sandbox workspaces)."""
+        await self._ensure()
+        if rev is None:
+            rev = await self.latest_rev(repo_id)
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(
+                "SELECT f.file_path, f.content, f.deleted FROM repo_files f "
+                "JOIN (SELECT file_path, MAX(rev) AS r FROM repo_files "
+                "      WHERE repo_id=? AND rev<=? GROUP BY file_path) m "
+                "  ON f.file_path=m.file_path AND f.rev=m.r "
+                "WHERE f.repo_id=?", (repo_id, rev, repo_id)) as cur:
+                return {r[0]: zlib.decompress(r[1]) for r in await cur.fetchall() if not r[2]}
+
+    async def delete_base(self, repo_id: str, paths: Iterable[str]) -> int:
+        """Remove rev-0 rows (the file was deleted from disk by an applied revision)."""
+        await self._ensure()
+        paths = [safe_rel_path(p) for p in paths]
+        async with aiosqlite.connect(self.db_path) as db:
+            for p in paths:
+                await db.execute("DELETE FROM repo_files WHERE repo_id=? AND rev=0 AND file_path=?", (repo_id, p))
+            await db.commit()
+        return len(paths)
+
+    async def mark_applied(self, repo_id: str, rev: int) -> None:
+        await self._ensure()
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute("SELECT report_json FROM repo_revisions WHERE repo_id=? AND rev=?",
+                                  (repo_id, rev)) as cur:
+                row = await cur.fetchone()
+            if not row:
+                return
+            report = json.loads(row[0] or "{}")
+            report["applied_at"] = datetime.now(timezone.utc).isoformat()
+            await db.execute("UPDATE repo_revisions SET report_json=? WHERE repo_id=? AND rev=?",
+                             (json.dumps(report, default=str), repo_id, rev))
+            await db.commit()
 
     # ------------------------------------------------------------------ extract
     async def materialize(self, repo_id: str, rev: Optional[int], dest: Path,

@@ -3,7 +3,7 @@ from pathlib import Path
 from typing import List
 from pydantic import BaseModel
 from fastapi import FastAPI, BackgroundTasks, HTTPException, Request, File, Form, UploadFile
-from fastapi.responses import HTMLResponse, FileResponse, PlainTextResponse, Response
+from fastapi.responses import HTMLResponse, FileResponse, PlainTextResponse, Response, JSONResponse
 from fastapi.templating import Jinja2Templates
 from sse_starlette.sse import EventSourceResponse
 
@@ -155,6 +155,17 @@ async def revision_download(repo_id: str, rev: int):
         raise HTTPException(status_code=404, detail="Revision not found")
     return Response(content=data, media_type="application/zip",
                     headers={"Content-Disposition": f'attachment; filename="{repo_id}_rev{rev}.zip"'})
+
+@app.post("/api/v1/repos/{repo_id}/revisions/{rev}/apply")
+async def apply_revision(repo_id: str, rev: int, force: bool = False):
+    """Writes the revision into the repo folder. 409 + conflicts if files changed on disk since ingest."""
+    try:
+        res = await controller.apply_revision(repo_id, rev, force)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    return JSONResponse(res, status_code=200 if res["ok"] else 409)
 
 @app.post("/api/v1/repos/{repo_id}/revisions/revert")
 async def revert_revision(repo_id: str, to_rev: int = 0):

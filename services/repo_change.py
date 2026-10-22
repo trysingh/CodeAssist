@@ -2,17 +2,19 @@
 
 Fixed sub-graph with bounded retries (not supervisor-driven):
 
-    locate -> patch -> apply_check --ok--> persist -> END
-                ^          |
-                +--retry---+      (max settings.change_max_attempts, then fail)
+    locate -> patch -> apply_check -> sandbox -> persist -> END
+                ^           |            |
+                +---retry---+------------+   (max settings.change_max_attempts, or no progress: stop)
 
-Phase 1 verification is L0 (syntax / undefined names / JSON / YAML / Jinja).
-Phase 2 adds the sandbox node after apply_check.
-Nothing is ever written to the repo on disk; the result is a new revision in RepoStore.
+Verification levels: L0 static checks, L1 import smoke, L2 repo tests (sandbox).
+Failures are triaged: a decision model (tev1) separates "code is wrong" from "test is
+outdated"; rules decide "sandbox environment problem". Pre-existing failures never block.
+Nothing is written to the repo on disk by this module; the result is a revision in RepoStore.
 """
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import operator
 import re
 from dataclasses import dataclass, field
@@ -22,10 +24,12 @@ from langgraph.graph import END, START, StateGraph
 
 from config.settings import settings
 from services import static_check
+from services.decision import Choice, decide_choice
 from services.model_calls import LLMJson, LLMText, ask_json, ask_text
 from services.patch_service import (apply_edits, diff_stats, make_diff, parse_edits,
                                     resolve_edit_paths)
 from services.repo_store import RepoStore, StaleRevision
+from services.sandbox_service import CaseResult, SandboxService, SandboxVerdict
 
 if TYPE_CHECKING:  # avoid importing chroma/ollama just to type-hint
     from models.database import DatabaseManager
@@ -51,16 +55,35 @@ class ChangeResult:
     notes: List[str] = field(default_factory=list)
     errors: List[str] = field(default_factory=list)
     trace: List[str] = field(default_factory=list)
+    tests: dict = field(default_factory=dict)
+    verification: str = "L0-static"
+
+    def _tests_line(self) -> str:
+        t = self.tests or {}
+        if t.get("inconclusive"):
+            return f"**Tests inconclusive:** {t.get('note')}"
+        if not t.get("ran"):
+            return f"**Tests not run:** {t.get('note') or 'sandbox not used'}."
+        if t.get("mode") == "smoke":
+            line = f"Import check: {t['passed']} module(s) import cleanly in the sandbox (the repo has no tests)."
+        else:
+            line = (f"Tests: **{t['passed']} passed**, {t['failed'] - t['preexisting']} new failure(s)"
+                    f" ({t['selected']} test file(s), {t['strategy']}).")
+        if t.get("preexisting"):
+            line += f" {t['preexisting']} failure(s) already existed before the change and were ignored."
+        if t.get("note"):
+            line += f" {t['note']}"
+        return line + f" [{t.get('backend')}, {t.get('duration')}s]"
 
     def to_markdown(self) -> str:
         base = f"/api/v1/repos/{self.repo_id}/revisions/{self.revision}"
         if self.ok:
             head = (f"**Change proposal saved as revision {self.revision}** "
-                    f"(built on revision {self.base_rev}, {self.attempts} attempt(s)).\n\n"
-                    f"Verification: static checks passed on {self.checked} check(s)"
-                    f"{f', {self.skipped} skipped' if self.skipped else ''}. "
-                    f"**Tests have not been run yet** (sandbox arrives in Phase 2). "
-                    f"Nothing was written to your repo.\n")
+                    f"(built on revision {self.base_rev}, {self.attempts} attempt(s)). "
+                    f"Verification level: **{self.verification}**.\n\n"
+                    f"Static checks passed on {self.checked} check(s)"
+                    f"{f', {self.skipped} skipped' if self.skipped else ''}. {self._tests_line()} "
+                    f"Nothing has been written to your repo yet.\n")
         else:
             head = (f"**I could not produce a safe change** after {self.attempts} attempt(s). "
                     f"Nothing was saved and nothing was written to your repo.\n")
@@ -82,7 +105,7 @@ class ChangeResult:
                 self.diff[:_CHAT_DIFF_CHARS] + "\n... [diff truncated; full diff via the link below]")
             parts.append(f"```diff\n{d}\n```")
         if self.ok:
-            parts.append(f"[Download changed files]({base}/download) · [Full diff]({base}/diff)")
+            parts.append(f"[Apply to repo]({base}/apply) · [Download changed files]({base}/download) · [Full diff]({base}/diff)")
         return "\n\n".join(parts)
 
 
@@ -101,6 +124,8 @@ class ChangeState(TypedDict, total=False):
     errors: List[str]
     notes: List[str]
     check_lines: List[str]
+    tests: dict
+    last_sig: str
     checked: int
     skipped: int
     revision: Optional[int]
@@ -135,10 +160,13 @@ FILES:
 
 class RepoChangeService:
     def __init__(self, db: "DatabaseManager", vector_service: "VectorStoreService", store: RepoStore,
-                 llm_text: LLMText = ask_text, llm_json: LLMJson = ask_json, emit=None):
+                 llm_text: LLMText = ask_text, llm_json: LLMJson = ask_json, emit=None,
+                 sandbox: Optional[SandboxService] = None, choice_fn=decide_choice):
         self.db, self.vector, self.store = db, vector_service, store
-        self.llm_text, self.llm_json = llm_text, llm_json
+        self.llm_text, self.llm_json = llm_text, llm_json      # chat models: text / JSON
+        self.choice_fn = choice_fn                             # decision model (tev1): classification
         self._emit_fn = emit
+        self.sandbox = sandbox or SandboxService(store, emit=emit)
         self.graph = self._build()
 
     # ------------------------------------------------------------------ public
@@ -166,6 +194,8 @@ class RepoChangeService:
         res.checked, res.skipped = out.get("checked", 0), out.get("skipped", 0)
         res.checks = out.get("check_lines", [])
         res.revision = out.get("revision")
+        res.tests = out.get("tests", {})
+        res.verification = self._verification(res.tests)
         res.ok = out.get("status") == "ok" and res.revision is not None
         await self._fill_diff(res, out.get("working", {}), base_rev)
         return res
@@ -249,7 +279,7 @@ class RepoChangeService:
         cands = list(dict.fromkeys(named + semantic))
         if not cands:
             # Nothing named, nothing found: let a small model choose from the file tree.
-            picker = settings.router_model or settings.patcher_model or settings.llm_model
+            picker = settings.patcher_model or settings.llm_model       # a chat model; decision models cannot return file lists
             try:
                 data = await self.llm_json(
                     picker,
@@ -262,9 +292,9 @@ class RepoChangeService:
                 trace.append(f"file-tree pick failed: {type(e).__name__}")
             cands = [p for p in (data or {}).get("files", []) if p in known][: settings.change_max_files]
             trace.append(f"file-tree pick: {len(cands)} file(s)")
-        elif len(cands) > settings.change_max_files and settings.router_model:
+        elif len(cands) > settings.change_max_files:
             data = await self.llm_json(
-                settings.router_model,
+                settings.patcher_model or settings.llm_model,
                 "Pick the files that must be edited for this request. "
                 f"Reply ONLY JSON: {{\"files\": [paths]}} using at most {settings.change_max_files} "
                 f"paths from the list.\nREQUEST: {request}\nCANDIDATES:\n" + "\n".join(cands),
@@ -379,7 +409,8 @@ class RepoChangeService:
         if not changes:
             return {"status": "failed", "errors": ["the edits produced no net change"]}
         report = {"kind": "edit", "attempts": state["attempt"], "checked": state.get("checked", 0),
-                  "skipped": state.get("skipped", 0), "verification": "L0-static",
+                  "skipped": state.get("skipped", 0), "verification": self._verification(state.get("tests", {})),
+                  "tests": state.get("tests", {}),
                   "notes": state.get("notes", []), "files": sorted(changes)}
         try:
             rev = await self.store.create_revision(
@@ -389,12 +420,111 @@ class RepoChangeService:
         self._emit(f"Saved revision {rev} ({len(changes)} file(s))", "SUCCESS")
         return {"revision": rev, "trace": [f"saved revision {rev}"]}
 
+    # ------------------------------------------------------------------ sandbox + triage
+    @staticmethod
+    def _verification(t: dict) -> str:
+        if t.get("ran") and t.get("ok"):
+            return "L2-tests" if t.get("mode") == "pytest" else "L1-import-smoke"
+        return "L0-static"
+
+    @staticmethod
+    def _is_environment(c: CaseResult, local_tops: set) -> bool:
+        """Rules gate 'environment': a model alone is never allowed to wave a failure away."""
+        text = f"{c.message}\n{c.detail}"
+        m = re.search(r"No module named '([\w.]+)'", text)
+        if m:
+            return m.group(1).split(".")[0] not in local_tops       # third-party package missing in image
+        return bool(re.search(r"Connection(Error|Refused)|Connection refused|Name or service not known|"
+                              r"Temporary failure in name resolution|getaddrinfo failed|Max retries exceeded",
+                              text, re.IGNORECASE))
+
+    async def _triage(self, state: ChangeState, failures: List[CaseResult]) -> Dict[str, str]:
+        """code_bug | test_outdated | environment for each new failure."""
+        tops = {p.split("/")[0].removesuffix(".py") for p in state["known"] + list(state["working"])}
+        kinds: Dict[str, str] = {}
+        todo: List[CaseResult] = []
+        for c in failures:
+            if self._is_environment(c, tops):
+                kinds[c.id] = "environment"
+            else:
+                kinds[c.id] = "code_bug"
+                todo.append(c)
+        if not (settings.router_model and todo):
+            return kinds
+
+        async def ask(c: CaseResult):
+            st = (f"Change request: {state['request'][:300]}\nFailing test: {c.id}\n"
+                  f"Error: {c.message}\n{c.detail[:600]}")
+            return c, await self.choice_fn(
+                settings.router_model, st, "Why does this test fail after the code change?",
+                {"code_bug": "The change introduced a defect or broke behaviour the test rightly expects.",
+                 "test_outdated": "The test checks old behaviour that the change request intentionally replaces."},
+                phase="TRIAGE", repo_id=state["repo_id"])
+
+        for c, ch in await asyncio.gather(*(ask(c) for c in todo[:3])):
+            if isinstance(ch, Choice) and ch.confidence >= settings.router_min_confidence:
+                kinds[c.id] = ch.choice
+        return kinds
+
+    @staticmethod
+    def _test_path(case_id: str, known: set) -> Optional[str]:
+        parts = case_id.split("::")[0].split(".")
+        while parts:
+            cand = "/".join(parts) + ".py"
+            if cand in known:
+                return cand
+            parts.pop()
+        return None
+
+    async def _sandbox(self, state: ChangeState) -> dict:
+        if state.get("status") == "failed":
+            return {}
+        verdict: SandboxVerdict = await self.sandbox.verify(state["repo_id"], state["base_rev"], state["working"])
+        tests = verdict.to_dict()
+        notes = list(state["notes"])
+        if not verdict.ran:
+            notes.append(f"tests not run: {verdict.report.note}")
+            return {"status": "ok", "tests": tests, "notes": notes}
+        if verdict.ok:
+            return {"status": "ok", "tests": tests}
+
+        kinds = await self._triage(state, verdict.new_failures)
+        real = [c for c in verdict.new_failures if kinds.get(c.id) != "environment"]
+        if not real:
+            tests.update(ok=False, inconclusive=True,
+                         note="The failures come from the sandbox environment (missing package or network), not from the change.")
+            notes.append("tests inconclusive: " + verdict.new_failures[0].message)
+            return {"status": "ok", "tests": tests, "notes": notes}
+
+        sig = hashlib.sha256("|".join(sorted(f"{c.id}:{c.message[:80]}" for c in real)).encode()).hexdigest()[:12]
+        lines = []
+        for c in real[:3]:
+            hint = " (the test expects OLD behaviour: update the test as well)" if kinds.get(c.id) == "test_outdated" else ""
+            lines.append(f"test {c.id} fails{hint}: {c.message}\n" + "\n".join("    " + l for l in c.detail.splitlines()[-14:]))
+        problems = [f"{len(real)} test(s) newly failing after the change:"] + lines
+        if state["attempt"] >= settings.change_max_attempts or sig == state.get("last_sig"):
+            why = ("no progress: the same tests still fail after the last fix"
+                   if sig == state.get("last_sig") else "tests still failing after the maximum number of attempts")
+            return {"status": "failed", "tests": tests, "last_sig": sig, "errors": [why] + problems}
+
+        known = set(state["known"]) | set(state["working"])
+        targets = list(state["targets"])
+        for c in real[:2]:
+            tp = self._test_path(c.id, known)
+            if tp and tp not in targets:
+                targets.append(tp)           # let the patcher read (and, if outdated, edit) the failing test
+        self._emit(f"Attempt {state['attempt']}: {len(real)} new test failure(s), retrying", "WARNING")
+        return {"status": "retry", "tests": tests, "last_sig": sig, "targets": targets, "errors": problems,
+                "feedback": "\n".join(problems)[:4500],
+                "trace": [f"attempt {state['attempt']}: {len(real)} new test failure(s)"]}
+
     # ------------------------------------------------------------------ wiring
     def _build(self):
         g = StateGraph(ChangeState)
         g.add_node("locate", self._locate)
         g.add_node("patch", self._patch)
         g.add_node("apply_check", self._apply_check)
+        g.add_node("sandbox", self._sandbox)
         g.add_node("persist", self._persist)
         g.add_edge(START, "locate")
         g.add_conditional_edges("locate", lambda s: END if s.get("status") == "failed" else "patch",
@@ -402,6 +532,10 @@ class RepoChangeService:
         g.add_edge("patch", "apply_check")
         g.add_conditional_edges(
             "apply_check",
+            lambda s: {"ok": "sandbox", "retry": "patch"}.get(s.get("status"), END),
+            {"sandbox": "sandbox", "patch": "patch", END: END})
+        g.add_conditional_edges(
+            "sandbox",
             lambda s: {"ok": "persist", "retry": "patch"}.get(s.get("status"), END),
             {"persist": "persist", "patch": "patch", END: END})
         g.add_edge("persist", END)

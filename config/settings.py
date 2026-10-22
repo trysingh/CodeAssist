@@ -16,7 +16,10 @@ class EngineSettings(BaseSettings):
     
     # Ollama Configuration
     ollama_base_url: str = Field(default="http://localhost:11434")
-    ollama_base_url_for_sys1_model: str = Field(default="http://localhost:11434/v1/systemone")
+    ollama_base_url_for_sys1_model: str = Field(default="http://localhost:11434/v1/systemone")   # full URL, /v1, or base: all accepted
+    decision_timeout_s: float = Field(default=10.0)
+    decision_cooldown_s: int = Field(default=60)       # skip a failing decision endpoint for this long
+    decision_max_state_chars: int = Field(default=2000)
 
     llm_model: str = Field(default="llama3.1:latest")
     embedding_model: str = Field(default="nomic-embed-text:latest")
@@ -35,7 +38,7 @@ class EngineSettings(BaseSettings):
     batch_size: int = Field(default=32)
 
     # Code change agents (Phase 1). Models run on the same Ollama endpoint as the others.
-    router_model: str = Field(default="tev1:0.8b")              # small decision model: ask vs change. empty = keyword rules only
+    router_model: str = Field(default="tev1:0.8b")     # DECISION model (/v1/systemone): ask vs change, failure triage. empty = rules only
     router_min_confidence: float = Field(default=0.6)
     patcher_model: str = Field(default="")             # edit-block author; empty = llm_model
     change_max_attempts: int = Field(default=3)        # patch -> apply -> check retries
@@ -43,6 +46,22 @@ class EngineSettings(BaseSettings):
     change_context_chars: int = Field(default=60000)   # raw-file budget per prompt
     change_num_ctx: int = Field(default=32768)
     change_max_output_tokens: int = Field(default=8192)
+
+    # Sandbox (Phase 2): isolated test runs for proposed changes
+    sandbox_enabled: bool = Field(default=True)
+    sandbox_backend: str = Field(default="docker")     # docker | local  (local = NO isolation: dev/tests only)
+    sandbox_base_image: str = Field(default="python:3.12-slim")
+    sandbox_image_prefix: str = Field(default="coderag-sbx")
+    sandbox_memory: str = Field(default="1g")
+    sandbox_cpus: str = Field(default="2")
+    sandbox_pids: int = Field(default=256)
+    sandbox_test_timeout_s: int = Field(default=180)
+    sandbox_build_timeout_s: int = Field(default=1500)
+    sandbox_max_workspace_mb: int = Field(default=64)
+    sandbox_requirements_files: List[str] = Field(default=["requirements-test.txt", "requirements-dev.txt", "requirements.txt"])
+
+    # Notifiations Configuration
+    notify_at_os_level: bool = Field(default=False)
 
     # Raw (verbatim) file store: what may be persisted
     raw_store_max_file_kb: int = Field(default=512)

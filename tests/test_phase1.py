@@ -188,26 +188,31 @@ def test_rules_router():
     assert route_by_rules("hmm engine").intent == "ask"
 
 
-def test_router_prefix_model_and_fallback(monkeypatch):
+def test_router_prefix_model_and_fallback():
     async def go():
         async def boom(*a, **k):
             raise AssertionError("model must not be called for a prefix")
-        d = await route_intent("/ask add pagination?", llm_json=boom, model="m")
+        d = await route_intent("/ask add pagination?", noul_fn=boom, model="m")
         assert (d.intent, d.query, d.source) == ("ask", "add pagination?", "prefix")
 
-        async def conf(*a, **k):
-            return {"intent": "change", "confidence": 0.9}
-        d = await route_intent("what is this", llm_json=conf, model="m")
+        async def likely_change(*a, **k):
+            return 0.9                                    # P(wants change)
+        d = await route_intent("what is this", noul_fn=likely_change, model="m")
         assert (d.intent, d.source) == ("change", "model")
 
-        async def low(*a, **k):
-            return {"intent": "change", "confidence": 0.2}
-        d = await route_intent("what is this", llm_json=low, model="m")
+        async def likely_ask(*a, **k):
+            return 0.1
+        d = await route_intent("fix the bug in a.py", noul_fn=likely_ask, model="m")
+        assert (d.intent, d.source) == ("ask", "model") and d.confidence == 0.9
+
+        async def unsure(*a, **k):
+            return 0.55                                   # confidence 0.55 < 0.6 -> rules decide
+        d = await route_intent("what is this", noul_fn=unsure, model="m")
         assert (d.intent, d.source) == ("ask", "rules")
 
         async def none(*a, **k):
             return None
-        d = await route_intent("fix the bug in a.py", llm_json=none, model="m")
+        d = await route_intent("fix the bug in a.py", noul_fn=none, model="m")
         assert (d.intent, d.source) == ("change", "rules")
     run(go())
 
@@ -256,7 +261,7 @@ def test_change_happy_path_creates_revision_not_disk_write():
         assert (await s.get_file(rid, "calc.py")).data == b"def add(a, b):\n    return a + b\n"
         assert (await s.get_file(rid, "calc.py", 0)).data.endswith(b"a - b\n")
         assert "revision 1" in r.to_markdown() and "```diff" in r.to_markdown()
-        assert "Tests have not been run" in r.to_markdown()
+        assert "Tests not run" in r.to_markdown()
     run(go())
 
 
