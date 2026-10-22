@@ -2,7 +2,7 @@ from datetime import datetime
 import aiosqlite
 from typing import List, Dict, Optional, Any
 from config.settings import settings
-from models.schemas import RepoInfo, JobStatus 
+from models.schemas import GENERAL_REPO_ID, RepoInfo, JobStatus 
 
 class DatabaseManager:
     """Manages SQLite persistence for repository metadata, job states, and multi-thread chat history."""
@@ -104,6 +104,9 @@ class DatabaseManager:
                     metadata_json TEXT
                 )
             """)
+            await db.execute(
+                "INSERT OR IGNORE INTO repositories (repo_id, title, root_path, status, total_files, created_at) "
+                "VALUES (?, 'General (web)', '', 'COMPLETED', 0, ?)", (GENERAL_REPO_ID, datetime.utcnow().isoformat()))
             await db.commit()
 
     async def create_thread(self, thread_id: str, repo_id: str, title: str):
@@ -215,8 +218,8 @@ class DatabaseManager:
         async with aiosqlite.connect(self.db_path) as db:
             async with db.execute("""
                 SELECT repo_id, title, root_path, status, total_files, processed_files, total_chunks, created_at
-                FROM repositories ORDER BY created_at DESC
-            """) as cursor:
+                FROM repositories WHERE repo_id != ? ORDER BY created_at DESC
+            """, (GENERAL_REPO_ID,)) as cursor:
                 rows = await cursor.fetchall()
                 results = []
                 for row in rows:

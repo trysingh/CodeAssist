@@ -39,7 +39,11 @@ class RepoInfo(BaseModel):
     total_chunks: int
     created_at: datetime
 
+GENERAL_REPO_ID = "__general__"      # placeholder repo: chat without a codebase (web / general questions)
+
+
 class ChatRequest(BaseModel):
     repo_id: str
     thread_id: str
     query: str
+    web: str = "auto"               # auto | on | off

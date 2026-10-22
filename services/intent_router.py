@@ -48,9 +48,11 @@ COMMANDS_HELP = """**Commands** (start your message with one):
 - `/fix <bug>`: same as `/change`, aimed at a bug
 - `/edit <request>`: same as `/change`
 - `/implement <feature>`: same as `/change`, aimed at a new feature
+- `/web <question>`: answer using a live web search (works with or without a repository)
 - `/help` (or `/commands`): show this list
 
-Without a command, the system decides between ask and change on its own."""
+Without a command, the system decides between ask and change on its own, and
+uses the web only when needed (see the Web chip next to the message box)."""
 
 
 def is_help(query: str) -> bool:

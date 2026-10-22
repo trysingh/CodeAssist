@@ -1,7 +1,9 @@
 from pathlib import Path
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from pydantic import Field
+from pydantic import AliasChoices, Field
 from typing import List
+
+DEFAULT_MODEL = "gemma4:31b-cloud"
 
 class EngineSettings(BaseSettings):
     app_name: str = "CodeRAG Chunking Engine"
@@ -21,7 +23,24 @@ class EngineSettings(BaseSettings):
     decision_cooldown_s: int = Field(default=60)       # skip a failing decision endpoint for this long
     decision_max_state_chars: int = Field(default=2000)
 
-    llm_model: str = Field(default="llama3.1:latest")
+    # ---- web search / scraping (optional context for chat) ----
+    web_enabled: bool = True                           # master switch; False = never touch the internet
+    searxng_url: str = Field(default="http://localhost:8080/search",
+                             validation_alias=AliasChoices("ENGINE_SEARXNG_URL", "SEARXNG_URL"))
+    web_max_results: int = 5                           # results requested from SearXNG
+    web_max_pages: int = 3                             # pages actually scraped per question
+    web_page_chars: int = 5000                         # per-page text budget sent to the LLM
+    web_search_timeout_s: float = 10.0
+    web_timeout_s: float = 12.0                        # whole search + scrape budget per question
+    web_auto_threshold: float = 0.75                   # P(needs web) required in "auto" mode inside a repo
+    web_allow_playwright: bool = False                 # browser fallback: +4-12s per page, off for chat
+    web_min_words: int = 120                           # scraper early-exit threshold
+    scraper_timeout: int = 15
+    playwright_headless: bool = True
+    scrape_fast_deadline: float = 2.5
+    scrape_max_concurrent_heavy: int = 3
+
+    llm_model: str = Field(default=DEFAULT_MODEL)
     embedding_model: str = Field(default="nomic-embed-text:latest")
     
     # Attachments (pasted images / files / large text)

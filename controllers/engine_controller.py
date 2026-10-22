@@ -16,6 +16,8 @@ from services.notifier import notifier
 from services.repo_store import RepoStore
 from services.repo_change import RepoChangeService, ChangeResult
 from services.intent_router import COMMANDS_HELP, route_intent
+from services.web_search_service import split_web_prefix
+from models.schemas import GENERAL_REPO_ID
 from services.patch_service import make_diff
 from services.apply_service import apply_revision as apply_revision_to_disk
 
@@ -318,17 +320,26 @@ class EngineController:
         await self.db.init_db()
         return await self.db.list_repos()
 
-    async def chat_with_repo(self, repo_id: str, thread_id: str, query: str) -> str:
+    async def chat_with_repo(self, repo_id: str, thread_id: str, query: str, web: str = "auto") -> str:
         await self.db.init_db()
         repo = await self.db.get_repo(repo_id)
         if not repo:
             raise ValueError(f"Repository ID '{repo_id}' not found.")
+        query, web = split_web_prefix(query, web)
+        if repo_id == GENERAL_REPO_ID:
+            # No codebase: only explicit prefixes matter (model routing would misread "write a script..." as a change).
+            decision = await route_intent(query, model="", repo_id=repo_id)
+            if decision.intent == "help":
+                return COMMANDS_HELP
+            if decision.intent == "change" and decision.source == "prefix":
+                return "Code changes need a repository. Pick one in the selector, or ask your question here."
+            return await self.rag_manager.invoke_chat(repo_id, thread_id, decision.query, web=web)
         decision = await route_intent(query, repo_id=repo_id)
         if decision.intent == "help":
             return COMMANDS_HELP
         if decision.intent == "change":
             return (await self.propose_change(repo_id, decision.query)).to_markdown()
-        return await self.rag_manager.invoke_chat(repo_id, thread_id, decision.query)
+        return await self.rag_manager.invoke_chat(repo_id, thread_id, decision.query, web=web)
 
     async def propose_change(self, repo_id: str, request: str, base_rev: Optional[int] = None) -> ChangeResult:
         await self.db.init_db()

@@ -85,7 +85,7 @@ async def chat_endpoint(req: ChatRequest):
         await controller.db.save_chat_message(req.thread_id, "user", req.query)
         
         # Run RAG workflow
-        response = await controller.chat_with_repo(req.repo_id, req.thread_id, req.query)
+        response = await controller.chat_with_repo(req.repo_id, req.thread_id, req.query, web=req.web)
         
         # Save assistant response
         await controller.db.save_chat_message(req.thread_id, "assistant", response)
@@ -98,6 +98,7 @@ async def chat_with_attachments(
     repo_id: str = Form(...),
     thread_id: str = Form(...),
     query: str = Form(""),
+    web: str = Form("auto"),
     files: List[UploadFile] = File(...),
 ):
     """Chat turn with pasted/uploaded attachments (image, pdf, docx, text). Extracted text is saved on the thread."""
@@ -124,7 +125,7 @@ async def chat_with_attachments(
     msg_id = await controller.db.save_chat_message(thread_id, "user", query)
     saved = await controller.store_attachments(thread_id, msg_id, prepared)
 
-    response = await controller.chat_with_repo(repo_id, thread_id, query or "Please review the attached content.")
+    response = await controller.chat_with_repo(repo_id, thread_id, query or "Please review the attached content.", web=web)
     await controller.db.save_chat_message(thread_id, "assistant", response)
     return {"repo_id": repo_id, "thread_id": thread_id, "answer": response, "attachments": saved}
 

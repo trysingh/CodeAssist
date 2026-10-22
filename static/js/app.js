@@ -99,10 +99,12 @@ const LS = {
     get(k, d) { try { const v = localStorage.getItem('crag.' + k); return v === null ? d : JSON.parse(v); } catch { return d; } },
     set(k, v) { try { localStorage.setItem('crag.' + k, JSON.stringify(v)); } catch { /* storage unavailable */ } }
 };
-const S = { repoId: null, threadId: null, repos: [], tab: null, sending: false, files: [], unread: 0, collapsed: LS.get('collapsed', null), poll: null };
+const GENERAL = '__general__';
+const S = { web: LS.get('web', 'auto'), repoId: null, threadId: null, repos: [], tab: null, sending: false, files: [], unread: 0, collapsed: LS.get('collapsed', null), poll: null };
 const TABS = ['chat', 'repos', 'ingest', 'telemetry'];
 const TITLES = { chat: 'Chat', repos: 'Repositories', ingest: 'Ingest repository', telemetry: 'Telemetry & logs' };
 const isMobile = () => window.innerWidth < 1024;
+const GENERAL_SUGGESTIONS = ['What is new in the latest FastAPI release?', 'Compare Chroma and FAISS for a small RAG POC', 'Summarize this page: https://'];
 const SUGGESTIONS = ['Give me an architecture overview', 'Where is the main entry point?', 'Which modules have the most dependencies?', 'Spot risky or untested code paths'];
 
 document.addEventListener('DOMContentLoaded', async () => {
@@ -346,9 +348,9 @@ async function loadRepositories() {
 
         const select = $('chat-repo-select');
         const keep = S.repoId || select.value || LS.get('repo', '');
-        select.innerHTML = '<option value="">Select repository</option>' +
+        select.innerHTML = `<option value="">Select repository</option><option value="${GENERAL}">🌐 General (web)</option>` +
             S.repos.map(r => `<option value="${esc(r.repo_id)}">${esc(r.title)} (${esc(r.repo_id)})</option>`).join('');
-        const pick = S.repos.some(r => String(r.repo_id) === String(keep)) ? keep : (S.repos.length === 1 ? S.repos[0].repo_id : '');
+        const pick = (keep === GENERAL || S.repos.some(r => String(r.repo_id) === String(keep))) ? keep : (S.repos.length === 1 ? S.repos[0].repo_id : '');
         select.value = pick;
         if (String(pick) !== String(S.repoId || '')) await onRepoChanged();
         else if (!S.repoId && !$('chat-col').children.length) showEmpty(S.repos.length ? 'pick' : 'none');
@@ -463,8 +465,8 @@ function showEmpty(kind, title = '') {
     if (kind === 'thread') {
         col.innerHTML = `<div data-welcome class="pt-[12vh] text-center space-y-5">
             <div class="mx-auto w-11 h-11 rounded-xl bg-blue-600/15 border border-blue-500/25 flex items-center justify-center text-blue-400"><i data-lucide="sparkles" class="w-5 h-5"></i></div>
-            <div><h3 class="text-lg font-semibold text-white">Ask about ${esc(title)}</h3><p class="text-sm text-slate-400 mt-1">Answers are grounded in the ingested chunks of this repository.</p></div>
-            <div class="flex flex-wrap justify-center gap-2">${SUGGESTIONS.map(s => `<button type="button" data-suggest class="text-xs text-slate-300 bg-slate-900 hover:bg-slate-800 border border-slate-700 rounded-full px-3.5 py-2 transition-colors">${esc(s)}</button>`).join('')}</div></div>`;
+            <div><h3 class="text-lg font-semibold text-white">Ask about ${esc(title)}</h3><p class="text-sm text-slate-400 mt-1">${S.repoId === GENERAL ? 'General questions. The web is searched when needed (see the Web chip below).' : 'Answers are grounded in the ingested chunks of this repository.'}</p></div>
+            <div class="flex flex-wrap justify-center gap-2">${(S.repoId === GENERAL ? GENERAL_SUGGESTIONS : SUGGESTIONS).map(s => `<button type="button" data-suggest class="text-xs text-slate-300 bg-slate-900 hover:bg-slate-800 border border-slate-700 rounded-full px-3.5 py-2 transition-colors">${esc(s)}</button>`).join('')}</div></div>`;
     } else {
         const none = kind === 'none';
         col.innerHTML = `<div data-welcome class="pt-[14vh] text-center space-y-4">
@@ -517,7 +519,7 @@ function updateComposer() {
     const ready = !!(S.repoId && S.threadId);
     const t = $('chat-input-query');
     t.disabled = !ready;
-    t.placeholder = ready ? 'Ask anything about the codebase' : (S.repoId ? 'Loading thread…' : 'Select a repository to start chatting');
+    t.placeholder = ready ? (S.repoId === GENERAL ? 'Ask anything (uses the web when needed)' : 'Ask anything about the codebase') : (S.repoId ? 'Loading thread…' : 'Select a repository to start chatting');
     $('send-btn').disabled = !ready || S.sending;
     $('attach-btn').disabled = !ready || S.sending;
 }
@@ -612,7 +614,7 @@ async function sendChatMessage(e) {
 
     const id = 'loader_' + Date.now();
     col.insertAdjacentHTML('beforeend', `<div id="${id}" class="flex gap-3"><div class="w-7 h-7 rounded-lg bg-blue-600/15 border border-blue-500/25 flex items-center justify-center text-blue-400 shrink-0"><i data-lucide="bot" class="w-4 h-4"></i></div>
-        <div class="flex items-center gap-2.5 text-sm text-slate-400 pt-0.5"><span class="think flex gap-1"><span></span><span></span><span></span></span>${files.length ? 'Reading attachments' : 'Retrieving relevant chunks'} <span id="${id}_t" class="font-mono text-xs text-slate-600">0s</span></div></div>`);
+        <div class="flex items-center gap-2.5 text-sm text-slate-400 pt-0.5"><span class="think flex gap-1"><span></span><span></span><span></span></span>${files.length ? 'Reading attachments' : (S.repoId === GENERAL ? 'Thinking' : 'Retrieving relevant chunks')}${S.web !== 'off' ? ' · may search the web' : ''} <span id="${id}_t" class="font-mono text-xs text-slate-600">0s</span></div></div>`);
     icons(); scrollDown(true);
     const t0 = performance.now();
     const tick = setInterval(() => { const el = $(id + '_t'); if (el) el.textContent = Math.floor((performance.now() - t0) / 1000) + 's'; }, 1000);
@@ -621,14 +623,14 @@ async function sendChatMessage(e) {
         let res;
         if (files.length) {
             const fd = new FormData();
-            fd.append('repo_id', S.repoId); fd.append('thread_id', S.threadId); fd.append('query', query);
+            fd.append('repo_id', S.repoId); fd.append('thread_id', S.threadId); fd.append('query', query); fd.append('web', S.web);
             files.forEach(f => fd.append('files', f, f.name));
             res = await fetch('/api/v1/chat/attach', { method: 'POST', body: fd });
         } else {
             res = await fetch('/api/v1/chat', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ repo_id: S.repoId, thread_id: S.threadId, query })
+                body: JSON.stringify({ repo_id: S.repoId, thread_id: S.threadId, query, web: S.web })
             });
         }
         if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || `Server returned ${res.status}`);
@@ -648,6 +650,20 @@ async function sendChatMessage(e) {
         S.sending = false; updateComposer(); input.focus();
     }
 }
+
+// Web chip: Auto -> On -> Off. Auto = only when needed; a leading /web forces it for one message.
+function renderWebBtn() {
+    const m = S.web, b = $('web-btn');
+    if (!b) return;
+    b.dataset.mode = m;
+    $('web-btn-label').textContent = '🌐 ' + { auto: 'Auto', on: 'On', off: 'Off' }[m];
+}
+function cycleWeb() {
+    S.web = { auto: 'on', on: 'off', off: 'auto' }[S.web] || 'auto';
+    LS.set('web', S.web); renderWebBtn();
+}
+window.cycleWeb = cycleWeb;
+renderWebBtn();
 
 renderRecentPaths();
 
