@@ -42,6 +42,17 @@ class RepoInfo(BaseModel):
 GENERAL_REPO_ID = "__general__"      # placeholder repo: chat without a codebase (web / general questions)
 
 
+class TelemetryEvent(BaseModel):
+    """One entry of the Telemetry & logs tab. scope 'general' = shown to everyone; 'repo' = only when repo_id is selected."""
+    uid: str
+    ts: str                          # ISO-8601 UTC, e.g. 2026-10-23T12:54:04.123Z
+    scope: str = "general"           # general | repo
+    repo_id: Optional[str] = None    # None for general events
+    level: str = "INFO"
+    title: str
+    message: str
+
+
 class ChatRequest(BaseModel):
     repo_id: str
     thread_id: str

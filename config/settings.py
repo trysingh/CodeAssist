@@ -49,6 +49,10 @@ class EngineSettings(BaseSettings):
     max_attachments_per_message: int = Field(default=5)
     attachment_inline_chars: int = Field(default=24000)  # thread attachments below this total go in full; above -> retrieval
     attachment_top_k: int = Field(default=6)
+    # A request written inside an uploaded image (error, pasted chat, task) is acted on when the typed message is empty or vague
+    attachment_request_enabled: bool = Field(default=True)
+    attachment_request_kinds: List[str] = Field(default=["image"])      # attachment kinds read for a request
+    attachment_request_timeout_s: float = Field(default=25.0)           # chat-model budget for pulling the request out
 
     # Chunking & Parallelism Configuration
     chunk_size: int = Field(default=1200)
@@ -58,13 +62,15 @@ class EngineSettings(BaseSettings):
 
     # Code change agents (Phase 1). Models run on the same Ollama endpoint as the others.
     router_model: str = Field(default="tev1:0.8b")     # DECISION model (/v1/systemone): ask vs change, failure triage. empty = rules only
-    router_min_confidence: float = Field(default=0.6)
+    router_min_confidence: float = Field(default=0.75)
     patcher_model: str = Field(default="")             # edit-block author; empty = llm_model
     change_max_attempts: int = Field(default=3)        # patch -> apply -> check retries
     change_max_files: int = Field(default=6)           # files shown to the patcher
     change_context_chars: int = Field(default=60000)   # raw-file budget per prompt
     change_num_ctx: int = Field(default=32768)
     change_max_output_tokens: int = Field(default=8192)
+    change_plan_first: bool = Field(default=True)      # /change writes a short plan first (one extra model call); /plan always works
+    change_call_check: bool = Field(default=True)      # fail a patch that calls methods no repo class defines
 
     # Sandbox (Phase 2): isolated test runs for proposed changes
     sandbox_enabled: bool = Field(default=True)
@@ -79,14 +85,28 @@ class EngineSettings(BaseSettings):
     sandbox_max_workspace_mb: int = Field(default=64)
     sandbox_requirements_files: List[str] = Field(default=["requirements-test.txt", "requirements-dev.txt", "requirements.txt"])
 
+     # Sandbox pre-warm: build the dependency image in the background instead of on the first change request
+    sandbox_prewarm: bool = Field(default=True)          # warm at startup, after ingest, and when a requirements file changes
+    sandbox_prewarm_max_repos: int = Field(default=5)    # at startup warm this many repos, most recently chatted-with first
+    sandbox_prune_images: bool = Field(default=False)    # after the startup warm-up remove coderag-sbx images no repo needs
+    sandbox_available_ttl_s: int = Field(default=60)     # cache the "is Docker up" check (a "down" answer for at most 10 s); 0 = off
+    sandbox_build_retry_s: int = Field(default=600)  
+
     # Notifiations Configuration
     notify_at_os_level: bool = Field(default=False)
+
+    # Telemetry & logs: every notification is stored in SQLite and replayed to the Telemetry tab on connect
+    telemetry_persist: bool = Field(default=True)         # False = live stream only (nothing is stored or replayed)
+    telemetry_history_default: int = Field(default=100)   # last N events replayed when the UI does not send its own N
+    telemetry_history_max: int = Field(default=1000)      # hard ceiling on the N a client may ask for
+    telemetry_max_rows: int = Field(default=20000)        # table is pruned to the newest rows (all repos together)
+    telemetry_prune_every: int = Field(default=200)       # prune check after this many inserts
 
     # Raw (verbatim) file store: what may be persisted
     raw_store_max_file_kb: int = Field(default=512)
     raw_store_exclude_patterns: List[str] = Field(default=[
         "*.env", ".env*", "*.pem", "*.key", "*.pfx", "*.p12", "*.crt", "id_rsa*", "id_ed25519*",
-        "*cookie*", "*secret*", "*credential*", "*token*", "*.kdbx"
+        "*cookie*", "*secret*", "*credential*", "*token*", "*.kdbx", "*.patch", "*.diff"
     ])
 
     # Exclusions Configuration
@@ -95,7 +115,23 @@ class EngineSettings(BaseSettings):
         "dist", "build", ".engine_storage", ".idea", ".vscode", "target", "data", "workspaces"
     ])
     exclude_patterns: List[str] = Field(default=[
-        "* copy.*", "*.pyc", "*.log", ".DS_Store", "*.lock", "package-lock.json", "*.db", "*.sqlite", "*.sqlite3", "*.tar.gz", "*.zip", "*.egg-info", "*.egg", "*.whl"
+        "* copy.*", 
+        "*.pyc", 
+        "*.log", 
+        ".DS_Store", 
+        "*.lock", 
+        "package-lock.json", 
+        "*.db", "*.sqlite", 
+        "*.sqlite3", 
+        "*.tar.gz", 
+        "*.zip", 
+        "*.egg-info", 
+        "*.egg", 
+        "*.whl",
+        "*.patch", 
+        "*.diff", 
+        "*.orig", 
+        "*.rej"
     ])
     
     model_config = SettingsConfigDict(env_prefix="ENGINE_", env_file=".env", extra="ignore")

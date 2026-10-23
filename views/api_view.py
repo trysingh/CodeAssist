@@ -1,12 +1,12 @@
 import uuid
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 from pydantic import BaseModel
 from fastapi import FastAPI, BackgroundTasks, HTTPException, Request, File, Form, UploadFile
 from fastapi.responses import HTMLResponse, FileResponse, PlainTextResponse, Response, JSONResponse
 from fastapi.templating import Jinja2Templates
 from sse_starlette.sse import EventSourceResponse
-
+from services.notifier import notifier, repo_scope
 from controllers.engine_controller import EngineController
 from models.schemas import ChatRequest
 from config.settings import settings
@@ -29,7 +29,17 @@ class ChangeRequest(BaseModel):
 @app.on_event("startup")
 async def startup_event():
     await controller.db.init_db()
+    notifier.bind(controller.db)        # persist notifications + thread-safe SSE fan-out (needs the running loop)
+    # Sandbox images are built in the background (docker build runs in a worker thread); start() returns at
+    # once. Started BEFORE restore_all_watchers(): that call waits up to 5 s for console input and then
+    # re-syncs offline changes, and the build can run meanwhile.
+    controller.warmer.start()
     await controller.restore_all_watchers()
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    await controller.warmer.stop()      # also kills a running `docker build` so closing the app is never held up
+    await notifier.close()              # flush queued telemetry rows
 
 @app.get("/", response_class=HTMLResponse)
 async def serve_dashboard(request: Request):
@@ -125,7 +135,8 @@ async def chat_with_attachments(
     msg_id = await controller.db.save_chat_message(thread_id, "user", query)
     saved = await controller.store_attachments(thread_id, msg_id, prepared)
 
-    response = await controller.chat_with_repo(repo_id, thread_id, query or "Please review the attached content.", web=web)
+    # empty/vague text + an image that holds a request -> that request is acted on (see services/attachment_intent.py)
+    response = await controller.chat_with_repo(repo_id, thread_id, query, web=web, attachments=prepared)
     await controller.db.save_chat_message(thread_id, "assistant", response)
     return {"repo_id": repo_id, "thread_id": thread_id, "answer": response, "attachments": saved}
 
@@ -176,6 +187,43 @@ async def revert_revision(repo_id: str, to_rev: int = 0):
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
+
+@app.delete("/api/v1/threads/{thread_id}")
+async def delete_thread(thread_id: str):
+    await controller.db.init_db()
+    if not await controller.db.delete_thread(thread_id):
+        raise HTTPException(status_code=404, detail="Thread not found")
+    return {"status": "deleted"}
+
+
 @app.get("/api/v1/notifications/stream")
-async def notification_stream():
-    return EventSourceResponse(notifier.subscribe())
+async def notification_stream(repo_id: Optional[str] = None, limit: Optional[int] = None):
+    """Telemetry & logs feed (SSE). First an event 'history' with the last `limit` stored events, then live
+    'notification' events. General events reach everyone; repo events only when `repo_id` is that repo.
+    `limit` defaults to settings.telemetry_history_default and is capped by settings.telemetry_history_max."""
+    return EventSourceResponse(notifier.subscribe(repo_id=repo_id, limit=limit))
+
+
+@app.post("/api/v1/repos/{repo_id}/reset-index")
+async def api_reset_repo_index(repo_id: str):
+    """
+    Resets the index for a specific repository by clearing 
+    Chroma collections and SQLite chunks.
+    """
+    try:
+        # The controller method is async and handles the deletion logic
+        await controller.reset_repo_index(repo_id)
+        notifier.notify("Repository Index Reset", "Indexes reset successfull", level="INFO", repo_id=repo_id)
+        return {
+            "status": "success", 
+            "repo_id": repo_id, 
+            "message": "Index successfully reset"
+        }
+    except ValueError as e:
+        # EngineController raises ValueError if repo_id is not found
+        notifier.notify("Repository Index Reset", f"Indexes reset NOT successfull: {e}", level="ERROR", repo_id=repo_id)
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        # Log the error and return a 500
+        notifier.notify("Repository Index Reset", f"Indexes reset NOT successfull: {e}", level="ERROR", repo_id=repo_id)
+        raise HTTPException(status_code=500, detail="Internal server error during index reset")

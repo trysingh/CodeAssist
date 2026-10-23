@@ -3,7 +3,7 @@
 
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
     <title>Coding Assistant</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script>
@@ -21,12 +21,13 @@
         href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap"
         rel="stylesheet">
     <script src="https://unpkg.com/lucide@latest"></script>
-    <link rel="stylesheet" href="/static/css/styles.css">
+    <link rel="stylesheet" href="/static/css/styles.css?v=3">
     <style>
+
         /* ---- Layout shell ---- */
         #sidebar {
             width: 14rem;
-            transition: width .2s ease;
+            transition: width .2s ease, transform .25s cubic-bezier(0.4, 0, 0.2, 1);
         }
 
         #sidebar[data-collapsed="true"] {
@@ -71,56 +72,180 @@
             background: rgba(30, 41, 59, .7);
         }
 
-        .nav-btn.active {
-            color: #fff;
+        .nav-btn.active,
+        .mob-nav-btn.active {
+            color: #3b82f6 !important;
             background: rgba(59, 130, 246, .14);
+        }
+
+        .nav-btn.active {
+            color: #fff !important;
             box-shadow: inset 2px 0 0 #3b82f6;
         }
 
+        /* CRITICAL: !important is required because Tailwind CDN injects .flex after <style> */
         #thread-panel[data-open="false"] {
-            display: none;
+            display: none !important;
         }
 
         body.focus #sidebar,
         body.focus #thread-panel {
-            display: none;
+            display: none !important;
         }
 
+        /* ---- Global mobile readability base ---- */
+        html {
+            -webkit-text-size-adjust: 100%;
+            text-size-adjust: 100%;
+            overflow-x: hidden;
+        }
+        body {
+            overflow-x: hidden;
+            max-width: 100vw;
+        }
+        * {
+            min-width: 0;
+        }
+        img, video, iframe {
+            max-width: 100%;
+            height: auto;
+        }
+
+        /* ---- Mobile & Tablet Responsive Overrides (< 1024px) ---- */
         @media (max-width: 1023px) {
             #sidebar {
-                position: fixed;
-                inset: 0 auto 0 0;
-                z-index: 40;
-                transform: translateX(-100%);
-                width: 14rem !important;
-                transition: transform .2s ease;
+                position: fixed !important;
+                inset: 0 auto 0 0 !important;
+                z-index: 60 !important;
+                transform: translateX(-100%) !important;
+                width: min(16rem, 85vw) !important;
+                max-width: 85vw !important;
+                height: 100dvh !important;
+                box-shadow: 8px 0 24px rgba(0, 0, 0, .6);
             }
 
             #sidebar[data-open="true"] {
-                transform: none;
+                transform: translateX(0) !important;
             }
 
             #sidebar[data-collapsed="true"] .lbl {
-                display: inline;
+                display: inline !important;
             }
 
             #sidebar[data-collapsed="true"] .nav-btn {
-                justify-content: flex-start;
-                padding-left: .875rem;
-                padding-right: .875rem;
+                justify-content: flex-start !important;
+                padding-left: .875rem !important;
+                padding-right: .875rem !important;
             }
 
             #thread-panel {
-                position: absolute;
-                inset: 0 auto 0 0;
-                z-index: 20;
-                box-shadow: 8px 0 24px rgba(0, 0, 0, .45);
+                position: fixed !important;
+                top: 3rem !important;
+                bottom: calc(3.5rem + env(safe-area-inset-bottom, 0px)) !important;
+                left: 0 !important;
+                z-index: 45 !important;
+                width: min(18rem, 85vw) !important;
+                background-color: #111827 !important;
+                box-shadow: 8px 0 24px rgba(0, 0, 0, .75) !important;
+                overflow-y: auto !important;
+            }
+
+            #thread-panel[data-open="true"] ~ #thread-scrim {
+                display: block !important;
+            }
+            
+            #mobile-bottom-nav {
+                padding-bottom: env(safe-area-inset-bottom, 0px);
+                height: calc(3.5rem + env(safe-area-inset-bottom, 0px));
+            }
+            
+            #chat-messages {
+                padding-bottom: env(safe-area-inset-bottom, 0px);
+            }
+        }
+
+        /* ---- Mobile Table-to-Card Layout (< 640px) ---- */
+        @media (max-width: 639px) {
+            #tab-repos .bg-cardBg.border {
+                overflow-x: hidden !important;
+            }
+            #repo-table {
+                min-width: 0 !important;
+            }
+            #repo-table thead {
+                display: none !important;
+            }
+            #repo-table,
+            #repo-table tbody,
+            #repo-table tr,
+            #repo-table td {
+                display: block !important;
+                width: 100% !important;
+                min-width: 0 !important;
+            }
+            #repo-table tr {
+                padding: 0.875rem 1rem !important;
+                border-bottom: 1px solid #1f2937 !important;
+                display: flex !important;
+                flex-wrap: wrap !important;
+                align-items: center !important;
+                gap: 0.5rem !important;
+            }
+            #repo-table td {
+                padding: 0 !important;
+                border: none !important;
+                width: auto !important;
+            }
+            #repo-table td:nth-child(1) {
+                flex: 1 1 auto !important;
+                font-weight: 600 !important;
+                font-size: 0.9375rem !important;
+            }
+            #repo-table td:nth-child(2) {
+                flex: 0 0 auto !important;
+            }
+            #repo-table td:nth-child(3),
+            #repo-table td:nth-child(4) {
+                font-size: 0.8125rem !important;
+                color: #94a3b8 !important;
+                background: #1e293b !important;
+                padding: 3px 9px !important;
+                border-radius: 6px !important;
+            }
+            #repo-table td:nth-child(3)::before {
+                content: "Files: ";
+                color: #64748b;
+            }
+            #repo-table td:nth-child(4)::before {
+                content: "Chunks: ";
+                color: #64748b;
+            }
+            #repo-table td:nth-child(5) {
+                flex: 1 1 100% !important;
+                font-size: 0.8125rem !important;
+                word-break: break-all !important;
+                color: #64748b !important;
+                margin-top: 2px !important;
+            }
+            #repo-table td:nth-child(6) {
+                flex: 1 1 100% !important;
+                text-align: right !important;
+                margin-top: 6px !important;
+                padding-top: 8px !important;
+                border-top: 1px dashed #1f2937 !important;
+            }
+            #repo-table td:nth-child(6) button {
+                width: 100%;
+                justify-content: center;
+                padding: 12px !important;
+                min-height: 44px;
             }
         }
 
         /* ---- Details ---- */
         .tab-content {
             min-height: 0;
+            overflow-wrap: break-word;
         }
 
         .thread-item.active {
@@ -128,18 +253,12 @@
             color: #fff;
         }
 
-        #conn-status[data-ok="true"] .dot {
-            background: #34d399;
-        }
-
-        #conn-status[data-ok="false"] .dot {
-            background: #f59e0b;
-        }
-
+        #conn-status[data-ok="true"] .dot,
         #logo-dot[data-ok="true"] {
             background: #34d399;
         }
 
+        #conn-status[data-ok="false"] .dot,
         #logo-dot[data-ok="false"] {
             background: #f59e0b;
         }
@@ -162,131 +281,169 @@
         }
 
         @keyframes bounce {
-
-            0%,
-            80%,
-            100% {
+            0%, 80%, 100% {
                 opacity: .25;
                 transform: translateY(0);
             }
-
             40% {
                 opacity: 1;
                 transform: translateY(-3px);
             }
         }
 
-        ::-webkit-scrollbar {
-            width: 10px;
-            height: 10px;
+        /* Code Block Styling - FIXED FOR MOBILE */
+        #chat-col {
+            overflow-wrap: anywhere;
+            word-break: break-word;
+            line-height: 1.7;
         }
-
-        ::-webkit-scrollbar-thumb {
-            background: #1f2937;
-            border-radius: 9999px;
-            border: 2px solid transparent;
-            background-clip: content-box;
+        #chat-col a {
+            word-break: break-all;
+            overflow-wrap: anywhere;
         }
-
-        ::-webkit-scrollbar-thumb:hover {
-            background: #334155;
-            background-clip: content-box;
-            border: 2px solid transparent;
+        #chat-col .overflow-x-auto {
+            max-width: 100%;
+            -webkit-overflow-scrolling: touch;
         }
-
-        :focus-visible {
-            outline: 2px solid #3b82f6;
-            outline-offset: 2px;
-        }
-
-        @media (prefers-reduced-motion: reduce) {
-            * {
-                animation: none !important;
-                transition: none !important;
-            }
-        }
-
-        /* 1. Professional Code Block Styling */
         #chat-col pre {
             background-color: #0d1117 !important;
-            /* GitHub-style deep dark */
             border: 1px solid #30363d !important;
-            /* Subtle border for definition */
             border-radius: 8px;
-            padding: 12px 16px;
+            padding: 12px 14px;
             margin: 12px 0;
             box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.2);
             overflow-x: auto;
+            max-width: 100% !important;
+            -webkit-overflow-scrolling: touch;
+            white-space: pre;
         }
 
-        /* 2. Font & Color Optimization */
         #chat-col code {
-            /* Use a high-quality mono stack */
             font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace !important;
-            font-size: 0.675rem !important;
+            font-size: 0.8125rem !important;
             line-height: 1.6 !important;
             color: #e6edf3 !important;
-            /* Off-white for reduced eye strain */
-            letter-spacing: -0.02em;
         }
 
-        /* 3. Inline Code Styling (for words inside sentences) */
-        #chat-col p code {
+        #chat-col p code,
+        #chat-col li code {
             background-color: rgba(59, 130, 246, 0.15) !important;
-            /* Subtle blue tint */
             color: #7dd3fc !important;
-            /* Light blue text */
             padding: 2px 5px;
             border-radius: 4px;
-            font-size: 0.6rem;
+            font-size: 0.78rem !important;
             border: 1px solid rgba(59, 130, 246, 0.2);
+            word-break: break-word;
+            overflow-wrap: anywhere;
         }
+
+        #chat-col > * {
+            max-width: 100%;
+            overflow-wrap: break-word;
+        }
+        
+        .codeblock {
+            max-width: 100%;
+            overflow: hidden;
+        }
+        .codeblock pre {
+            max-width: 100% !important;
+        }
+
+        /* ---- Mobile readability boost ---- */
+        @media (max-width: 639px) {
+            #chat-col {
+                font-size: 15px !important;
+                line-height: 1.65 !important;
+            }
+            #chat-col .text-sm {
+                font-size: 15px !important;
+                line-height: 1.65 !important;
+            }
+            #chat-col pre {
+                font-size: 13px !important;
+                margin-left: -2px;
+                margin-right: -2px;
+                border-radius: 10px;
+            }
+            #chat-col pre code {
+                font-size: 13px !important;
+            }
+            #chat-col p code,
+            #chat-col li code {
+                font-size: 13px !important;
+            }
+            .codeblock {
+                margin-left: -4px;
+                margin-right: -4px;
+            }
+            /* Larger touch targets for accessibility */
+            button, [role="button"] {
+                min-height: 40px;
+            }
+            .nav-btn, .mob-nav-btn {
+                min-height: 44px;
+            }
+            #chat-form button {
+                min-width: 44px;
+                min-height: 44px;
+            }
+            #chat-form {
+                padding-bottom: env(safe-area-inset-bottom, 0px);
+            }
+        }
+
     </style>
 </head>
 
 <body
-    class="bg-darkBg text-slate-100 h-[100dvh] overflow-hidden font-sans antialiased selection:bg-blue-500 selection:text-white">
+    class="bg-darkBg text-slate-100 h-[100dvh] w-full max-w-full overflow-x-hidden overflow-y-hidden font-sans antialiased selection:bg-blue-500 selection:text-white flex flex-col">
 
     <div id="toast-container" aria-live="polite"
         class="fixed top-14 right-4 z-50 flex flex-col space-y-2 max-w-sm w-[calc(100%-2rem)] pointer-events-none">
     </div>
-    <div id="scrim" class="hidden fixed inset-0 bg-black/60 z-30 lg:hidden" onclick="closeMobileNav()"></div>
+    <div id="scrim" class="hidden fixed inset-0 bg-black/60 backdrop-blur-[1px] z-50 lg:hidden" onclick="closeMobileNav()"></div>
 
-    <div class="flex h-full">
-        <!-- ============ NAV RAIL ============ -->
+    <div class="flex flex-1 min-h-0 w-full overflow-hidden">
+        <!-- ============ NAV RAIL (Desktop Sidebar / Mobile Slide-over) ============ -->
         <aside id="sidebar" data-collapsed="false" data-open="false"
-            class="bg-cardBg border-r border-cardBorder flex flex-col shrink-0 z-20">
-            <div class="h-12 flex items-center gap-2.5 px-3 border-b border-cardBorder shrink-0">
-                <div class="relative w-8 h-8 rounded-lg bg-blue-600/20 border border-blue-500/30 flex items-center justify-center text-accentBlue shrink-0"
-                    title="Coding Assistant">
-                    <i data-lucide="cpu" class="w-4 h-4"></i>
-                    <span id="logo-dot" data-ok="true"
-                        class="absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 rounded-full border-2 border-cardBg"></span>
+            class="bg-cardBg border-r border-cardBorder flex flex-col shrink-0 z-50">
+            <div class="h-12 flex items-center justify-between gap-2.5 px-3 border-b border-cardBorder shrink-0">
+                <div class="flex items-center gap-2.5 min-w-0">
+                    <div class="relative w-8 h-8 rounded-lg bg-blue-600/20 border border-blue-500/30 flex items-center justify-center text-accentBlue shrink-0"
+                        title="Coding Assistant">
+                        <i data-lucide="cpu" class="w-4 h-4"></i>
+                        <span id="logo-dot" data-ok="true"
+                            class="absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 rounded-full border-2 border-cardBg"></span>
+                    </div>
+                    <div class="lbl leading-tight min-w-0">
+                        <div class="font-semibold text-sm text-white truncate">Coding Assistant</div>
+                        <div class="text-[11px] text-slate-500 truncate">Engine dashboard</div>
+                    </div>
                 </div>
-                <div class="lbl leading-tight min-w-0">
-                    <div class="font-semibold text-sm text-white truncate">Coding Assistant</div>
-                    <div class="text-[11px] text-slate-500 truncate">Engine dashboard</div>
-                </div>
+                <button onclick="closeMobileNav()" class="lg:hidden p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800" aria-label="Close menu">
+                    <i data-lucide="x" class="w-4 h-4"></i>
+                </button>
             </div>
 
             <nav class="p-2 space-y-1 flex-1" aria-label="Main">
-                <button onclick="switchTab('chat')" id="nav-chat" data-tip="Chat (Alt+1)"
-                    class="nav-btn w-full flex items-center gap-3 px-3.5 py-2.5 rounded-lg text-sm font-medium transition-colors">
+                <button onclick="switchTab('chat'); closeMobileNav();" id="nav-chat" data-tip="Chat (Alt+1)"
+                    class="nav-btn w-full flex items-center gap-3 px-3.5 py-3 lg:py-2.5 rounded-lg text-sm font-medium transition-colors">
                     <i data-lucide="message-square-code" class="w-4 h-4 shrink-0"></i><span class="lbl">Chat</span>
                 </button>
-                <button onclick="switchTab('repos')" id="nav-repos" data-tip="Repositories (Alt+2)"
-                    class="nav-btn w-full flex items-center gap-3 px-3.5 py-2.5 rounded-lg text-sm font-medium transition-colors">
+                <button onclick="switchTab('repos'); closeMobileNav();" id="nav-repos" data-tip="Repositories (Alt+2)"
+                    class="nav-btn w-full flex items-center gap-3 px-3.5 py-3 lg:py-2.5 rounded-lg text-sm font-medium transition-colors">
                     <i data-lucide="database" class="w-4 h-4 shrink-0"></i><span
                         class="lbl flex-1 text-left">Repositories</span>
                     <span id="nav-repo-count"
                         class="lbl text-[11px] font-mono text-slate-400 bg-slate-800 rounded-md px-1.5 py-0.5">–</span>
                 </button>
-                <button onclick="switchTab('ingest')" id="nav-ingest" data-tip="Ingest (Alt+3)"
-                    class="nav-btn w-full flex items-center gap-3 px-3.5 py-2.5 rounded-lg text-sm font-medium transition-colors">
+                <button onclick="switchTab('ingest'); closeMobileNav();" id="nav-ingest" data-tip="Ingest (Alt+3)"
+                    class="nav-btn w-full flex items-center gap-3 px-3.5 py-3 lg:py-2.5 rounded-lg text-sm font-medium transition-colors">
                     <i data-lucide="folder-git-2" class="w-4 h-4 shrink-0"></i><span class="lbl">Ingest</span>
                 </button>
-                <button onclick="switchTab('telemetry')" id="nav-telemetry" data-tip="Telemetry (Alt+4)"
-                    class="nav-btn w-full flex items-center gap-3 px-3.5 py-2.5 rounded-lg text-sm font-medium transition-colors">
+                <button onclick="switchTab('telemetry'); closeMobileNav();" id="nav-telemetry" data-tip="Telemetry (Alt+4)"
+                    class="nav-btn w-full flex items-center gap-3 px-3.5 py-3 lg:py-2.5 rounded-lg text-sm font-medium transition-colors">
                     <i data-lucide="activity" class="w-4 h-4 shrink-0"></i><span
                         class="lbl flex-1 text-left">Telemetry</span>
                     <span id="telemetry-badge"
@@ -295,10 +452,6 @@
             </nav>
 
             <div class="p-2 border-t border-cardBorder space-y-1 shrink-0">
-                <!-- <div class="flex items-center gap-2 px-2.5 py-1.5 text-xs text-slate-400" title="Ollama model">
-                    <i data-lucide="server" class="w-4 h-4 shrink-0 mx-auto lg:mx-0"></i>
-                    <span class="lbl flex-1">Ollama</span><span class="lbl font-mono text-slate-200">llama3.1</span>
-                </div> -->
                 <button onclick="toggleSidebar()" data-tip="Expand / collapse (Alt+B)"
                     class="nav-btn hidden lg:flex w-full items-center gap-3 px-3.5 py-2 rounded-lg text-xs transition-colors">
                     <i data-lucide="panel-left" class="w-4 h-4 shrink-0"></i><span class="lbl">Collapse</span>
@@ -308,31 +461,32 @@
 
         <!-- ============ MAIN ============ -->
         <main class="flex-1 flex flex-col min-w-0 min-h-0">
-            <header class="h-12 bg-cardBg border-b border-cardBorder flex items-center gap-2 px-3 shrink-0 z-10">
+            <header class="h-12 bg-cardBg border-b border-cardBorder flex items-center gap-2 px-2.5 sm:px-3 shrink-0 z-10">
                 <button onclick="openMobileNav()"
-                    class="lg:hidden p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800"
+                    class="lg:hidden p-2 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 shrink-0"
                     aria-label="Open menu"><i data-lucide="menu" class="w-5 h-5"></i></button>
                 <h2 id="current-tab-title" class="text-sm font-semibold text-white truncate hidden">Chat</h2>
 
-                <!-- chat context lives in the top bar so the chat canvas keeps every pixel -->
-                <div id="chat-ctx" class="hidden items-center gap-2 min-w-0 flex-1">
+                <div id="chat-ctx" class="hidden items-center gap-1.5 sm:gap-2 min-w-0 flex-1">
                     <button onclick="toggleThreads()" id="threads-btn"
-                        class="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 shrink-0"
-                        title="Threads (Alt+T)" aria-label="Toggle threads panel"><i data-lucide="messages-square"
-                            class="w-4 h-4"></i></button>
+                        class="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-slate-800/80 lg:bg-transparent border border-slate-700 lg:border-0 text-slate-300 hover:text-white hover:bg-slate-800 shrink-0 text-xs"
+                        title="Threads (Alt+T)" aria-label="Toggle threads panel">
+                        <i data-lucide="messages-square" class="w-4 h-4 text-blue-400 lg:text-current"></i>
+                        <span class="lg:hidden font-medium">Threads</span>
+                    </button>
                     <select id="chat-repo-select" onchange="onRepoChanged()" aria-label="Repository"
-                        class="bg-slate-900 border border-cardBorder text-xs text-white rounded-lg px-2.5 py-1.5 font-mono max-w-[45%] sm:max-w-xs truncate focus:outline-none focus:border-blue-500">
+                        class="bg-slate-900 border border-cardBorder text-xs text-white rounded-lg px-2.5 py-1.5 font-mono flex-1 sm:flex-initial min-w-0 max-w-full sm:max-w-xs truncate focus:outline-none focus:border-blue-500">
                         <option value="">Select repository</option>
                     </select>
-                    <span id="active-thread-badge" class="text-xs text-slate-400 truncate hidden sm:block">No thread
+                    <span id="active-thread-badge" class="text-xs text-slate-400 truncate hidden md:block">No thread
                         selected</span>
                 </div>
 
                 <div class="ml-auto flex items-center gap-1.5 shrink-0">
                     <div id="conn-status" data-ok="true"
-                        class="hidden sm:flex items-center gap-1.5 text-xs text-slate-400 px-2 py-1 rounded-lg"
+                        class="flex items-center gap-1.5 text-xs text-slate-400 px-2 py-1 rounded-lg"
                         title="Notification stream">
-                        <span class="dot w-1.5 h-1.5 rounded-full"></span><span id="conn-label">Live</span>
+                        <span class="dot w-2 h-2 sm:w-1.5 sm:h-1.5 rounded-full"></span><span id="conn-label" class="hidden sm:inline">Live</span>
                     </div>
                     <button id="focus-btn" onclick="toggleFocus()"
                         class="hidden lg:block p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800"
@@ -342,62 +496,75 @@
             </header>
 
             <div class="flex-1 min-h-0 relative bg-darkBg">
-                <!-- TAB: CHAT (full-bleed) -->
+                <!-- TAB: CHAT -->
                 <section id="tab-chat" class="tab-content hidden h-full">
                     <div class="flex h-full relative">
-                        <div id="thread-panel" data-open="true"
-                            class="w-60 bg-cardBg/70 border-r border-cardBorder flex flex-col shrink-0">
-                            <div class="p-2.5">
+                        <!-- Thread panel: starts data-open="false" on mobile via script below -->
+                        <div id="thread-panel" data-open="false"
+                            class="w-60 bg-cardBg border-r border-cardBorder flex flex-col shrink-0">
+                            <div class="p-2.5 flex items-center gap-2 border-b border-cardBorder lg:border-b-0">
                                 <button onclick="toggleNewThreadForm()"
-                                    class="w-full flex items-center justify-center gap-1.5 py-2 rounded-lg bg-blue-600/15 hover:bg-blue-600/25 text-blue-300 text-xs font-medium border border-blue-500/25 transition-colors">
+                                    class="flex-1 flex items-center justify-center gap-1.5 py-2 rounded-lg bg-blue-600/15 hover:bg-blue-600/25 text-blue-300 text-xs font-medium border border-blue-500/25 transition-colors">
                                     <i data-lucide="plus" class="w-3.5 h-3.5"></i>New chat
                                 </button>
+                                <button onclick="toggleThreads()"
+                                    class="lg:hidden p-2 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 shrink-0"
+                                    aria-label="Close threads panel">
+                                    <i data-lucide="x" class="w-4 h-4"></i>
+                                </button>
                             </div>
-                            <div id="new-thread-box" class="hidden px-2.5 pb-2.5 space-y-2">
+                            <div id="new-thread-box" class="hidden px-2.5 pb-2.5 pt-2 lg:pt-0 space-y-2">
                                 <input type="text" id="new-thread-title-input" placeholder="Thread title"
                                     aria-label="Thread title"
                                     onkeydown="if(event.key==='Enter')submitNewThread();if(event.key==='Escape')toggleNewThreadForm()"
-                                    class="w-full bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-white focus:outline-none focus:border-blue-500">
+                                    class="w-full bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 text-base sm:text-xs text-white focus:outline-none focus:border-blue-500">
                                 <div class="flex justify-end gap-1.5">
                                     <button onclick="toggleNewThreadForm()"
-                                        class="px-2 py-1 text-[11px] text-slate-400 hover:text-white">Cancel</button>
+                                        class="px-2.5 py-1.5 sm:py-1 text-xs sm:text-[11px] text-slate-400 hover:text-white">Cancel</button>
                                     <button onclick="submitNewThread()"
-                                        class="px-2.5 py-1 bg-blue-600 hover:bg-blue-500 text-white rounded-lg text-[11px] font-medium">Create</button>
+                                        class="px-3 py-1.5 sm:py-1 bg-blue-600 hover:bg-blue-500 text-white rounded-lg text-xs sm:text-[11px] font-medium">Create</button>
                                 </div>
                             </div>
-                            <div id="thread-list" class="flex-1 overflow-y-auto px-2 pb-2 space-y-0.5"></div>
+                            <div id="thread-list" class="flex-1 overflow-y-auto px-2 py-2 space-y-1"></div>
                         </div>
+
+                        <!-- Mobile backdrop for Thread Panel -->
+                        <div id="thread-scrim" class="hidden fixed inset-0 bg-black/60 z-40 lg:hidden" onclick="toggleThreads()"></div>
 
                         <div class="flex-1 min-w-0 flex flex-col relative">
                             <div id="chat-messages" class="flex-1 overflow-y-auto scroll-smooth">
-                                <div id="chat-col" class="max-w-3xl mx-auto w-full px-4 py-6 space-y-6"></div>
+                                <div id="chat-col" class="max-w-3xl mx-auto w-full px-3 sm:px-4 py-4 sm:py-6 space-y-4 sm:space-y-6"></div>
                             </div>
                             <button id="jump-btn" onclick="scrollDown(true)"
-                                class="hidden absolute bottom-28 left-1/2 -translate-x-1/2 z-10 items-center gap-1.5 bg-slate-800 hover:bg-slate-700 border border-slate-600 text-xs text-slate-200 rounded-full px-3 py-1.5 shadow-lg"
+                                class="hidden absolute bottom-28 left-1/2 -translate-x-1/2 z-10 items-center gap-1.5 bg-slate-800 hover:bg-slate-700 border border-slate-600 text-xs text-slate-200 rounded-full px-3.5 py-2 sm:py-1.5 shadow-lg"
                                 aria-label="Jump to latest">
                                 <i data-lucide="arrow-down" class="w-3.5 h-3.5"></i>Latest
                             </button>
-                            <div class="px-4 pb-3 pt-1 shrink-0">
+
+                            <!-- Composer: 2-row layout on mobile so textarea gets 100% width, single-row on sm+ -->
+                            <div class="px-2.5 sm:px-4 pb-2.5 pt-1 shrink-0">
                                 <form id="chat-form" onsubmit="sendChatMessage(event)"
                                     class="max-w-3xl mx-auto bg-cardBg border border-cardBorder focus-within:border-blue-500/70 rounded-2xl p-2 transition-colors">
                                     <div id="attach-strip" class="hidden flex-wrap gap-2 px-1.5 pb-2"></div>
-                                    <div class="flex items-end gap-2">
+                                    <div class="flex flex-wrap sm:flex-nowrap items-end gap-1.5 sm:gap-2">
+                                        <!-- Textarea sits full-width on top on mobile (order-1), inline middle on desktop (sm:order-2) -->
+                                        <textarea id="chat-input-query" rows="1"
+                                            placeholder="Ask anything about the codebase..." aria-label="Message"
+                                            class="order-1 sm:order-2 w-full sm:w-auto sm:flex-1 min-w-0 bg-transparent resize-none px-2 py-1.5 sm:py-2 text-base sm:text-sm text-white placeholder-slate-500 focus:outline-none max-h-36 sm:max-h-52 disabled:cursor-not-allowed"></textarea>
+
                                         <input id="attach-input" type="file" multiple class="hidden">
                                         <button id="attach-btn" type="button" onclick="document.getElementById('attach-input').click()"
-                                            class="shrink-0 w-9 h-9 rounded-xl text-slate-400 hover:text-white hover:bg-slate-800 disabled:opacity-40 disabled:hover:bg-transparent flex items-center justify-center transition-colors"
-                                            aria-label="Attach files" title="Attach files (or paste with Ctrl+V)">
+                                            class="order-2 sm:order-1 shrink-0 w-9 h-9 rounded-xl text-slate-400 hover:text-white hover:bg-slate-800 disabled:opacity-40 flex items-center justify-center transition-colors"
+                                            aria-label="Attach files" title="Attach files">
                                             <i data-lucide="paperclip" class="w-4 h-4"></i>
                                         </button>
                                         <button id="web-btn" type="button" onclick="cycleWeb()"
-                                            class="shrink-0 h-9 px-2.5 rounded-xl text-xs font-medium border border-slate-700 text-slate-300 hover:text-white hover:bg-slate-800 data-[mode=on]:border-blue-500/50 data-[mode=on]:text-blue-300 data-[mode=on]:bg-blue-600/10 data-[mode=off]:text-slate-500 transition-colors"
-                                            data-mode="auto" aria-label="Web search mode" title="Web search: Auto (only when needed) / On / Off. Or start a message with /web">
+                                            class="order-3 sm:order-1 shrink-0 h-9 px-2.5 rounded-xl text-xs font-medium border border-slate-700 text-slate-300 hover:text-white hover:bg-slate-800 data-[mode=on]:border-blue-500/50 data-[mode=on]:text-blue-300 data-[mode=on]:bg-blue-600/10 data-[mode=off]:text-slate-500 transition-colors"
+                                            data-mode="auto" aria-label="Web search mode">
                                             <span id="web-btn-label">🌐 Auto</span>
                                         </button>
-                                        <textarea id="chat-input-query" rows="1"
-                                            placeholder="Ask anything about the codebase" aria-label="Message"
-                                            class="flex-1 bg-transparent resize-none px-2.5 py-2 text-sm text-white placeholder-slate-500 focus:outline-none max-h-52 disabled:cursor-not-allowed"></textarea>
                                         <button id="send-btn" type="submit"
-                                            class="shrink-0 w-9 h-9 rounded-xl bg-blue-600 hover:bg-blue-500 disabled:bg-slate-800 disabled:text-slate-600 text-white flex items-center justify-center transition-colors"
+                                            class="order-4 ml-auto sm:ml-0 shrink-0 w-9 h-9 rounded-xl bg-blue-600 hover:bg-blue-500 disabled:bg-slate-800 disabled:text-slate-600 text-white flex items-center justify-center transition-colors"
                                             aria-label="Send">
                                             <i data-lucide="arrow-up" class="w-4 h-4"></i>
                                         </button>
@@ -411,22 +578,22 @@
                 </section>
 
                 <!-- TAB: REPOSITORIES -->
-                <section id="tab-repos" class="tab-content hidden h-full overflow-y-auto p-4 md:p-6">
+                <section id="tab-repos" class="tab-content hidden h-full overflow-y-auto p-3 sm:p-4 md:p-6">
                     <div class="max-w-6xl mx-auto space-y-4">
-                        <div class="flex flex-wrap gap-3 justify-between items-center">
+                        <div class="flex flex-col sm:flex-row gap-3 justify-between sm:items-center">
                             <h3 class="text-lg font-semibold text-white">Ingested repositories</h3>
-                            <div class="flex items-center gap-2">
+                            <div class="flex items-center gap-2 w-full sm:w-auto">
                                 <input id="repo-filter" oninput="renderRepos()" placeholder="Filter repositories"
                                     aria-label="Filter repositories"
-                                    class="bg-slate-900 border border-cardBorder rounded-xl px-3 py-2 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-blue-500 w-48">
+                                    class="bg-slate-900 border border-cardBorder rounded-xl px-3 py-2 text-base sm:text-xs text-white placeholder-slate-500 focus:outline-none focus:border-blue-500 flex-1 sm:w-48">
                                 <button onclick="loadRepositories()"
-                                    class="bg-slate-800 hover:bg-slate-700 text-slate-200 px-3.5 py-2 rounded-xl text-xs font-medium flex items-center gap-2 border border-slate-700">
-                                    <i data-lucide="rotate-cw" class="w-3.5 h-3.5"></i>Refresh
+                                    class="bg-slate-800 hover:bg-slate-700 text-slate-200 px-3.5 py-2.5 sm:py-2 rounded-xl text-xs font-medium flex items-center gap-2 border border-slate-700 shrink-0">
+                                    <i data-lucide="rotate-cw" class="w-3.5 h-3.5"></i><span>Refresh</span>
                                 </button>
                             </div>
                         </div>
                         <div class="bg-cardBg border border-cardBorder rounded-2xl overflow-x-auto">
-                            <table class="w-full text-left border-collapse min-w-[640px]">
+                            <table id="repo-table" class="w-full text-left border-collapse sm:min-w-[640px]">
                                 <thead>
                                     <tr
                                         class="bg-slate-900/60 border-b border-cardBorder text-xs font-medium text-slate-400">
@@ -445,14 +612,14 @@
                 </section>
 
                 <!-- TAB: INGEST -->
-                <section id="tab-ingest" class="tab-content hidden h-full overflow-y-auto p-4 md:p-6">
-                    <div class="max-w-3xl mx-auto bg-cardBg border border-cardBorder rounded-2xl p-6">
+                <section id="tab-ingest" class="tab-content hidden h-full overflow-y-auto p-3 sm:p-4 md:p-6">
+                    <div class="max-w-3xl mx-auto bg-cardBg border border-cardBorder rounded-2xl p-4 sm:p-6">
                         <div class="flex items-center gap-3 mb-5">
-                            <div class="p-2.5 rounded-xl bg-blue-500/10 text-blue-400 border border-blue-500/20"><i
+                            <div class="p-2.5 rounded-xl bg-blue-500/10 text-blue-400 border border-blue-500/20 shrink-0"><i
                                     data-lucide="folder-input" class="w-5 h-5"></i></div>
-                            <div>
+                            <div class="min-w-0">
                                 <h3 class="text-base font-semibold text-white">Ingest a repository</h3>
-                                <p class="text-xs text-slate-400">Same as <code
+                                <p class="text-xs text-slate-400 truncate">Same as <code
                                         class="text-blue-400 font-mono">python engine.py ingest --repo &lt;path&gt;</code>
                                 </p>
                             </div>
@@ -462,15 +629,15 @@
                         <div class="flex flex-col sm:flex-row gap-3">
                             <input type="text" id="ingest-repo-path" placeholder="C:\Projects\my-code-repo"
                                 autocomplete="off" onkeydown="if(event.key==='Enter')triggerIngestion()"
-                                class="flex-1 bg-slate-900 border border-cardBorder rounded-xl px-4 py-2.5 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-blue-500 font-mono">
+                                class="flex-1 bg-slate-900 border border-cardBorder rounded-xl px-4 py-2.5 text-base sm:text-sm text-white placeholder-slate-500 focus:outline-none focus:border-blue-500 font-mono">
                             <button id="ingest-btn" onclick="triggerIngestion()"
-                                class="bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white font-medium px-6 py-2.5 rounded-xl text-sm transition-colors flex items-center justify-center gap-2">
+                                class="bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white font-medium px-6 py-3 sm:py-2.5 rounded-xl text-sm transition-colors flex items-center justify-center gap-2">
                                 <i data-lucide="play" class="w-4 h-4"></i>Start ingest
                             </button>
                         </div>
                         <div id="recent-paths" class="flex flex-wrap gap-2 mt-3"></div>
                         <div id="ingest-progress-card"
-                            class="hidden mt-6 bg-slate-900/80 border border-slate-800 rounded-xl p-5 space-y-3">
+                            class="hidden mt-6 bg-slate-900/80 border border-slate-800 rounded-xl p-4 sm:p-5 space-y-3">
                             <div class="flex justify-between items-center text-xs text-slate-400">
                                 <span class="font-medium text-blue-400">Queuing ingestion</span>
                                 <span id="ingest-timer" class="font-mono">0.0s</span>
@@ -483,18 +650,35 @@
                 </section>
 
                 <!-- TAB: TELEMETRY -->
-                <section id="tab-telemetry" class="tab-content hidden h-full flex-col p-4 md:p-6 gap-3">
-                    <div class="max-w-5xl mx-auto w-full flex justify-between items-center">
-                        <h3 class="text-lg font-semibold text-white">Live telemetry</h3>
-                        <div class="flex gap-2">
+                <section id="tab-telemetry" class="tab-content hidden h-full flex-col p-3 sm:p-4 md:p-6 gap-3">
+                    <div class="max-w-5xl mx-auto w-full flex flex-wrap justify-between items-center gap-2">
+                        <div class="min-w-0">
+                            <h3 class="text-lg font-semibold text-white">Live telemetry</h3>
+                            <p id="telemetry-scope" class="text-[11px] text-slate-500 truncate">General events only</p>
+                        </div>
+                        <div class="flex flex-wrap items-center gap-2">
+                            <label class="flex items-center gap-1.5 text-xs text-slate-400"
+                                title="How many stored events are loaded when this tab connects (the server caps it)">
+                                Last
+                                <select id="telemetry-limit" onchange="onTelemetryLimitChange(this.value)" aria-label="Events to load from history"
+                                    class="bg-slate-900 border border-cardBorder text-xs text-white rounded-lg px-2 py-1.5 font-mono focus:outline-none focus:border-blue-500">
+                                    <option value="25">25</option>
+                                    <option value="50">50</option>
+                                    <option value="100">100</option>
+                                    <option value="250">250</option>
+                                    <option value="500">500</option>
+                                    <option value="1000">1000</option>
+                                </select>
+                                events
+                            </label>
                             <button onclick="copyConsole()"
-                                class="bg-slate-800 hover:bg-slate-700 text-slate-300 px-3 py-1.5 rounded-xl text-xs">Copy</button>
+                                class="bg-slate-800 hover:bg-slate-700 text-slate-300 px-3.5 py-2 sm:py-1.5 rounded-xl text-xs">Copy</button>
                             <button onclick="clearConsole()"
-                                class="bg-slate-800 hover:bg-slate-700 text-slate-300 px-3 py-1.5 rounded-xl text-xs">Clear</button>
+                                class="bg-slate-800 hover:bg-slate-700 text-slate-300 px-3.5 py-2 sm:py-1.5 rounded-xl text-xs">Clear</button>
                         </div>
                     </div>
                     <div id="telemetry-console"
-                        class="max-w-5xl mx-auto w-full flex-1 min-h-0 border border-cardBorder rounded-2xl p-4 font-mono text-xs overflow-y-auto space-y-1.5 bg-[#080b12]">
+                        class="max-w-5xl mx-auto w-full flex-1 min-h-0 border border-cardBorder rounded-2xl p-3 sm:p-4 font-mono text-xs overflow-y-auto space-y-1.5 bg-[#080b12]">
                         <div class="text-slate-500">[System] Telemetry console active...</div>
                     </div>
                 </section>
@@ -502,7 +686,68 @@
         </main>
     </div>
 
-    <script src="/static/js/app.js"></script>
+    <!-- ============ MOBILE BOTTOM TAB BAR (< 1024px) ============ -->
+    <nav id="mobile-bottom-nav" class="lg:hidden h-14 bg-cardBg border-t border-cardBorder grid grid-cols-4 shrink-0 z-30 select-none">
+        <button onclick="switchTab('chat')" data-mob-tab="chat" class="mob-nav-btn active flex flex-col items-center justify-center gap-1 text-slate-400">
+            <i data-lucide="message-square-code" class="w-4 h-4"></i>
+            <span class="text-[10px] font-medium">Chat</span>
+        </button>
+        <button onclick="switchTab('repos')" data-mob-tab="repos" class="mob-nav-btn flex flex-col items-center justify-center gap-1 text-slate-400">
+            <i data-lucide="database" class="w-4 h-4"></i>
+            <span class="text-[10px] font-medium">Repos</span>
+        </button>
+        <button onclick="switchTab('ingest')" data-mob-tab="ingest" class="mob-nav-btn flex flex-col items-center justify-center gap-1 text-slate-400">
+            <i data-lucide="folder-git-2" class="w-4 h-4"></i>
+            <span class="text-[10px] font-medium">Ingest</span>
+        </button>
+        <button onclick="switchTab('telemetry')" data-mob-tab="telemetry" class="mob-nav-btn flex flex-col items-center justify-center gap-1 text-slate-400">
+            <i data-lucide="activity" class="w-4 h-4"></i>
+            <span class="text-[10px] font-medium">Telemetry</span>
+        </button>
+    </nav>
+
+    <script src="/static/js/app.js?v=2"></script>
+    <script>
+        (function () {
+            const threadPanel = document.getElementById('thread-panel');
+            const threadList = document.getElementById('thread-list');
+
+            // Force thread panel open on desktop, closed on mobile on initial load
+            function initThreadPanelState() {
+                if (!threadPanel) return;
+                if (window.innerWidth < 1024) {
+                    threadPanel.setAttribute('data-open', 'false');
+                } else {
+                    threadPanel.setAttribute('data-open', 'true');
+                }
+            }
+
+            // Run immediately AND after app.js finishes DOMContentLoaded
+            initThreadPanelState();
+            window.addEventListener('DOMContentLoaded', () => setTimeout(initThreadPanelState, 50));
+            window.addEventListener('load', () => setTimeout(initThreadPanelState, 100));
+
+            // Close thread panel automatically on mobile when a thread is clicked
+            if (threadList && threadPanel) {
+                threadList.addEventListener('click', function (e) {
+                    if (window.innerWidth < 1024 && e.target.closest('.thread-item')) {
+                        threadPanel.setAttribute('data-open', 'false');
+                    }
+                });
+            }
+
+            // Sync mobile bottom nav active state whenever switchTab is called
+            const origSwitchTab = window.switchTab;
+            if (typeof origSwitchTab === 'function') {
+                window.switchTab = function (tabName) {
+                    origSwitchTab(tabName);
+                    document.querySelectorAll('.mob-nav-btn').forEach(btn => {
+                        btn.classList.toggle('active', btn.getAttribute('data-mob-tab') === tabName);
+                    });
+                };
+            }
+        })();
+    </script>
 </body>
 
 </html>

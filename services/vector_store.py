@@ -96,3 +96,14 @@ class VectorStoreService:
             sys.stdout.write(f"[WARNING] Failed to purge old vectors for {file_path}: {exc}\n")
             sys.stdout.flush()
 
+    def delete_collection(self, repo_id: str) -> None:
+        """Deletes the entire vector collection for a specific repository."""
+        try:
+            collection_name = f"repo_{repo_id}"
+            vectorstore = self._get_vectorstore(repo_id)
+            # Chroma's delete_collection is usually called on the client, 
+            # but we can use the underlying client from the vectorstore object.
+            vectorstore._client.delete_collection(collection_name)
+        except Exception as exc:
+            sys.stdout.write(f"[WARNING] Failed to delete collection for {repo_id}: {exc}\n")
+            sys.stdout.flush()

@@ -1,7 +1,7 @@
 """Decide whether a chat message is a question ("ask") or a code change ("change").
 
 Order of authority:
-  1. explicit prefix:  /ask ...   /change ...   /fix ...   (always wins, no model call)
+  1. explicit prefix:  /ask ...   /plan ...   /change ...   /fix ...   (always wins, no model call)
   2. decision model:   settings.router_model via Ollama /v1/systemone (services/decision.py)
   3. keyword rules:    always available; used if no model is set, it is unreachable, or unsure
 
@@ -22,7 +22,7 @@ from typing import Awaitable, Callable, Optional
 from config.settings import settings
 from services.decision import decide_noul
 
-_PREFIX = re.compile(r"^\s*/(ask|change|fix|edit|implement)\b[:\s]*", re.IGNORECASE)
+_PREFIX = re.compile(r"^\s*/(ask|change|fix|edit|implement|plan)\b[:\s]*", re.IGNORECASE)
 
 _VERBS = (r"fix|implement|add|create|build|write|refactor|rename|remove|delete|change|update|modify|"
           r"rewrite|patch|migrate|convert|optimi[sz]e|replace|extend|integrate|support|resolve|handle|"
@@ -48,6 +48,7 @@ COMMANDS_HELP = """**Commands** (start your message with one):
 - `/fix <bug>`: same as `/change`, aimed at a bug
 - `/edit <request>`: same as `/change`
 - `/implement <feature>`: same as `/change`, aimed at a new feature
+- `/plan <request>`: show the files and steps a change would need, without building it
 - `/web <question>`: answer using a live web search (works with or without a repository)
 - `/help` (or `/commands`): show this list
 
@@ -90,7 +91,8 @@ async def route_intent(query: str, *, noul_fn: NoulFn = decide_noul,
         return RouteDecision("help", query.strip(), "rules", 1.0)
     if m:
         word = m.group(1).lower()
-        return RouteDecision("ask" if word == "ask" else "change", query[m.end():].strip(), "prefix", 1.0)
+        intent = "ask" if word == "ask" else "plan" if word == "plan" else "change"
+        return RouteDecision(intent, query[m.end():].strip(), "prefix", 1.0)
 
     q = query.strip()
     model = settings.router_model if model is None else model

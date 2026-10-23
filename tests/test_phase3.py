@@ -156,3 +156,119 @@ def test_gather_fails_soft(monkeypatch):
         ctx = await asyncio.wait_for(svc.gather("python asyncio timeout", repo_scoped=False), 4)   # returns, does not hang
         assert "search snippet only" in ctx.text
     run(go())
+
+# ----------------------------------------------------------------------------- follow-ups: "do a new search"
+from datetime import datetime, timezone
+
+from services.web_search_service import retry_kind, time_range_for, today_str
+
+NOW = datetime(2026, 10, 22, 9, 30, tzinfo=timezone.utc)
+HIST = [("User", "any india vs new zealand t20 coming up?"),
+        ("Assistant", "India play New Zealand in a T20 series; I could not confirm the date."),
+        ("User", "can u confirm if there is a T20 match scheduled today between them"),
+        ("Assistant", "I cannot confirm a match between India and New Zealand today.")]
+
+
+def test_retry_kind():
+    assert retry_kind("do a new search and try checking again") == "search"
+    assert retry_kind("search again") == "search"
+    assert retry_kind("can you look it up once more?") == "search"
+    assert retry_kind("check again") == "soft"
+    assert retry_kind("try again please") == "soft"
+    assert retry_kind("how does the retry logic in model_calls work") == ""
+    assert retry_kind("refresh the vectors for engine.py") == ""
+    assert retry_kind("do a new search " + "word " * 20) == ""            # long messages carry their own topic
+
+
+def test_decide_web_retry_and_follow_up():
+    async def go():
+        async def boom(*a, **k):
+            raise AssertionError("rules must decide")
+        # the exact failing message from the bug report: inside a repo, no model, no topic words
+        assert await decide_web("do a new search and try checking again", "auto", repo_scoped=True,
+                                noul_fn=boom, model="m") == (True, "retry")
+        assert (await decide_web("check again", "auto", repo_scoped=True, noul_fn=boom, model="m", prev_web=True))[0]
+        # "check again" in a repo with no web turn before it is a code question, not a search
+        async def no(*a, **k):
+            return 0.1
+        assert not (await decide_web("run the tests and check again", "auto", repo_scoped=True, noul_fn=no, model="m"))[0]
+        assert await decide_web("what about tomorrow?", "auto", repo_scoped=True, noul_fn=boom, model="m",
+                                prev_web=True) == (True, "follow-up")
+        assert not (await decide_web("what about tomorrow?", "auto", repo_scoped=True, noul_fn=no, model="m"))[0]
+        # the Web chip still wins
+        assert await decide_web("do a new search", "off", repo_scoped=False, noul_fn=boom, model="m") == (False, "off")
+    run(go())
+
+
+def test_plan_query_follow_up_uses_conversation_and_date():
+    async def go():
+        seen = {}
+
+        async def llm(payload):
+            seen["payload"] = payload
+            return "India vs New Zealand T20 match today"
+        q = await plan_query("do a new search and try checking again", repo_scoped=False, history=HIST, now=NOW,
+                             avoid=["India New Zealand T20 22 October 2026"], llm_fn=llm)
+        assert q == "India vs New Zealand T20 match today 22 October 2026"      # date stamped, topic from history
+        assert "between them" in seen["payload"] and "Today: Thursday, 22 October 2026" in seen["payload"]
+        assert "NEW search" in seen["payload"] and "different keywords" in seen["payload"]
+
+        # model down: the last real question is reused, never the words "do a new search"
+        async def down(payload):
+            raise RuntimeError("ollama down")
+        q = await plan_query("do a new search and try checking again", repo_scoped=False, history=HIST, now=NOW, llm_fn=down)
+        assert q.startswith("can u confirm if there is a T20 match scheduled today") and q.endswith("22 October 2026")
+
+        # asking the same thing twice must not repeat the query verbatim
+        async def same(payload):
+            return "India vs New Zealand T20 match 22 October 2026"
+        q = await plan_query("search again", repo_scoped=False, history=HIST, now=NOW,
+                             avoid=["India vs New Zealand T20 match 22 October 2026"], llm_fn=same)
+        assert q.endswith("latest update")
+
+        # tomorrow means tomorrow's date
+        async def tmr(payload):
+            return "India New Zealand T20 tomorrow"
+        assert (await plan_query("and tomorrow?", repo_scoped=False, history=HIST, now=NOW, llm_fn=tmr)).endswith("23 October 2026")
+
+        # evergreen queries are left alone
+        async def boom(payload):
+            raise AssertionError("short general query needs no rewrite")
+        assert await plan_query("python asyncio timeout", repo_scoped=False, history=HIST[:1], now=NOW, llm_fn=boom) \
+            == "python asyncio timeout"
+    run(go())
+
+
+def test_time_range_and_today():
+    assert time_range_for("match scheduled today") == "day"
+    assert time_range_for("fixtures tomorrow") == "week"
+    assert time_range_for("latest fastapi version") is None
+    assert today_str(NOW) == "Thursday, 22 October 2026"
+
+
+def test_gather_follow_up_searches_the_topic_with_a_time_range(monkeypatch):
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(dict(request.url.params))
+        hit = {"url": "https://live.example/score", "title": "Live", "content": "snippet"}
+        return httpx.Response(200, json={"results": [] if request.url.params.get("time_range") == "day"
+                                          and len(calls) == 1 else [hit]})
+
+    async def scrape(url, allow_pw):
+        return _page(300, title="Live score")
+
+    async def go():
+        async def llm(payload):
+            return "India vs New Zealand T20 today"
+
+        async def plan(question, **kw):
+            return await plan_query(question, llm_fn=llm, **kw)
+        svc = WebSearchService(transport=httpx.MockTransport(handler), scrape_fn=scrape, plan_fn=plan)
+        ctx = await svc.gather("do a new search and try checking again", repo_scoped=False, history=HIST, now=NOW)
+        assert "India vs New Zealand" in calls[0]["q"] and "do a new search" not in calls[0]["q"]
+        assert calls[0]["time_range"] == "day"                    # time-bound question -> fresh results first
+        assert "time_range" not in calls[1]                       # ...and one retry without the filter if that was empty
+        assert ctx.query.endswith("22 October 2026") and ctx.date == "Thursday, 22 October 2026"
+        assert "*Searched: India vs New Zealand T20 today 22 October 2026" in ctx.footer()
+    run(go())

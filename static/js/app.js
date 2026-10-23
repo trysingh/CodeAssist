@@ -100,7 +100,7 @@ const LS = {
     set(k, v) { try { localStorage.setItem('crag.' + k, JSON.stringify(v)); } catch { /* storage unavailable */ } }
 };
 const GENERAL = '__general__';
-const S = { web: LS.get('web', 'auto'), repoId: null, threadId: null, repos: [], tab: null, sending: false, files: [], unread: 0, collapsed: LS.get('collapsed', null), poll: null };
+const S = { web: LS.get('web', 'auto'), repoId: null, threadId: null, repos: [], tab: null, sending: false, files: [], unread: 0, collapsed: LS.get('collapsed', null), poll: null, stream: null, streamKey: '', tlimit: LS.get('tlimit', null) };
 const TABS = ['chat', 'repos', 'ingest', 'telemetry'];
 const TITLES = { chat: 'Chat', repos: 'Repositories', ingest: 'Ingest repository', telemetry: 'Telemetry & logs' };
 const isMobile = () => window.innerWidth < 1024;
@@ -113,6 +113,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     panel.dataset.open = String(isMobile() ? false : LS.get('threads', true));
     setupComposer();
     setupAttachments();
+    syncLimitSelect(S.tlimit);
     setupNotificationStream();
     $('chat-messages').addEventListener('scroll', updateJumpBtn);
     window.addEventListener('hashchange', () => switchTab(location.hash.slice(1)));
@@ -147,7 +148,7 @@ function switchTab(tabId) {
     $('focus-btn').classList.toggle('lg:hidden', tabId !== 'chat');
     if (tabId !== 'chat') document.body.classList.remove('focus');
     if (location.hash !== '#' + tabId) history.replaceState(null, '', '#' + tabId);
-    if (tabId === 'telemetry') { S.unread = 0; renderBadge(); $('telemetry-console').scrollTop = 1e9; }
+    if (tabId === 'telemetry') { S.unread = 0; renderBadge(); $('telemetry-console').scrollTop = 0; }   // newest line is on top
     applyLayout();
     closeMobileNav();
     if (tabId === 'repos' || tabId === 'chat') loadRepositories();
@@ -212,33 +213,112 @@ function renderBadge() {
     b.classList.toggle('hidden', !S.unread);
 }
 
+/* ---- Telemetry & logs: one SSE stream per (selected repo, last-N). Server replays stored history, then streams live. ---- */
+const TELEMETRY_CAP = 500;       // lines kept in the console (never below the chosen N)
+
+function streamRepo() { return S.repoId && S.repoId !== GENERAL ? S.repoId : ''; }
+
+function renderScopeHint() {
+    const el = $('telemetry-scope');
+    if (!el) return;
+    const r = S.repos.find(x => String(x.repo_id) === String(streamRepo()));
+    el.textContent = streamRepo()
+        ? `General events + events of ${r ? r.title : streamRepo()}`
+        : 'General events only. Select a repository to include its events.';
+}
+
+function syncLimitSelect(n) {
+    const sel = $('telemetry-limit');
+    if (!sel || n == null) return;
+    if (![...sel.options].some(o => o.value === String(n))) {
+        const opt = new Option(String(n), String(n));
+        const after = [...sel.options].find(o => Number(o.value) > Number(n));
+        sel.add(opt, after || null);
+    }
+    sel.value = String(n);
+}
+
+function onTelemetryLimitChange(v) {
+    S.tlimit = Math.max(0, parseInt(v, 10) || 0);
+    LS.set('tlimit', S.tlimit);
+    setupNotificationStream();
+}
+
+function fmtTs(ts) {
+    const d = ts ? new Date(ts) : new Date();
+    if (isNaN(d)) return String(ts || '');
+    const time = d.toLocaleTimeString([], { hour12: false });
+    return d.toDateString() === new Date().toDateString() ? time : `${d.toLocaleDateString([], { month: 'short', day: 'numeric' })} ${time}`;
+}
+
+function prettyMessage(ev) {
+    if (ev.title === 'Telemetry Trace') {      // LLM trace: JSON payload -> one readable line
+        try {
+            const t = JSON.parse(ev.message);
+            return `${t.phase} · ${t.model} · in ${t.input_tokens} / out ${t.output_tokens} / total ${t.total_tokens} tok · ${t.duration_sec}s`;
+        } catch { /* not JSON: show as is */ }
+    }
+    return ev.message;
+}
+
+function telemetryLine(ev) {
+    const level = String(ev.level || 'info').toLowerCase();
+    const colour = { error: 'text-red-400', warning: 'text-amber-400', success: 'text-emerald-400' }[level] || 'text-blue-300';
+    const line = document.createElement('div');
+    line.className = `${colour} border-b border-slate-900 pb-1`;
+    line.textContent = `${fmtTs(ev.ts)}  [${ev.level}] ${ev.scope === 'repo' ? '(repo) ' : ''}${ev.title} — ${prettyMessage(ev)}`;
+    return line;
+}
+
 function setupNotificationStream() {
-    const evtSource = new EventSource(window.location.origin + "/api/v1/notifications/stream");
+    const repo = streamRepo();
+    const key = `${repo}|${S.tlimit}`;
+    if (S.stream && S.streamKey === key) return;           // same scope: keep the open stream
+    if (S.stream) S.stream.close();
+    S.streamKey = key;
+    renderScopeHint();
+
+    const qs = new URLSearchParams();
+    if (repo) qs.set('repo_id', repo);
+    if (S.tlimit != null) qs.set('limit', String(S.tlimit)); // none chosen yet: the server default applies
+    const evtSource = S.stream = new EventSource(`${window.location.origin}/api/v1/notifications/stream${qs.toString() ? '?' + qs : ''}`);
     evtSource.onopen = () => setConn(true);
     evtSource.onerror = () => setConn(false);
+
+    // Stored events: replaces the console (also after an automatic reconnect, so nothing is duplicated). No toasts.
+    evtSource.addEventListener("history", (event) => {
+        setConn(true);
+        try {
+            const data = JSON.parse(event.data);
+            if (S.tlimit == null) syncLimitSelect(data.limit);
+            const consoleDiv = $('telemetry-console');
+            const frag = document.createDocumentFragment();
+            (data.events || []).forEach(ev => frag.prepend(telemetryLine(ev)));    // oldest first in -> newest on top
+            if (!frag.childNodes.length) {
+                const none = document.createElement('div');
+                none.className = 'text-slate-500';
+                none.textContent = '[System] No stored events yet for this scope.';
+                frag.append(none);
+            }
+            consoleDiv.replaceChildren(frag);
+        } catch (err) {
+            console.error("Failed to parse telemetry history:", err, event.data);
+        }
+    });
+
     evtSource.addEventListener("notification", (event) => {
         setConn(true);
-        try{
-            // const data = JSON.parse(event.data);
-            // const level = String(data.level || 'info').toLowerCase();
-            
+        try {
             const data = typeof event.data === 'string' ? JSON.parse(event.data) : event.data;
-            console.log(data);
             const level = String(data.level || 'info').toLowerCase();
-
-            showToast(data.title, data.message, level);
-            const colour = { error: 'text-red-400', warning: 'text-amber-400', success: 'text-emerald-400' }[level] || 'text-blue-300';
+            showToast(data.title, prettyMessage(data), level);
             const consoleDiv = $('telemetry-console');
-            const line = document.createElement('div');
-            line.className = `${colour} border-b border-slate-900 pb-1`;
-            line.textContent = `${new Date().toLocaleTimeString([], { hour12: false })}  [${data.level}] ${data.title} — ${data.message}`;
-            const stick = consoleDiv.scrollHeight - consoleDiv.scrollTop - consoleDiv.clientHeight < 80;
-            // consoleDiv.appendChild(line);
-            consoleDiv.prepend(line); 
-            while (consoleDiv.children.length > 500) consoleDiv.firstChild.remove();
-            if (stick) consoleDiv.scrollTop = consoleDiv.scrollHeight;
+            consoleDiv.querySelector(':scope > .text-slate-500')?.remove();          // placeholder line
+            consoleDiv.prepend(telemetryLine(data));
+            const cap = Math.max(TELEMETRY_CAP, S.tlimit || 0);
+            while (consoleDiv.children.length > cap) consoleDiv.lastChild.remove();  // newest is first: drop the oldest
             if (S.tab !== 'telemetry') { S.unread++; renderBadge(); }
-        } catch (err) { 
+        } catch (err) {
             console.error("Failed to parse SSE notification event:", err, event.data);
         }
     });
@@ -329,12 +409,42 @@ function renderRepos() {
             <td class="py-3.5 px-5 font-mono text-xs text-blue-400 font-semibold">${esc(r.total_chunks)}</td>
             <td class="py-3.5 px-5 font-mono text-xs text-slate-400 truncate max-w-xs" title="${esc(r.root_path)}">${esc(r.root_path)}</td>
             <td class="py-3.5 px-5 text-right"><button data-chat-repo="${esc(r.repo_id)}" class="bg-blue-600/20 hover:bg-blue-600/30 text-blue-400 border border-blue-500/30 px-3 py-1.5 rounded-lg text-xs">Open chat</button></td>
+            <td class="py-3 px-4 text-right">
+                <button data-reset-repo="${esc(r.repo_id)}" 
+                        class="text-xs bg-red-900/30 hover:bg-red-900/50 text-red-400 border border-red-800/50 px-2 py-1 rounded transition-colors">
+                    Reset Index
+                </button>
+            </td>
         </tr>`;
     }).join('') : `<tr><td colspan="6" class="py-14 text-center text-sm text-slate-500">${S.repos.length ? 'No repositories match your filter.' : 'No repositories yet. <button class="text-blue-400 hover:underline" onclick="switchTab(\'ingest\')">Ingest your first one</button>.'}</td></tr>`;
 }
-document.addEventListener('click', e => {
+
+async function resetRepoIndex(repoId) {
+    if (!confirm(`Are you sure you want to reset the index for ${repoId}? This will permanently delete all search indexes and chunks for this repository.`)) return;
+    
+    try {
+        const res = await fetch(`/api/v1/repos/${encodeURIComponent(repoId)}/reset-index`, { method: 'POST' });
+        if (!res.ok) throw new Error(`Server returned ${res.status}`);
+        
+        // Assuming showToast is a global function in your app.js
+        showToast("Index reset", `Successfully reset index for ${repoId}`, "success");
+        
+        // Refresh the list to show updated status
+        await loadRepositories(); 
+    } catch (err) {
+        showToast("Reset failed", err.message, "error");
+    }
+}
+
+document.addEventListener('click', async e => {
     const b = e.target.closest('[data-chat-repo]');
     if (b) quickChat(b.dataset.chatRepo);
+
+    const rb = e.target.closest('[data-reset-repo]');
+    if (rb) {
+        await resetRepoIndex(rb.dataset.resetRepo);
+    }
+
 });
 
 async function loadRepositories() {
@@ -374,14 +484,28 @@ function renderThreads(threads) {
     const list = $('thread-list');
     list.innerHTML = threads.length ? threads.map(t =>
         `<div id="thread_btn_${esc(t.thread_id)}" data-thread="${esc(t.thread_id)}" data-title="${esc(t.title)}" role="button" tabindex="0" class="thread-item px-2.5 py-2 rounded-lg cursor-pointer hover:bg-slate-800 text-xs text-slate-300 flex items-center gap-2 transition-colors">
-            <i data-lucide="message-square" class="w-3.5 h-3.5 text-blue-400 shrink-0"></i><span class="truncate">${esc(t.title)}</span></div>`).join('')
+            <i data-lucide="message-square" class="w-3.5 h-3.5 text-blue-400 shrink-0"></i><span class="truncate">${esc(t.title)}</span><button type="button" data-del="${esc(t.thread_id)}" title="Delete chat" aria-label="Delete chat" class="ml-auto p-1 shrink-0 text-slate-500 hover:text-red-400"><i data-lucide="trash-2" class="w-3.5 h-3.5"></i></button></div>`).join('')
         : '<div class="text-xs text-slate-500 text-center py-6">Select a repository to see its threads</div>';
     icons();
 }
 document.addEventListener('click', e => {
+    const d = e.target.closest('[data-del]');
+    if (d) return deleteThread(d.dataset.del);
     const t = e.target.closest('[data-thread]');
     if (t) selectThread(t.dataset.thread, t.dataset.title);
 });
+
+async function deleteThread(id) {
+    if (!confirm('Delete this chat and all its messages? This cannot be undone.')) return;
+    try {
+        const res = await fetch(`/api/v1/threads/${encodeURIComponent(id)}`, { method: 'DELETE' });
+        if (!res.ok) throw new Error(`Server returned ${res.status}`);
+        await onRepoChanged(String(S.threadId) === String(id) ? null : S.threadId);
+    } catch (err) {
+        showToast("Couldn't delete chat", err.message, "error");
+    }
+}
+
 document.addEventListener('keydown', e => {
     if ((e.key === 'Enter' || e.key === ' ') && e.target.matches?.('[data-thread]')) { e.preventDefault(); e.target.click(); }
 });
@@ -389,6 +513,7 @@ document.addEventListener('keydown', e => {
 async function onRepoChanged(preferThread) {
     S.repoId = $('chat-repo-select').value || null;
     LS.set('repo', S.repoId || '');
+    setupNotificationStream();      // telemetry follows the selection: general events + this repo's events
     if (!S.repoId) {
         S.threadId = null;
         renderThreads([]);

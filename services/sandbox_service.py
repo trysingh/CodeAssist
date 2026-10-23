@@ -15,6 +15,12 @@ Docker design (why it looks like this)
     memory / cpu / pid limits, hard timeout (in-container AND host side)
   * dependencies are baked into an image tagged by the hash of requirements, built once
     (the only step that needs network)
+
+Pre-warm: that build no longer has to wait for the first change request.
+SandboxService.prewarm() builds the image for a repo ahead of time (services/sandbox_warmer.py
+calls it in the background at startup, after ingest and when a requirements file changes),
+verify() then finds the tag in `_ready` and goes straight to `docker run`. A build that is
+still running when a request arrives is awaited, never started twice (per-tag lock).
 """
 from __future__ import annotations
 
@@ -29,12 +35,14 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import time
 import uuid
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from services.notifier import notifier
 
 from config.settings import settings
 
@@ -304,10 +312,15 @@ exit 0
 class DockerRunner:
     name = "docker"
     report_path = "/tmp/sbx_report.xml"
+    _NEG_TTL_S = 10.0          # a "Docker is down" answer is trusted for this long at most
 
     def __init__(self):
         self._locks: Dict[str, asyncio.Lock] = {}
-        self._failed: Dict[str, str] = {}
+        self._failed: Dict[str, Tuple[float, str]] = {}     # tag -> (monotonic time, error)
+        self._avail: Optional[Tuple[float, bool, str]] = None
+        self._procs: Set[subprocess.Popen] = set()          # running image builds, killable by stop()
+        self._plock = threading.Lock()
+        self._closing = False
 
     def image_tag(self, requirements: str) -> str:
         h = hashlib.sha256((settings.sandbox_base_image + "\n" + ENTRY_SH + "\n" + requirements).encode()).hexdigest()[:12]
@@ -325,6 +338,22 @@ class DockerRunner:
                 tag, *argv]
 
     async def available(self) -> Tuple[bool, str]:
+        """Is the Docker daemon reachable? Cached: `docker version` costs 0.1-2 s (more on Docker Desktop)
+        and it used to run before every single verification. A negative answer is cached only briefly
+        so starting Docker Desktop after the app is noticed quickly."""
+        ttl = settings.sandbox_available_ttl_s
+        if ttl > 0 and self._avail is not None:
+            ts, ok, info = self._avail
+            if time.monotonic() - ts < (ttl if ok else min(ttl, self._NEG_TTL_S)):
+                return ok, info
+        ok, info = await self._probe()
+        self._avail = (time.monotonic(), ok, info)
+        return ok, info
+
+    def invalidate_availability(self) -> None:
+        self._avail = None
+
+    async def _probe(self) -> Tuple[bool, str]:
         try:
             rc, out, _ = await asyncio.to_thread(
                 _exec, ["docker", "version", "--format", "{{.Server.Version}}"], None, 15)
@@ -336,19 +365,92 @@ class DockerRunner:
             return False, "Docker is installed but the daemon is not reachable (is Docker Desktop running?)"
         return True, out.decode(errors="replace").strip()
 
+    def _recent_failure(self, tag: str) -> Optional[str]:
+        hit = self._failed.get(tag)
+        if hit and time.monotonic() - hit[0] < settings.sandbox_build_retry_s:
+            return hit[1]
+        return None
+
     async def prepare(self, requirements: str) -> Optional[str]:
-        """Make sure the dependency image exists. Returns an error string or None."""
+        """Make sure the dependency image exists. Returns an error string or None.
+
+        A failed build is remembered for settings.sandbox_build_retry_s, then tried again: a network
+        hiccup during a background build at startup must not switch tests off until the next restart."""
         tag = self.image_tag(requirements)
-        if tag in self._failed:
-            return self._failed[tag]
+        err = self._recent_failure(tag)
+        if err:
+            return err
         async with self._locks.setdefault(tag, asyncio.Lock()):
+            err = self._recent_failure(tag)        # a caller that waited for the lock must not redo a build that just failed
+            if err:
+                return err
             rc, _, _ = await asyncio.to_thread(_exec, ["docker", "image", "inspect", tag], None, 30)
             if rc == 0:
+                self._failed.pop(tag, None)
                 return None
+            if self._closing:
+                return "application is shutting down"
             err = await self._build(tag, requirements)
-            if err:
-                self._failed[tag] = err
+            if err is None:
+                self._failed.pop(tag, None)
+            elif not self._closing:                # a build killed by stop() is not a verdict on the requirements
+                self._failed[tag] = (time.monotonic(), err)
             return err
+
+    def _exec_tracked(self, args: List[str], timeout: float) -> Tuple[Optional[int], bytes, bool]:
+        """Blocking like _exec, but the process can be killed from another thread (stop()).
+        Without this a background `docker build` (minutes) would keep the application from exiting:
+        asyncio waits for its worker threads, and the thread waits for docker."""
+        with self._plock:                    # same lock as stop(): a build can not slip in after shutdown began
+            if self._closing:
+                return 1, b"application is shutting down", False
+            p = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            self._procs.add(p)
+        try:
+            out, _ = p.communicate(timeout=timeout)
+            return p.returncode, out or b"", False
+        except subprocess.TimeoutExpired:
+            p.kill()
+            out, _ = p.communicate()
+            return None, out or b"", True
+        finally:
+            with self._plock:
+                self._procs.discard(p)
+
+    def stop(self) -> None:
+        """Application shutdown: kill an in-flight image build and refuse to start new ones."""
+        with self._plock:
+            self._closing = True
+            procs = list(self._procs)
+        for p in procs:
+            try:
+                p.terminate()
+            except Exception:  # noqa: BLE001 - already gone
+                pass
+
+    async def list_images(self) -> List[str]:
+        """`repository:tag` of every image this sandbox built (settings.sandbox_image_prefix)."""
+        prefix = settings.sandbox_image_prefix + ":"
+        try:
+            rc, out, _ = await asyncio.to_thread(
+                _exec, ["docker", "image", "ls", settings.sandbox_image_prefix,
+                        "--format", "{{.Repository}}:{{.Tag}}"], None, 30)
+        except Exception:  # noqa: BLE001
+            return []
+        if rc != 0:
+            return []
+        lines = (ln.strip() for ln in out.decode(errors="replace").splitlines())
+        return sorted({ln for ln in lines if ln.startswith(prefix) and not ln.endswith(":<none>")})
+
+    async def remove_image(self, tag: str) -> bool:
+        """`docker rmi` without --force: an image used by a running container is left alone."""
+        if not tag.startswith(settings.sandbox_image_prefix + ":"):
+            return False
+        try:
+            rc, _, _ = await asyncio.to_thread(_exec, ["docker", "rmi", tag], None, 60)
+        except Exception:  # noqa: BLE001
+            return False
+        return rc == 0
 
     async def _build(self, tag: str, requirements: str) -> Optional[str]:
         with tempfile.TemporaryDirectory(prefix="coderag_build_") as ctx:
@@ -364,7 +466,7 @@ class DockerRunner:
                 "RUN pip install --no-cache-dir pytest -r /tmp/requirements.txt\n"
                 'ENTRYPOINT ["/usr/local/bin/sbx-entry"]\n').encode("utf-8"))
             rc, out, timed = await asyncio.to_thread(
-                _exec, ["docker", "build", "-t", tag, ctx], None, settings.sandbox_build_timeout_s)
+                self._exec_tracked, ["docker", "build", "-t", tag, ctx], settings.sandbox_build_timeout_s)
         if timed:
             return f"image build exceeded {settings.sandbox_build_timeout_s}s"
         if rc != 0:
@@ -380,6 +482,8 @@ class DockerRunner:
                 _exec, self.docker_args(tag, name, timeout, argv), tar, timeout + 30)
         except FileNotFoundError:
             return RawRun(error="Docker CLI not found on PATH")
+        if rc == 125:                          # docker itself failed (daemon gone ...): do not trust a cached "Docker is up"
+            self.invalidate_availability()
         if timed:
             await asyncio.to_thread(_exec, ["docker", "rm", "-f", name], None, 30)   # CLI killed, container may live
         return RawRun(stdout=out.decode("utf-8", errors="replace"), exit_code=rc, timed_out=timed)
@@ -493,6 +597,86 @@ class SandboxService:
                 return tree[name].decode("utf-8", errors="replace")
         return ""
 
+    # ------------------------------------------------------------------ pre-warm
+    async def requirements_for(self, repo_id: str, rev: Optional[int] = None) -> str:
+        """The requirements text verify() would use for the repo view at `rev` (default: latest).
+        Same file order as _requirements(), but reads only those files, not the whole repo."""
+        rev = await self.store.latest_rev(repo_id) if rev is None else rev
+        for name in settings.sandbox_requirements_files:
+            try:
+                f = await self.store.get_file(repo_id, name, rev)
+            except ValueError:
+                continue
+            if f is not None:
+                return f.data.decode("utf-8", errors="replace")
+        return ""
+
+    async def prewarm(self, repo_id: str, rev: Optional[int] = None) -> dict:
+        """Build the dependency image for a repo ahead of the first change request. Never raises for
+        an expected situation; returns {repo_id, status, tag, note[, seconds][, retry]} where status is
+        ready | skipped | failed. `retry` is set when trying again later can help (Docker not up yet)."""
+        out: dict = {"repo_id": repo_id, "status": "skipped", "tag": "", "note": ""}
+        if not self.enabled:
+            out["note"] = "sandbox disabled"
+            return out
+        if self.runner.name != "docker":
+            out["note"] = f"the {self.runner.name} backend needs no image"
+            return out
+        rev = await self.store.latest_rev(repo_id) if rev is None else rev
+        if not any(p.endswith(".py") for p in await self.store.list_paths(repo_id, rev)):
+            out["note"] = "no Python files in this repo (verify never starts a container for it)"
+            return out
+        ok, info = await self.runner.available()
+        if not ok:
+            out.update(note=info, retry=True)
+            return out
+
+        requirements = await self.requirements_for(repo_id, rev)
+        tag = self.runner.image_tag(requirements)
+        out["tag"] = tag
+        if tag in self._ready:
+            out.update(status="ready", note="image already prepared")
+            return out
+        self._emit(f"Preparing the sandbox image for repo {repo_id} in the background "
+                   f"(a first build can take minutes, chat is not blocked)")
+        t0 = time.monotonic()
+        err = await self.runner.prepare(requirements)
+        if err:
+            out.update(status="failed", note=err)
+            self._emit(f"Sandbox image for repo {repo_id} could not be built: {err[:300]}. "
+                       f"Tests will be skipped for this repo until it builds.", "WARNING")
+            return out
+        self._ready.add(tag)
+        secs = round(time.monotonic() - t0, 1)
+        out.update(status="ready", seconds=secs, note="image present")
+        if secs >= 2:                              # an image that already existed answers in milliseconds: stay quiet
+            self._emit(f"Sandbox image for repo {repo_id} is ready ({secs}s)", "SUCCESS")
+        return out
+
+    async def prune_images(self, repo_ids: Iterable[str]) -> List[str]:
+        """Remove sandbox images that no repo's current requirements map to (old requirement hashes,
+        a changed base image). Only images under settings.sandbox_image_prefix are ever touched."""
+        if not self.enabled or self.runner.name != "docker":
+            return []
+        ok, _ = await self.runner.available()
+        if not ok:
+            return []
+        keep = {self.runner.image_tag(await self.requirements_for(r)) for r in repo_ids}
+        removed = []
+        for tag in await self.runner.list_images():
+            if tag not in keep and await self.runner.remove_image(tag):
+                removed.append(tag)
+        if removed:
+            self._ready.difference_update(removed)
+            self._emit(f"Removed {len(removed)} unused sandbox image(s)")
+        return removed
+
+    def close(self) -> None:
+        """Application shutdown: stop anything the runner has running in the background."""
+        stop = getattr(self.runner, "stop", None)
+        if stop:
+            stop()
+
     async def _execute(self, tree: Dict[str, bytes], mode: str, selected: List[str],
                        smoke: List[str], requirements: str) -> RunReport:
         extra: Dict[str, bytes] = {}
@@ -536,7 +720,8 @@ class SandboxService:
         if self.runner.name == "docker":
             tag = self.runner.image_tag(requirements)
             if tag not in self._ready:
-                self._emit("Preparing sandbox image (first run builds dependencies, this can take minutes)")
+                self._emit("Preparing sandbox image (a background build may already be running; "
+                           "a first build can take minutes)")
                 err = await self.runner.prepare(requirements)
                 if err:
                     return none(err)

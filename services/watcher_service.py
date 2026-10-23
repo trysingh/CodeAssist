@@ -40,7 +40,7 @@ class RepoChangeHandler(FileSystemEventHandler):
             rel_path = str(fpath.relative_to(self.root_path))
             asyncio.run(controller.incremental_reingest_file(self.repo_id, self.root_path, rel_path))
         except Exception as exc:
-            notifier.notify("Incremental Ingestion Error", f"Failed to refresh {fpath.name}: {exc}", level="ERROR")
+            notifier.notify("Incremental Ingestion Error", f"Failed to refresh {fpath.name}: {exc}", level="ERROR", repo_id=self.repo_id)
 
 
 class RepoWatcherManager:
@@ -60,7 +60,7 @@ class RepoWatcherManager:
         observer.schedule(event_handler, str(root_path), recursive=True)
         observer.start()
         self.observers[repo_id] = observer
-        notifier.notify("Watcher Active", f"Real-time monitoring enabled for repository: {root_path.name}")
+        notifier.notify("Watcher Active", f"Real-time monitoring enabled for repository: {root_path.name}", repo_id=repo_id)
 
     def stop_all(self):
         for obs in self.observers.values():

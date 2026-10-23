@@ -2,6 +2,7 @@ import hashlib
 import os
 import sys
 import time
+import re
 import orjson
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Callable
@@ -12,9 +13,11 @@ from services.chunking.registry import ChunkingRegistry, parallel_chunk_files
 from services.vector_store import VectorStoreService
 from services.rag_graph import RAGWorkflowManager
 from services.attachment_service import AttachmentService
-from services.notifier import notifier
+from services.attachment_intent import derive_request
+from services.notifier import notifier, repo_scope
 from services.repo_store import RepoStore
 from services.repo_change import RepoChangeService, ChangeResult
+from services.sandbox_warmer import SandboxWarmer, is_requirements_path, request_prewarm
 from services.intent_router import COMMANDS_HELP, route_intent
 from services.web_search_service import split_web_prefix
 from models.schemas import GENERAL_REPO_ID
@@ -31,6 +34,13 @@ class EngineController:
         self.rag_manager = RAGWorkflowManager(self.db, self.vector_service, self.attachments)
         self.repo_store = RepoStore()
         self.change_service = RepoChangeService(self.db, self.vector_service, self.repo_store)
+        # Builds sandbox dependency images in the background. Inert until warmer.start() is called from the
+        # running application (views/api_view.py); the file watcher's short-lived controllers never start one.
+        self.warmer = SandboxWarmer(self.change_service.sandbox, self._warm_repo_ids)
+
+    async def _warm_repo_ids(self) -> List[str]:
+        await self.db.init_db()
+        return await self.db.list_repo_ids_by_activity()
 
     @staticmethod
     def compute_repo_id(root_path: Path) -> str:
@@ -152,7 +162,7 @@ class EngineController:
             if repo.status.value != "COMPLETED" or not root_path.exists():
                 continue
 
-            notifier.notify("Syncing Repository", f"Checking for offline updates in '{repo.title}'...", level="INFO")
+            notifier.notify("Syncing Repository", f"Checking for offline updates in '{repo.title}'...", level="INFO", repo_id=repo.repo_id)
             completed_hashes = await self.db.get_completed_file_hashes(repo.repo_id)
             current_files = self.scan_supported_files(root_path)
             
@@ -163,13 +173,13 @@ class EngineController:
                 
                 if completed_hashes.get(rel_path) != current_hash:
                     offline_updates_count += 1
-                    notifier.notify("Offline Change Detected", f"Catching up on modified file: {rel_path}")
+                    notifier.notify("Offline Change Detected", f"Catching up on modified file: {rel_path}", repo_id=repo.repo_id)
                     await self.incremental_reingest_file(repo.repo_id, root_path, rel_path)
 
             if offline_updates_count > 0:
-                notifier.notify("Sync Complete", f"Caught up on {offline_updates_count} file(s) changed while offline.", level="SUCCESS")
+                notifier.notify("Sync Complete", f"Caught up on {offline_updates_count} file(s) changed while offline.", level="SUCCESS", repo_id=repo.repo_id)
             else:
-                notifier.notify("Repo Up-to-Date", f"No offline changes detected for '{repo.title}'.", level="INFO")
+                notifier.notify("Repo Up-to-Date", f"No offline changes detected for '{repo.title}'.", level="INFO", repo_id=repo.repo_id)
 
             watcher_manager.start_watching(repo.repo_id, str(root_path))
 
@@ -212,7 +222,7 @@ class EngineController:
             notifier.notify("Disk edit recorded",
                             f"{len(changed)} file(s) changed on disk while proposals touched them (e.g. {sorted(changed)[0]}). "
                             f"Recorded as revision {rev}; new proposals build on your version.",
-                            level="WARNING")
+                            level="WARNING", repo_id=repo_id)
 
     async def incremental_reingest_file(self, repo_id: str, root_path: Path, rel_path: str):
         full_path = root_path / rel_path
@@ -225,7 +235,7 @@ class EngineController:
         if completed_hashes.get(rel_path) == fhash:
             return
 
-        notifier.notify("Code Change Detected", f"Re-chunking and refreshing vectors for: {rel_path}")
+        notifier.notify("Code Change Detected", f"Re-chunking and refreshing vectors for: {rel_path}", repo_id=repo_id)
 
         ext = full_path.suffix.lower()
         content = full_path.read_text(encoding="utf-8", errors="replace")
@@ -234,7 +244,9 @@ class EngineController:
         raw = await self.repo_store.upsert_base_files(repo_id, [(rel_path.replace("\\", "/"), raw_bytes)])
         if raw["shadowed"]:
             await self._record_disk_sync(repo_id, {raw["shadowed"][0]: raw_bytes})
-        
+        if is_requirements_path(rel_path):
+            request_prewarm(repo_id)  # dependencies changed -> new image tag; build it now, not on the next change request
+
         strategy = ChunkingRegistry.get_strategy(ext)
         chunk_docs = strategy.chunk_file(repo_id, rel_path, fhash, content, settings.chunk_size, settings.chunk_overlap)
 
@@ -257,7 +269,8 @@ class EngineController:
         notifier.notify(
             "Vectors Refreshed Successfully", 
             f"'{rel_path}' successfully updated. Old vectors replaced with {len(chunk_docs)} new chunks.", 
-            level="SUCCESS"
+            level="SUCCESS",
+            repo_id=repo_id
         )
 
     async def ingest_repository(self, repo_root_str: str) -> RepoInfo:
@@ -272,7 +285,8 @@ class EngineController:
         
         await self.db.upsert_repo(repo_id, title, str(root_path), JobStatus.PROCESSING, len(all_files))
         await self.snapshot_raw_files(repo_id, root_path)
-        
+        request_prewarm(repo_id)      # build the sandbox image while the chunks are being embedded (no-op without a running app)
+
         completed_hashes = await self.db.get_completed_file_hashes(repo_id)
         pending_tasks: List[Tuple[str, str, str, str, int, int]] = []
         
@@ -320,32 +334,75 @@ class EngineController:
         await self.db.init_db()
         return await self.db.list_repos()
 
-    async def chat_with_repo(self, repo_id: str, thread_id: str, query: str, web: str = "auto") -> str:
+    async def chat_with_repo(self, repo_id: str, thread_id: str, query: str, web: str = "auto",
+                             attachments: Optional[List[dict]] = None) -> str:
+        """attachments = prepared attachments of THIS message. When the typed text is empty or vague, a request
+        written inside an uploaded image becomes the user's message (then routed like typed text)."""
         await self.db.init_db()
         repo = await self.db.get_repo(repo_id)
         if not repo:
             raise ValueError(f"Repository ID '{repo_id}' not found.")
+        note = ""
+        if attachments:
+            found = await derive_request(query, attachments, repo_id=repo_id)
+            if found.source == "image":
+                query, note = found.request, found.note()
+            elif not query.strip():
+                query = "Please review the attached content."
+        with repo_scope(repo_id):       # events raised while answering (web search, sandbox, ...) belong to this repo
+            return note + await self._route_chat(repo_id, thread_id, query, web)
+
+    async def _thread_context(self, thread_id: str, max_msgs: int = 6, per_msg: int = 700, total: int = 3000) -> str:
+        """Last few turns of this thread, so '/change ... as discussed above' has something to refer to."""
+        try:
+            msgs = await self.db.get_thread_messages(thread_id)
+        except Exception:
+            return ""
+        if msgs and msgs[-1]["role"] == "user":
+            msgs = msgs[:-1]                        # the /change command itself: the API layer saved it before routing
+        lines = [f"{m['role'].upper()}: {' '.join(str(m['content']).split())[:per_msg]}" for m in msgs[-max_msgs:]]
+        return "\n".join(lines)[-total:]
+
+    async def _last_plan(self, thread_id: str, request: str) -> str:
+        """Reviewed /plan, only if the last assistant reply was a plan for this exact request."""
+        try:
+            msgs = await self.db.get_thread_messages(thread_id)
+        except Exception:
+            return ""
+        last = next((str(m["content"]) for m in reversed(msgs) if m["role"] == "assistant"), "")
+        m = re.search(r"To build it, send: `/change (.*)`\s*$", last, re.S)
+        if not last.startswith("**Plan**") or not m or m.group(1).strip() != request.strip():
+            return ""
+        return last.split("\n\n", 2)[-1].rsplit("\n\nTo build it", 1)[0]
+
+    async def _route_chat(self, repo_id: str, thread_id: str, query: str, web: str) -> str:
         query, web = split_web_prefix(query, web)
         if repo_id == GENERAL_REPO_ID:
             # No codebase: only explicit prefixes matter (model routing would misread "write a script..." as a change).
             decision = await route_intent(query, model="", repo_id=repo_id)
             if decision.intent == "help":
                 return COMMANDS_HELP
-            if decision.intent == "change" and decision.source == "prefix":
+            if decision.intent in ("change", "plan") and decision.source == "prefix":
                 return "Code changes need a repository. Pick one in the selector, or ask your question here."
             return await self.rag_manager.invoke_chat(repo_id, thread_id, decision.query, web=web)
         decision = await route_intent(query, repo_id=repo_id)
         if decision.intent == "help":
             return COMMANDS_HELP
+        if decision.intent == "plan":
+            return await self.change_service.plan_only(repo_id, decision.query,
+                                                       context=await self._thread_context(thread_id))
         if decision.intent == "change":
-            return (await self.propose_change(repo_id, decision.query)).to_markdown()
+            ctx = await self._thread_context(thread_id)
+            plan = await self._last_plan(thread_id, decision.query)
+            return (await self.propose_change(repo_id, decision.query, context=ctx, plan=plan)).to_markdown()
         return await self.rag_manager.invoke_chat(repo_id, thread_id, decision.query, web=web)
 
-    async def propose_change(self, repo_id: str, request: str, base_rev: Optional[int] = None) -> ChangeResult:
+    async def propose_change(self, repo_id: str, request: str, base_rev: Optional[int] = None,
+                             context: str = "", plan: str = "") -> ChangeResult:
         await self.db.init_db()
         if not await self.db.get_repo(repo_id):
             raise ValueError(f"Repository ID '{repo_id}' not found.")
-        return await self.change_service.run(repo_id, request, base_rev)
+        return await self.change_service.run(repo_id, request, base_rev, context=context, plan=plan)
 
     async def list_revisions(self, repo_id: str) -> list:
         return await self.repo_store.list_revisions(repo_id)
@@ -393,3 +450,17 @@ class EngineController:
                 notifier.notify("Attachment not indexed", f"{p['filename']}: {exc}", level="WARNING")
             saved.append({"id": att_id, "filename": p["filename"], "kind": p["kind"], "chars": len(p["text"])})
         return saved
+
+    async def reset_repo_index(self, repo_id: str):
+        """Resets both the SQLite metadata and the Chroma vector store for a repo."""
+        await self.db.init_db()
+        repo = await self.db.get_repo(repo_id)
+        if not repo:
+            raise ValueError(f"Repository ID '{repo_id}' not found.")
+        
+        # 1. Clear Chroma collection
+        self.vector_service.delete_collection(repo_id)
+        # 2. Clear SQLite chunks and jobs
+        await self.db.reset_repo_indexes(repo_id)
+        
+        notifier.notify("Index Reset", f"Successfully cleared all indexes for repository {repo_id}.", level="SUCCESS", repo_id=repo_id)

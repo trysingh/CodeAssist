@@ -104,6 +104,20 @@ class DatabaseManager:
                     metadata_json TEXT
                 )
             """)
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS telemetry_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    uid TEXT NOT NULL UNIQUE,
+                    ts TEXT NOT NULL,
+                    scope TEXT NOT NULL,
+                    repo_id TEXT,
+                    level TEXT NOT NULL DEFAULT 'INFO',
+                    title TEXT NOT NULL,
+                    message TEXT NOT NULL
+                )
+            """)
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_telemetry_scope_repo ON telemetry_events(scope, repo_id, id)")
             await db.execute(
                 "INSERT OR IGNORE INTO repositories (repo_id, title, root_path, status, total_files, created_at) "
                 "VALUES (?, 'General (web)', '', 'COMPLETED', 0, ?)", (GENERAL_REPO_ID, datetime.utcnow().isoformat()))
@@ -236,6 +250,24 @@ class DatabaseManager:
                     ))
                 return results
 
+    async def list_repo_ids_by_activity(self) -> List[str]:
+        """Ingested (COMPLETED) repos, most recently chatted-with first; a repo nobody chatted with yet is
+        ranked by its creation time. Used to decide which sandbox images to pre-build first at startup.
+        The General (web) placeholder is not a codebase and is never listed."""
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute("""
+                SELECT r.repo_id
+                FROM repositories r
+                LEFT JOIN (
+                    SELECT t.repo_id AS repo_id, MAX(m.timestamp) AS last_msg
+                    FROM chat_threads t JOIN chat_messages m ON m.thread_id = t.thread_id
+                    GROUP BY t.repo_id
+                ) a ON a.repo_id = r.repo_id
+                WHERE r.repo_id != ? AND r.status = ?
+                ORDER BY datetime(COALESCE(a.last_msg, r.created_at)) DESC, r.repo_id
+            """, (GENERAL_REPO_ID, JobStatus.COMPLETED.value)) as cursor:
+                return [row[0] for row in await cursor.fetchall()]
+
     async def record_file_job(self, repo_id: str, file_path: str, file_hash: str, status: JobStatus, error: Optional[str] = None):
         now_iso = datetime.utcnow().isoformat()
         async with aiosqlite.connect(self.db_path) as db:
@@ -308,6 +340,64 @@ class DatabaseManager:
         async with aiosqlite.connect(self.db_path) as db:
             async with db.execute("SELECT DISTINCT file_path FROM code_chunks WHERE repo_id=?", (repo_id,)) as c:
                 return [r[0] for r in await c.fetchall()]
+
+    async def delete_thread(self, thread_id: str) -> bool:
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("DELETE FROM chat_attachments WHERE thread_id = ?", (thread_id,))
+            await db.execute("DELETE FROM chat_messages WHERE thread_id = ?", (thread_id,))
+            cur = await db.execute("DELETE FROM chat_threads WHERE thread_id = ?", (thread_id,))
+            await db.commit()
+            return cur.rowcount > 0
+    
+    async def reset_repo_indexes(self, repo_id: str):
+        """Deletes all chunks and file job history for a specific repository."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("DELETE FROM code_chunks WHERE repo_id = ?", (repo_id,))
+            await db.execute("DELETE FROM file_jobs WHERE repo_id = ?", (repo_id,))
+            await db.commit()
+
+    
+    # ------------------------------------------------------------------ telemetry & logs
+    async def save_telemetry_events(self, events: List[Dict[str, Any]]) -> None:
+        """Batch insert (one connection, one commit). A repeated uid is ignored, so a retry cannot duplicate a row."""
+        if not events:
+            return
+        rows = [(e["uid"], e["ts"], e["scope"], e.get("repo_id"), e.get("level") or "INFO",
+                 e["title"], e["message"]) for e in events]
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.executemany(
+                "INSERT OR IGNORE INTO telemetry_events (uid, ts, scope, repo_id, level, title, message) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)", rows)
+            await db.commit()
+
+    async def get_telemetry_events(self, repo_id: Optional[str], limit: int) -> List[Dict[str, Any]]:
+        """Last `limit` events, oldest first. General events always; repo events only for `repo_id`
+        (None or the General placeholder = general events only)."""
+        limit = max(0, int(limit))
+        if limit == 0:
+            return []
+        cols = "uid, ts, scope, repo_id, level, title, message"
+        if repo_id and repo_id != GENERAL_REPO_ID:
+            sql = (f"SELECT {cols} FROM telemetry_events WHERE scope = 'general' OR (scope = 'repo' AND repo_id = ?) "
+                   f"ORDER BY id DESC LIMIT ?")
+            args: tuple = (repo_id, limit)
+        else:
+            sql = f"SELECT {cols} FROM telemetry_events WHERE scope = 'general' ORDER BY id DESC LIMIT ?"
+            args = (limit,)
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(sql, args) as cursor:
+                rows = await cursor.fetchall()
+        keys = ("uid", "ts", "scope", "repo_id", "level", "title", "message")
+        return [dict(zip(keys, r)) for r in reversed(rows)]
+
+    async def prune_telemetry_events(self, keep: int) -> int:
+        """Keep only the newest `keep` rows. Returns how many were removed."""
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(
+                "DELETE FROM telemetry_events WHERE id <= (SELECT COALESCE(MAX(id), 0) FROM telemetry_events) - ?",
+                (max(1, int(keep)),))
+            await db.commit()
+            return cur.rowcount or 0
 
     async def get_file_chunks(self, repo_id: str, file_path: str) -> List[Dict[str, Any]]:
         async with aiosqlite.connect(self.db_path) as db:
