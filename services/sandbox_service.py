@@ -50,6 +50,52 @@ _TEST_FILE = re.compile(r"(^|/)(test_[^/]+|[^/]+_test)\.py$")
 _SMOKE_SKIP = re.compile(r"(^|/)(tests?|migrations|docs?|examples?|scripts)/|(^|/)(setup|conftest)\.py$")
 _REPORT = "{REPORT}"
 _MAX_TAIL = 3000
+_IMAGE_REV = "2"          # part of the image tag: bump it when the Dockerfile text changes so old images are rebuilt
+_TIKTOKEN_REQ = re.compile(r"^\s*tiktoken\b", re.IGNORECASE | re.MULTILINE)
+_GENERIC_MSG = {"", "collection failure", "test setup failure", "test teardown failure"}
+
+_NET_ERR = re.compile(r"NameResolutionError|Name or service not known|Temporary failure in name resolution|getaddrinfo failed|"
+                      r"Connection refused|ConnectionError|Max retries exceeded|Network is unreachable", re.IGNORECASE)
+_HOST = re.compile(r"host='([^']+)'|Failed to resolve '([^']+)'|https?://([\w.\-]+)")
+_NO_MOD = re.compile(r"No module named '([\w.]+)'")
+
+
+def hint_for(text: str, local_tops: Optional[Set[str]] = None) -> str:
+    """One actionable sentence for the usual reasons a test fails inside the sandbox but not on the host.
+    '' = no idea. Text only, no side effects."""
+    text = text or ""
+    m = _NO_MOD.search(text)
+    if m:
+        top = m.group(1).split(".")[0]
+        if not local_tops or top not in local_tops:
+            return (f"package '{top}' is not installed in the sandbox image. It exists on your machine but is missing from "
+                    f"the requirements file the sandbox uses; add it there and the image rebuilds by itself")
+    if _NET_ERR.search(text):
+        hm = _HOST.search(text)
+        host = next((g for g in (hm.groups() if hm else ()) if g), "")
+        extra = " (tiktoken downloads its vocabulary on first use)" if "tiktoken" in text else ""
+        return (f"code tried to reach {host or 'the network'}{extra}, but the sandbox runs with --network none. Fetch it while "
+                f"the image is built (settings.sandbox_build_run) or mock it in the test")
+    if re.search(r"Read-only file system|\[Errno 30\]", text):
+        return "code wrote to the read-only root filesystem; only /tmp and /work are writable in the sandbox"
+    if re.search(r"PermissionError|Permission denied", text):
+        return "permission denied inside the sandbox (non-root user 1000, read-only root): write under /tmp or tmp_path"
+    return ""
+
+
+def write_log(scope: str, label: str, text: str) -> str:
+    """Keep the raw console output of a sandbox run on disk (best effort, rotated). -> absolute path or ''."""
+    try:
+        safe = lambda v: re.sub(r"[^\w.-]", "_", v or "_")[:60]
+        d = (Path(settings.storage_dir) / "sandbox_logs" / safe(scope)).resolve()
+        d.mkdir(parents=True, exist_ok=True)
+        f = d / f"{time.strftime('%Y%m%d-%H%M%S')}-{safe(label)}-{uuid.uuid4().hex[:4]}.log"
+        f.write_text((text or "")[-2_000_000:], encoding="utf-8", errors="replace")
+        for old in sorted(d.glob("*.log"), key=lambda x: x.stat().st_mtime)[:-max(1, settings.sandbox_logs_keep)]:
+            old.unlink(missing_ok=True)
+        return str(f)
+    except Exception:  # noqa: BLE001 - a log is a convenience, never a reason to fail a run
+        return ""
 
 
 # --------------------------------------------------------------------------- results
@@ -76,6 +122,13 @@ class RunReport:
     timed_out: bool = False
     duration: float = 0.0
     tail: str = ""
+    exit_code: Optional[int] = None
+    passed_ids: List[str] = field(default_factory=list)
+    log_path: str = ""
+
+
+def _case_dict(c: CaseResult) -> dict:
+    return {"id": c.id, "kind": c.kind, "message": _trim(c.message, 240)}
 
 
 @dataclass
@@ -83,6 +136,9 @@ class SandboxVerdict:
     report: RunReport
     new_failures: List[CaseResult] = field(default_factory=list)
     preexisting: int = 0
+    preexisting_cases: List[CaseResult] = field(default_factory=list)
+    hints: List[str] = field(default_factory=list)
+    proof: dict = field(default_factory=dict)       # fail->pass evidence for generated tests
 
     @property
     def ran(self) -> bool:
@@ -97,7 +153,11 @@ class SandboxVerdict:
         return {"mode": r.mode, "ran": r.ran, "ok": self.ok, "note": r.note, "backend": r.backend,
                 "strategy": r.strategy, "selected": len(r.selected), "passed": r.passed, "failed": r.failed,
                 "skipped": r.skipped, "new_failures": [c.id for c in self.new_failures],
-                "preexisting": self.preexisting, "duration": round(r.duration, 1)}
+                "preexisting": self.preexisting, "duration": round(r.duration, 1),
+                "exit_code": r.exit_code, "log": r.log_path,
+                "new_failure_details": [_case_dict(c) for c in self.new_failures[:8]],
+                "preexisting_details": [_case_dict(c) for c in self.preexisting_cases[:8]],
+                "hints": self.hints[:3], "proof": self.proof}
 
 
 # --------------------------------------------------------------------------- test selection
@@ -191,13 +251,40 @@ for m in json.load(open(".sbx_smoke.json")):
 
 
 def pytest_argv(paths: Sequence[str]) -> List[str]:
+    # --continue-on-collection-errors: one test file that cannot be imported (offline download, missing package) must not
+    # abort the whole session, otherwise NOT A SINGLE test runs and the run proves nothing
     return ["python", "-m", "pytest", "-q", "-p", "no:cacheprovider", "--maxfail=25", "--tb=short",
+            "--continue-on-collection-errors",
             "-o", "junit_family=xunit2", f"--junitxml={_REPORT}", *paths]
 
 
 def _trim(s: str, n: int) -> str:
     s = (s or "").strip()
     return s if len(s) <= n else s[:n] + " ..."
+
+
+def _tail(s: str, n: int) -> str:
+    """Last n chars: in a traceback the cause is at the END."""
+    s = (s or "").strip()
+    return s if len(s) <= n else "... " + s[-n:]
+
+
+def _headline(body: str) -> str:
+    """The line that says what went wrong: the last 'E   ...' line of a pytest traceback, else the last non-empty line."""
+    lines = [ln.rstrip() for ln in (body or "").splitlines() if ln.strip()]
+    for ln in reversed(lines):
+        if ln.startswith("E "):
+            return _trim(ln[1:].strip(), 300)
+    return _trim(lines[-1].strip(), 300) if lines else ""
+
+
+def junit_passed_ids(xml_text: str) -> List[str]:
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return []
+    return [f"{tc.get('classname', '')}::{tc.get('name', '')}" for tc in root.iter("testcase")
+            if tc.find("failure") is None and tc.find("error") is None and tc.find("skipped") is None]
 
 
 def parse_junit(xml_text: str) -> Tuple[int, int, int, List[CaseResult]]:
@@ -213,7 +300,12 @@ def parse_junit(xml_text: str) -> Tuple[int, int, int, List[CaseResult]]:
             kind = "error"
         if bad is not None:
             failed += 1
-            cases.append(CaseResult(cid, kind, _trim(bad.get("message", ""), 300), _trim(bad.text or "", 1500)))
+            body, msg = (bad.text or "").strip(), (bad.get("message") or "").strip()
+            if msg == "collection failure":
+                kind = "collect"                      # the test file could not even be imported: no test in it ran
+            if msg in _GENERIC_MSG and body:
+                msg = f"{msg}: {_headline(body)}" if msg else _headline(body)
+            cases.append(CaseResult(cid, kind, _trim(msg, 300), _tail(body, 2400)))
         elif tc.find("skipped") is not None:
             skipped += 1
         else:
@@ -243,6 +335,11 @@ def parse_run(raw: RawRun, mode: str, backend: str) -> RunReport:
     rc = int(m.group(1)) if m else raw.exit_code
     console = out.split("::SBX-EXIT::")[0]
     rep.tail = console[-_MAX_TAIL:]
+    rep.exit_code = rc
+    if m is None and rc in (125, 126, 127):          # `docker run` itself failed: the container never started
+        last = next((ln.strip() for ln in reversed(console.splitlines()) if ln.strip()), "")
+        rep.note = f"docker could not start the sandbox container (exit {rc}): {_trim(last, 300)}"
+        return rep
     if "::SBX-ERROR::" in out:
         rep.note = "sandbox could not unpack the workspace"
         return rep
@@ -268,12 +365,15 @@ def parse_run(raw: RawRun, mode: str, backend: str) -> RunReport:
     if jm:
         try:
             rep.passed, rep.failed, rep.skipped, rep.failures = parse_junit(jm.group(1))
+            rep.passed_ids = junit_passed_ids(jm.group(1))
         except ET.ParseError:
             rep.failures.append(CaseResult("pytest::report", "error", "unreadable JUnit report", _trim(rep.tail, 800)))
     if rc == 5:
         rep.note = "pytest collected no tests"
     elif rc in (137, 9):
-        rep.failures.append(CaseResult("sandbox::killed", "killed", "process killed (out of memory?)", _trim(rep.tail, 800)))
+        rep.failures.append(CaseResult("sandbox::killed", "killed",
+                                       f"process killed (exit {rc}, out of memory? the sandbox limit is {settings.sandbox_memory})",
+                                       _trim(rep.tail, 800)))
     elif rc not in (0, 1, None) and not rep.failures:
         rep.failures.append(CaseResult("pytest::run", "error", f"pytest exited with {rc}", _trim(rep.tail, 800)))
     return rep
@@ -322,8 +422,26 @@ class DockerRunner:
         self._plock = threading.Lock()
         self._closing = False
 
+    def dockerfile(self, requirements: str) -> str:
+        """The image recipe. The build is the ONLY step with network: whatever the code downloads at import or test
+        time (tiktoken vocabularies, nltk data ...) has to be fetched here, the run itself has --network none."""
+        lines = [f"FROM {settings.sandbox_base_image}",
+                 "COPY sbx-entry /usr/local/bin/sbx-entry",
+                 "RUN chmod 0755 /usr/local/bin/sbx-entry",
+                 "COPY requirements.txt /tmp/requirements.txt",
+                 "RUN pip install --no-cache-dir pytest -r /tmp/requirements.txt"]
+        if _TIKTOKEN_REQ.search(requirements or ""):
+            lines += ["ENV TIKTOKEN_CACHE_DIR=/opt/tiktoken",
+                      "RUN mkdir -p /opt/tiktoken && python -c \"import tiktoken; "
+                      "[tiktoken.get_encoding(n) for n in ('cl100k_base', 'o200k_base')]\" && chmod -R a+rX /opt/tiktoken "
+                      "|| echo 'tiktoken vocabulary prefetch skipped (no network while building?)'"]
+        lines += [f"RUN {c}" for c in settings.sandbox_build_run]
+        lines.append('ENTRYPOINT ["/usr/local/bin/sbx-entry"]')
+        return "\n".join(lines) + "\n"
+
     def image_tag(self, requirements: str) -> str:
-        h = hashlib.sha256((settings.sandbox_base_image + "\n" + ENTRY_SH + "\n" + requirements).encode()).hexdigest()[:12]
+        h = hashlib.sha256("\n".join((_IMAGE_REV, settings.sandbox_base_image, ENTRY_SH, self.dockerfile(requirements),
+                                      requirements)).encode()).hexdigest()[:12]
         return f"{settings.sandbox_image_prefix}:{h}"
 
     def docker_args(self, tag: str, name: str, timeout: int, argv: List[str]) -> List[str]:
@@ -458,19 +576,15 @@ class DockerRunner:
             # write bytes: text mode would turn LF into CRLF on Windows and break the shebang
             (c / "sbx-entry").write_bytes(ENTRY_SH.encode("utf-8"))
             (c / "requirements.txt").write_bytes((requirements or "").encode("utf-8"))
-            (c / "Dockerfile").write_bytes((
-                f"FROM {settings.sandbox_base_image}\n"
-                "COPY sbx-entry /usr/local/bin/sbx-entry\n"
-                "RUN chmod 0755 /usr/local/bin/sbx-entry\n"
-                "COPY requirements.txt /tmp/requirements.txt\n"
-                "RUN pip install --no-cache-dir pytest -r /tmp/requirements.txt\n"
-                'ENTRYPOINT ["/usr/local/bin/sbx-entry"]\n').encode("utf-8"))
+            (c / "Dockerfile").write_bytes(self.dockerfile(requirements).encode("utf-8"))
             rc, out, timed = await asyncio.to_thread(
                 self._exec_tracked, ["docker", "build", "-t", tag, ctx], settings.sandbox_build_timeout_s)
+        text = out.decode(errors="replace")
+        log = write_log("_image_builds", tag.split(":")[-1] + ("-FAILED" if rc != 0 or timed else ""), text)
         if timed:
-            return f"image build exceeded {settings.sandbox_build_timeout_s}s"
+            return f"image build exceeded {settings.sandbox_build_timeout_s}s" + (f" (full build log: {log})" if log else "")
         if rc != 0:
-            return "image build failed: " + out.decode(errors="replace")[-600:].strip()
+            return "image build failed: " + text[-1500:].strip() + (f"\n(full build log: {log})" if log else "")
         return None
 
     async def run(self, requirements: str, tar: bytes, argv: List[str], timeout: int) -> RawRun:
@@ -677,8 +791,32 @@ class SandboxService:
         if stop:
             stop()
 
+    @staticmethod
+    def _hints(failures: List[CaseResult], tree: Dict[str, bytes]) -> List[str]:
+        tops = {p.split("/")[0].removesuffix(".py") for p in tree}
+        out: List[str] = []
+        for c in failures[:6]:
+            h = hint_for(f"{c.message}\n{c.detail}", tops)
+            if h and h not in out:
+                out.append(h)
+        return out[:3]
+
+    def _announce(self, rep: RunReport, what: str = "") -> None:
+        """What happened inside the container, in the notification stream: counts, the failing ids and WHY, the log file."""
+        if not rep.ran:
+            self._emit(f"{what}the sandbox could not run the tests: {rep.note}", "WARNING")
+            return
+        line = f"{what}{rep.passed} passed, {rep.failed} failed, {rep.skipped} skipped in {rep.duration:.1f}s"
+        if rep.failures:
+            shown = " | ".join(f"{c.id} [{c.kind}]: {_trim((c.message or '').splitlines()[0] if c.message else '', 160)}"
+                               for c in rep.failures[:3])
+            line += f" - {shown}" + (f" (+{len(rep.failures) - 3} more)" if len(rep.failures) > 3 else "")
+        if rep.log_path:
+            line += f" [log: {rep.log_path}]"
+        self._emit(line, "WARNING" if rep.failures else "INFO")
+
     async def _execute(self, tree: Dict[str, bytes], mode: str, selected: List[str],
-                       smoke: List[str], requirements: str) -> RunReport:
+                       smoke: List[str], requirements: str, repo_id: str = "", label: str = "") -> RunReport:
         extra: Dict[str, bytes] = {}
         if mode == "smoke":
             extra = {".sbx_smoke.py": _SMOKE_PY.encode(), ".sbx_smoke.json": json.dumps(smoke).encode()}
@@ -693,10 +831,46 @@ class SandboxService:
         rep = parse_run(raw, mode, self.runner.name)
         rep.duration = time.monotonic() - t0
         rep.selected = selected if mode == "pytest" else smoke
+        rep.log_path = write_log(repo_id or "_", label or mode, raw.stdout or raw.error)
         return rep
 
-    async def verify(self, repo_id: str, base_rev: int, working: Dict[str, bytes]) -> SandboxVerdict:
-        """Run the proposal. `working` = {path: new bytes} on top of the repo at `base_rev`."""
+    @staticmethod
+    def _case_file(case_id: str, paths: Sequence[str]) -> Optional[str]:
+        """Which of `paths` (test files) a JUnit case id belongs to: 'tests.test_x::test_y' or '::tests.test_x' (collection)."""
+        head = case_id.split("::")[0] or (case_id.split("::")[1] if "::" in case_id else "")
+        for p in paths:
+            mod = p[:-3].replace("/", ".")
+            if head == mod or head.startswith(mod + "."):
+                return p
+        return None
+
+    async def _prove(self, repo_id: str, base_tree: Dict[str, bytes], tree: Dict[str, bytes],
+                     new_tests: Sequence[str], requirements: str, after: RunReport) -> dict:
+        """fail->pass proof: the GENERATED tests against the OLD code. A test that fails there and passes on the new code
+        demonstrates the change; one that passes on both is only a regression test and says nothing about it.
+        Called only when everything passed on the new code (otherwise the fix loop is busy anyway)."""
+        old = {**base_tree, **{p: tree[p] for p in new_tests}}
+        rep = await self._execute(old, "pytest", list(new_tests), [], requirements, repo_id=repo_id, label="fail-to-pass-on-old-code")
+        mods = {p: p[:-3].replace("/", ".") for p in new_tests}
+        n_after = sum(1 for cid in after.passed_ids if self._case_file(cid, new_tests))
+        out = {"checked": rep.ran, "files": list(new_tests), "tests": n_after}
+        if not rep.ran:
+            out["note"] = rep.note or "the old-code run did not execute"
+            return out
+        failing = {self._case_file(c.id, new_tests) for c in rep.failures} - {None}
+        out["fail_on_old"] = sorted(failing)
+        out["pass_on_old"] = [p for p in new_tests if p not in failing]
+        out["proves"] = len(failing)
+        self._emit(f"fail->pass on the old code: {len(failing)} of {len(new_tests)} generated test file(s) fail without the change "
+                   f"(they demonstrate it)" + (f"; pass on old code too: {', '.join(out['pass_on_old'])}" if out["pass_on_old"] else ""),
+                   "SUCCESS" if failing else "WARNING")
+        return out
+
+    async def verify(self, repo_id: str, base_rev: int, working: Dict[str, bytes],
+                     new_tests: Sequence[str] = ()) -> SandboxVerdict:
+        """Run the proposal. `working` = {path: new bytes} on top of the repo at `base_rev`.
+        `new_tests` = generated test files inside `working`: they always run, and (when everything passes) are re-run
+        against the OLD code to prove they fail without the change."""
         none = lambda note: SandboxVerdict(RunReport(mode="none", ran=False, note=note, backend=self.runner.name))
         if not self.enabled:
             return none("sandbox disabled")
@@ -707,7 +881,11 @@ class SandboxService:
         base_tree = await self.store.snapshot_bytes(repo_id, base_rev)
         tree = {**base_tree, **working}
         changed = sorted(working)
-        selected, strategy = select_tests(tree, changed)
+        gen = sorted(p for p in new_tests if p in working)
+        src_changed = [c for c in changed if c not in gen] or changed
+        selected, strategy = select_tests(tree, src_changed)       # existing tests chosen by what the SOURCE change touches
+        if gen:
+            selected = sorted(set(selected) | set(gen))
         smoke: List[str] = []
         mode = "pytest"
         if not selected:
@@ -729,12 +907,18 @@ class SandboxService:
 
         self._emit(f"Running {len(selected) if mode == 'pytest' else len(smoke)} "
                    f"{'test file(s)' if mode == 'pytest' else 'module import(s)'} [{strategy}] in {self.runner.name}")
-        report = await self._execute(tree, mode, selected, smoke, requirements)
+        report = await self._execute(tree, mode, selected, smoke, requirements, repo_id=repo_id, label="change")
         report.strategy = strategy
+        self._announce(report)
         if not report.ran:
             return SandboxVerdict(report)
         if not report.failures:
-            return _unverified(report) if report.passed + report.failed == 0 else SandboxVerdict(report)
+            if report.passed + report.failed == 0:
+                return _unverified(report)
+            verdict = SandboxVerdict(report)
+            if gen and mode == "pytest":
+                verdict.proof = await self._prove(repo_id, base_tree, tree, gen, requirements, report)
+            return verdict
 
         # failures: subtract what was already broken before the change
         key = (repo_id, base_rev, mode, tuple(selected), tuple(smoke), hashlib.sha256(requirements.encode()).hexdigest())
@@ -746,13 +930,31 @@ class SandboxService:
                 self._baseline[key] = (set(), False)
             else:
                 self._emit("Failures found, checking whether they already existed before the change", "WARNING")
-                base_report = await self._execute(base_tree, mode, b_selected, b_smoke, requirements)
+                base_report = await self._execute(base_tree, mode, b_selected, b_smoke, requirements,
+                                                  repo_id=repo_id, label="base")
+                self._announce(base_report, "untouched base: ")
                 self._baseline[key] = ({c.id for c in base_report.failures}, base_report.timed_out)
             if len(self._baseline) > 64:
                 self._baseline.pop(next(iter(self._baseline)))
         base_ids, base_timed_out = self._baseline[key]
         fresh = [c for c in report.failures
                  if c.id not in base_ids and not (c.kind == "timeout" and base_timed_out)]
-        if not fresh and report.passed + report.failed == 0:
-            return _unverified(report, preexisting=len(report.failures))   # same crash/timeout on the base: not a pass
-        return SandboxVerdict(report, new_failures=fresh, preexisting=len(report.failures) - len(fresh))
+        old_cases = [c for c in report.failures if c not in fresh]
+        hints = self._hints(report.failures, tree)
+        if old_cases:
+            self._emit(f"{len(old_cases)} of {len(report.failures)} failure(s) also occur on the untouched base, so they are not "
+                       f"caused by this change: {', '.join(c.id for c in old_cases[:4])}", "WARNING")
+        for h in hints:
+            self._emit(f"Likely cause: {h}", "WARNING")
+        if not fresh and report.passed == 0:
+            # Nothing passed and nothing new failed: the same breakage exists without the change, so not one test says anything
+            # about it. That is 'not run', never a pass (this is the all-tests-fail-offline case).
+            v = _unverified(report, preexisting=len(report.failures))
+            v.preexisting_cases, v.hints = old_cases, hints
+            if hints:
+                v.report.note += f" Likely cause: {hints[0]}"
+            return v
+        v = SandboxVerdict(report, new_failures=fresh, preexisting=len(old_cases), preexisting_cases=old_cases, hints=hints)
+        if v.ok and gen and mode == "pytest":
+            v.proof = await self._prove(repo_id, base_tree, tree, gen, requirements, report)
+        return v

@@ -2,11 +2,16 @@
 
 Fixed sub-graph with bounded retries (not supervisor-driven):
 
-    locate -> patch -> apply_check -> sandbox -> persist -> END
-                ^           |            |
-                +---retry---+------------+   (max settings.change_max_attempts, or no progress: stop)
+    locate -> plan -> patch -> apply_check -> author_tests -> sandbox -> persist -> END
+                        ^           |                           |
+                        +---retry---+---------------------------+   (max settings.change_max_attempts, or no progress: stop)
 
-Verification levels: L0 static checks, L1 import smoke, L2 repo tests (sandbox).
+author_tests: a model writes pytest tests for the changed source (settings.change_author_tests). The sandbox runs them
+with the repo's own tests and, when all is green, re-runs them against the OLD code: a generated test must fail there
+and pass on the new code (fail->pass), otherwise it proves nothing about the change.
+
+Verification levels: L0 static checks, L1 import smoke, L2 repo tests (sandbox), L3 generated tests that fail on the
+old code and pass on the new one.
 Failures are triaged: a decision model (tev1) separates "code is wrong" from "test is
 outdated"; rules decide "sandbox environment problem". Pre-existing failures never block.
 Nothing is written to the repo on disk by this module; the result is a revision in RepoStore.
@@ -61,6 +66,21 @@ class ChangeResult:
     verification: str = "L0-static"
     plan: str = ""
 
+    def _sandbox_block(self) -> str:
+        """What the container reported, beyond counts: failing ids with the reason, base-vs-change, likely cause, log file."""
+        t = self.tests or {}
+        rows = []
+        for c in t.get("new_failure_details", [])[:5]:
+            rows.append(f"- NEW `{c['id']}` [{c['kind']}]: {c['message']}")
+        for c in t.get("preexisting_details", [])[:5]:
+            rows.append(f"- also fails on the untouched base, so not caused by the change: `{c['id']}` [{c['kind']}]: {c['message']}")
+        for g in t.get("generated_dropped", [])[:4]:
+            rows.append(f"- generated test left out, still failing on the new code: `{g['id']}`: {g['message']}")
+        rows += [f"- likely cause: {h}" for h in t.get("hints", [])[:3]]
+        if t.get("log") and (rows or not t.get("ok")):
+            rows.append(f"- full container output: `{t['log']}`")
+        return ("**Sandbox details:**\n" + "\n".join(rows)) if rows else ""
+
     def _tests_line(self) -> str:
         t = self.tests or {}
         if t.get("inconclusive"):
@@ -74,6 +94,19 @@ class ChangeResult:
                     f" ({t['selected']} test file(s), {t['strategy']}).")
         if t.get("preexisting"):
             line += f" {t['preexisting']} failure(s) already existed before the change and were ignored."
+        pr = t.get("proof") or {}
+        if pr.get("files"):
+            if not pr.get("checked"):
+                line += f" Generated tests included ({', '.join(pr['files'])}); the old-code run did not execute: {pr.get('note', '')}."
+            elif pr.get("proves"):
+                line += (f" Generated {pr.get('tests', 0)} test(s) in {', '.join(pr['files'])}: {pr['proves']} of {len(pr['files'])} "
+                         f"file(s) fail on the OLD code and pass on the new (fail->pass).")
+            else:
+                line += (f" Generated {pr.get('tests', 0)} test(s) in {', '.join(pr['files'])}: they also pass on the OLD code, "
+                         f"so they guard against regressions but do not prove the change.")
+        if t.get("generated_dropped"):
+            line += (f" **{len(t['generated_dropped'])} generated test(s) kept failing and were left out: the new behaviour is NOT "
+                     f"covered by a passing test, review it by hand.**")
         if t.get("note"):
             line += f" {t['note']}"
         return line + f" [{t.get('backend')}, {t.get('duration')}s]"
@@ -95,6 +128,8 @@ class ChangeResult:
                         f"Nothing was saved and nothing was written to your repo.\n")
 
         parts = [head.rstrip()]
+        if self._sandbox_block():
+            parts.append(self._sandbox_block())
         if self.plan:
             parts.append("**Plan:**\n" + self.plan)
         if self.files:
@@ -140,6 +175,9 @@ class ChangeState(TypedDict, total=False):
     skipped: int
     revision: Optional[int]
     plan: str
+    gen_tests: List[str]              # generated test files inside `working`
+    author_feedback: str              # why the generated tests must be rewritten (they passed on the old code too)
+    author_tries: int
     trace: Annotated[List[str], operator.add]
 
 
@@ -200,6 +238,39 @@ ALL FILES:
 """
 
 
+_TEST_PROMPT = """You write pytest tests for a code change that was JUST made. Never change source files.
+
+REQUEST THAT WAS IMPLEMENTED:
+{request}
+
+DIFF OF THE CHANGE (old -> new):
+{diff}
+
+CURRENT SOURCE OF THE CHANGED FILES:
+{sources}
+
+HOW THIS REPO'S TESTS LOOK (copy its import style and helpers):
+{style}
+{feedback}
+OUTPUT FORMAT (nothing else: no explanations, no code fences):
+FILE: {path}
+<<<<<<< SEARCH
+=======
+<the entire test file>
+>>>>>>> REPLACE
+
+RULES:
+- Write 2 to 6 small deterministic tests. They must FAIL on the old code and PASS on the new code: call the new or changed
+  function and assert the new result. Add one edge case the change could break.
+- The tests run offline in a container that has only the repo's requirements and plain pytest: no network, no Docker, no
+  Ollama or other model, no sleeping, no pytest-asyncio (run a coroutine with asyncio.run(...)), write only under tmp_path.
+- Import the code like the existing tests do (the repo root is on PYTHONPATH). Replace every external service with a fake
+  (unittest.mock or monkeypatch).
+- Assert on behaviour through public functions, not on private details or log text.
+- If the change cannot be tested without a network, a browser or a GPU, output one line: NO_TESTS: <reason>
+"""
+
+
 class RepoChangeService:
     def __init__(self, db: "DatabaseManager", vector_service: "VectorStoreService", store: RepoStore,
                  llm_text: LLMText = ask_text, llm_json: LLMJson = ask_json, emit=None,
@@ -234,7 +305,7 @@ class RepoChangeService:
                              "errors": [], "notes": [], "check_lines": [], "trace": []}
         try:
             out = await self.graph.ainvoke(
-                init, config={"recursion_limit": 12 + 3 * settings.change_max_attempts})
+                init, config={"recursion_limit": 16 + 5 * settings.change_max_attempts})
         except Exception as e:  # noqa: BLE001 — surface, never crash the chat
             res.errors.append(f"change pipeline error: {type(e).__name__}: {e}")
             return res
@@ -664,7 +735,9 @@ class RepoChangeService:
     def _verification(t: dict) -> str:
         if t.get("ran") and t.get("ok"):
             if t.get("mode") == "pytest":
-                return "L2-tests" if t.get("passed", 0) > 0 else "L0-static"      # 0 passed verifies nothing
+                if t.get("passed", 0) <= 0:
+                    return "L0-static"                                            # 0 passed verifies nothing
+                return "L3-fail-to-pass" if (t.get("proof") or {}).get("proves", 0) > 0 else "L2-tests"
             return "L1-import-smoke"
         return "L0-static"
 
@@ -717,40 +790,183 @@ class RepoChangeService:
             parts.pop()
         return None
 
+    # ------------------------------------------------------------------ generated tests
+    @staticmethod
+    def _gen_test_path(state: ChangeState) -> str:
+        src = sorted(p for p in state["working"] if p.endswith(".py") and not RepoChangeService._is_test_path(p))
+        stem = re.sub(r"\W+", "_", src[0].rsplit("/", 1)[-1][:-3]).strip("_") if src else ""
+        path = f"tests/test_change_r{state['base_rev'] + 1}_{stem or 'change'}.py"
+        return path[:-3] + "_b.py" if path in state.get("known", []) else path
+
+    async def _test_style(self, state: ChangeState) -> str:
+        tests = [p for p in state.get("known", []) if p.endswith(".py") and self._is_test_path(p)]
+        if not tests:
+            return "(the repo has no tests yet: plain pytest functions, absolute imports from the repo root)"
+        stems = {p.rsplit("/", 1)[-1][:-3] for p in state["working"] if p.endswith(".py")}
+        pick, head = None, ""
+        for p in tests[:15]:
+            data = await self._current(state, p)
+            text = data.decode("utf-8", errors="replace") if data else ""
+            if pick is None:
+                pick, head = p, text                         # fallback: the first test file
+            if any(st in text for st in stems):
+                pick, head = p, text
+                break
+        return f"=== {pick} (first lines) ===\n" + "\n".join(head.splitlines()[:70])
+
+    @staticmethod
+    def _strip_fences(body: str) -> str:
+        body = re.sub(r"^\s*```[\w-]*\s*\n", "", body)
+        return re.sub(r"\n\s*```\s*$", "\n", body)
+
+    async def _author_tests(self, state: ChangeState) -> dict:
+        """Write pytest tests for the changed source so the sandbox checks the NEW behaviour, not only the old tests.
+        Never blocks a change: every failure here only means 'no generated tests'."""
+        if state.get("status") == "failed" or not settings.change_author_tests or not self.sandbox.enabled:
+            return {}
+        fb, tries = state.get("author_feedback", ""), state.get("author_tries", 0)
+        have = [p for p in state.get("gen_tests", []) if p in state["working"]]
+        if have and not fb:
+            return {}                                        # written already: the fix loop edits it like any other file
+        if tries >= 2:
+            return {"status": "ok", "author_feedback": ""}
+        src = [p for p in state["working"] if p.endswith(".py") and not self._is_test_path(p)]
+        if not src:
+            return {"status": "ok", "author_feedback": ""} if fb else {}
+        ok, why = await self.sandbox.runner.available()
+        notes = list(state["notes"])
+
+        def skip(msg: str) -> dict:
+            if msg not in notes:
+                notes.append(msg)
+            return {"status": "ok", "author_feedback": "", "author_tries": tries + 1, "notes": notes}
+
+        if not ok:
+            return skip(f"no tests were written for the change: {why}")
+
+        path = have[0] if have else self._gen_test_path(state)
+        diffs, sources, used = [], [], 0
+        for p in src[: settings.change_author_max_files]:
+            f = await self.store.get_file(state["repo_id"], p, state["base_rev"])
+            new = state["working"][p]
+            diffs.append(make_diff(p, f.data if f else None, new))
+            text = new.decode("utf-8", errors="replace")
+            if used + len(text) <= 24000:
+                used += len(text)
+                sources.append(f"=== {p} ===\n{text}")
+        style = await self._test_style(state)
+        previous = state["working"].get(path, b"").decode("utf-8", errors="replace") if have else ""
+        feedback = ""
+        if fb:
+            feedback = f"\nTHE TEST FILE YOU WROTE BEFORE:\n{previous}\n\nPROBLEM WITH IT:\n{fb}\n"
+        model = settings.patcher_model or settings.llm_model
+        problems: List[str] = []
+        for round_ in range(2):                              # one repair round for an unusable reply
+            extra = feedback + (("\nYOUR PREVIOUS REPLY WAS UNUSABLE:\n- " + "\n- ".join(problems) + "\n") if problems else "")
+            prompt = _TEST_PROMPT.format(request=state["request"], diff="\n".join(diffs)[:9000],
+                                         sources="\n\n".join(sources), style=style, feedback=extra, path=path)
+            self._emit(f"Writing tests for the change with {model}" + (" (rewrite)" if fb else ""))
+            try:
+                raw = (await self.llm_text(model, prompt, phase="TESTS", repo_id=state["repo_id"],
+                                           num_predict=settings.change_max_output_tokens)).strip()
+            except Exception as e:  # noqa: BLE001
+                return skip(f"no tests were written: model call failed ({type(e).__name__})")
+            if raw.startswith("NO_TESTS"):
+                return skip("no tests were written: " + raw[:200])
+            edits, perrs = parse_edits(raw)
+            body = next((e.replace for e in edits if not e.search.strip() and self._is_test_path(e.path)), None)
+            if body is None and not edits and "def test_" in raw:
+                body = raw                                   # tolerate a bare python reply
+            problems = list(perrs)
+            if body is None:
+                problems.append("no complete test file found: output one FILE/SEARCH/REPLACE block with an empty SEARCH")
+                continue
+            text = self._strip_fences(body).rstrip("\n") + "\n"
+            if "def test_" not in text:
+                problems.append("the file contains no test function (def test_...)")
+                continue
+            bad = [r for r in static_check.check_files({path: text.encode("utf-8")}) if not r.ok]
+            if bad:
+                problems += [r.label() for r in bad]
+                continue
+            working = dict(state["working"])
+            working[path] = text.encode("utf-8")
+            self._emit(f"Test file ready: {path} ({text.count('def test_')} test(s))")
+            return {"working": working, "gen_tests": [path], "author_feedback": "", "author_tries": tries + 1,
+                    "status": "ok", "trace": [f"generated tests: {path}"]}
+        return skip("no usable tests were written: " + "; ".join(problems)[:300])
+
+    # ------------------------------------------------------------------ sandbox + triage (continued)
     async def _sandbox(self, state: ChangeState) -> dict:
         if state.get("status") == "failed":
             return {}
-        verdict: SandboxVerdict = await self.sandbox.verify(state["repo_id"], state["base_rev"], state["working"])
-        if not verdict.ok:
-            # Use the notifier here to alert the system/user about the specific failure
-            await self.notifier.notify(
-                level="ERROR", 
-                message=f"Sandbox failure: {verdict.report.note}"
-            )
-        
+        gen = [p for p in state.get("gen_tests", []) if p in state["working"]]
+
+        def drop() -> dict:
+            """Generated tests that never ran (or never became trustworthy) must not ride along in the saved revision."""
+            if not gen:
+                return {}
+            return {"working": {p: d for p, d in state["working"].items() if p not in gen}, "gen_tests": []}
+
+        kw = {"new_tests": gen} if gen else {}
+        verdict: SandboxVerdict = await self.sandbox.verify(state["repo_id"], state["base_rev"], state["working"], **kw)
         tests = verdict.to_dict()
         notes = list(state["notes"])
         if not verdict.ran:
+            self._emit(f"Tests not run: {verdict.report.note}", "WARNING")
             notes.append(f"tests not run: {verdict.report.note}")
-            return {"status": "ok", "tests": tests, "notes": notes}
+            if gen:
+                notes.append("generated tests were not kept: the sandbox could not run them")
+            return {"status": "ok", "tests": tests, "notes": notes, **drop()}
         if verdict.ok:
+            pr = verdict.proof or {}
+            if gen and pr.get("checked") and not pr.get("proves"):
+                if settings.change_require_fail_to_pass and state.get("author_tries", 0) < 2:
+                    fbk = ("These tests also PASS on the old code, so they do not test the change. Rewrite them so that at "
+                           "least one fails without the change: call the new or changed function and assert the new result.")
+                    self._emit("Generated tests also pass on the old code: asking for a rewrite", "WARNING")
+                    return {"status": "retry_tests", "tests": tests, "author_feedback": fbk,
+                            "trace": ["generated tests did not fail on the old code, rewrite requested"]}
+                notes.append("generated tests also pass on the old code: regression guards only, they do not prove the change")
+                return {"status": "ok", "tests": tests, "notes": notes}
             return {"status": "ok", "tests": tests}
 
-        kinds = await self._triage(state, verdict.new_failures)
+        tops = {p.split("/")[0].removesuffix(".py") for p in state["known"] + list(state["working"])}
+        is_gen = lambda c: bool(gen) and self._test_path(c.id, set(gen)) is not None
+        kinds = await self._triage(state, [c for c in verdict.new_failures if not is_gen(c)])
+        for c in verdict.new_failures:
+            if is_gen(c):
+                kinds[c.id] = "environment" if self._is_environment(c, tops) else "generated_test"
         real = [c for c in verdict.new_failures if kinds.get(c.id) != "environment"]
         if not real:
             tests.update(ok=False, inconclusive=True,
                          note="The failures come from the sandbox environment (missing package or network), not from the change.")
             notes.append("tests inconclusive: " + verdict.new_failures[0].message)
-            return {"status": "ok", "tests": tests, "notes": notes}
+            if gen:
+                notes.append("generated tests were not kept: they could not run in the sandbox")
+            return {"status": "ok", "tests": tests, "notes": notes, **drop()}
 
         sig = hashlib.sha256("|".join(sorted(f"{c.id}:{c.message[:80]}" for c in real)).encode()).hexdigest()[:12]
         lines = []
         for c in real[:3]:
-            hint = " (the test expects OLD behaviour: update the test as well)" if kinds.get(c.id) == "test_outdated" else ""
+            hint = ""
+            if kinds.get(c.id) == "test_outdated":
+                hint = " (the test expects OLD behaviour: update the test as well)"
+            elif kinds.get(c.id) == "generated_test":
+                hint = (" (GENERATED for this change: decide from the request whether the CODE or the TEST is wrong, "
+                        "and fix that one)")
             lines.append(f"test {c.id} fails{hint}: {c.message}\n" + "\n".join("    " + l for l in c.detail.splitlines()[-14:]))
         problems = [f"{len(real)} test(s) newly failing after the change:"] + lines
-        if state["attempt"] >= settings.change_max_attempts or sig == state.get("last_sig"):
+        out_of_tries = state["attempt"] >= settings.change_max_attempts or sig == state.get("last_sig")
+        if out_of_tries and gen and all(is_gen(c) for c in real):
+            # The change passes every existing test; only tests written for it keep failing (the code or the test is wrong, the
+            # loop could not tell which). Save the change WITHOUT them and say so loudly, instead of throwing the work away.
+            tests.update(ok=True, failed=max(0, tests["failed"] - len(real)), new_failures=[],
+                         generated_dropped=[{"id": c.id, "message": c.message[:200]} for c in real[:4]],
+                         note="")
+            notes.append("generated tests kept failing and were left out: " + ", ".join(c.id for c in real[:3]))
+            return {"status": "ok", "tests": tests, "notes": notes, **drop()}
+        if out_of_tries:
             why = ("no progress: the same tests still fail after the last fix"
                    if sig == state.get("last_sig") else "tests still failing after the maximum number of attempts")
             return {"status": "failed", "tests": tests, "last_sig": sig, "errors": [why] + problems}
@@ -774,6 +990,7 @@ class RepoChangeService:
         g.add_node("plan", self._plan)
         g.add_node("patch", self._patch)
         g.add_node("apply_check", self._apply_check)
+        g.add_node("author_tests", self._author_tests)
         g.add_node("sandbox", self._sandbox)
         g.add_node("persist", self._persist)
         g.add_edge(START, "locate")
@@ -783,11 +1000,12 @@ class RepoChangeService:
         g.add_edge("patch", "apply_check")
         g.add_conditional_edges(
             "apply_check",
-            lambda s: {"ok": "sandbox", "retry": "patch"}.get(s.get("status"), END),
-            {"sandbox": "sandbox", "patch": "patch", END: END})
+            lambda s: {"ok": "author_tests", "retry": "patch"}.get(s.get("status"), END),
+            {"author_tests": "author_tests", "patch": "patch", END: END})
+        g.add_edge("author_tests", "sandbox")
         g.add_conditional_edges(
             "sandbox",
-            lambda s: {"ok": "persist", "retry": "patch"}.get(s.get("status"), END),
-            {"persist": "persist", "patch": "patch", END: END})
+            lambda s: {"ok": "persist", "retry": "patch", "retry_tests": "author_tests"}.get(s.get("status"), END),
+            {"persist": "persist", "patch": "patch", "author_tests": "author_tests", END: END})
         g.add_edge("persist", END)
         return g.compile()

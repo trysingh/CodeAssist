@@ -181,6 +181,11 @@ class EngineController:
             else:
                 notifier.notify("Repo Up-to-Date", f"No offline changes detected for '{repo.title}'.", level="INFO", repo_id=repo.repo_id)
 
+            # Non-chunked files (requirements.txt, *.txt ...) are skipped by the scan above, so edits made
+            # while the app was off never reached the raw store the sandbox reads. Sync them too.
+            raw = await self.snapshot_raw_files(repo.repo_id, root_path)
+            if raw["updated"]:
+                request_prewarm(repo.repo_id)   # dependencies may have changed -> rebuild the sandbox image
             watcher_manager.start_watching(repo.repo_id, str(root_path))
 
     async def snapshot_raw_files(self, repo_id: str, root_path: Path) -> dict:

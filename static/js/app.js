@@ -311,7 +311,14 @@ function setupNotificationStream() {
         try {
             const data = typeof event.data === 'string' ? JSON.parse(event.data) : event.data;
             const level = String(data.level || 'info').toLowerCase();
-            showToast(data.title, prettyMessage(data), level);
+            // showToast(data.title, prettyMessage(data), level);
+            const st = S.liveStatus && $(S.liveStatus);
+            if (st) {                                  // request in flight: show its latest step in the loader
+                const msg = `${data.title} — ${prettyMessage(data)}`;
+                st.textContent = msg.length > 160 ? msg.slice(0, 157) + '…' : msg;
+                st.title = msg;                        // hover for the full text
+            }
+            if (!(st && level === 'info')) showToast(data.title, prettyMessage(data), level);   // info is already in the loader
             const consoleDiv = $('telemetry-console');
             consoleDiv.querySelector(':scope > .text-slate-500')?.remove();          // placeholder line
             consoleDiv.prepend(telemetryLine(data));
@@ -483,7 +490,7 @@ function quickChat(repoId) {
 function renderThreads(threads) {
     const list = $('thread-list');
     list.innerHTML = threads.length ? threads.map(t =>
-        `<div id="thread_btn_${esc(t.thread_id)}" data-thread="${esc(t.thread_id)}" data-title="${esc(t.title)}" role="button" tabindex="0" class="thread-item px-2.5 py-2 rounded-lg cursor-pointer hover:bg-slate-800 text-xs text-slate-300 flex items-center gap-2 transition-colors">
+        `<div id="thread_btn_${esc(t.thread_id)}" data-thread="${esc(t.thread_id)}" data-title="${esc(t.title)}" title="${esc(t.title)}"  role="button" tabindex="0" class="thread-item px-2.5 py-2 rounded-lg cursor-pointer hover:bg-slate-800 text-xs text-slate-300 flex items-center gap-2 transition-colors">
             <i data-lucide="message-square" class="w-3.5 h-3.5 text-blue-400 shrink-0"></i><span class="truncate">${esc(t.title)}</span><button type="button" data-del="${esc(t.thread_id)}" title="Delete chat" aria-label="Delete chat" class="ml-auto p-1 shrink-0 text-slate-500 hover:text-red-400"><i data-lucide="trash-2" class="w-3.5 h-3.5"></i></button></div>`).join('')
         : '<div class="text-xs text-slate-500 text-center py-6">Select a repository to see its threads</div>';
     icons();
@@ -738,9 +745,12 @@ async function sendChatMessage(e) {
     S.sending = true; updateComposer();
 
     const id = 'loader_' + Date.now();
+    // col.insertAdjacentHTML('beforeend', `<div id="${id}" class="flex gap-3"><div class="w-7 h-7 rounded-lg bg-blue-600/15 border border-blue-500/25 flex items-center justify-center text-blue-400 shrink-0"><i data-lucide="bot" class="w-4 h-4"></i></div>
+    //     <div class="flex items-center gap-2.5 text-sm text-slate-400 pt-0.5"><span class="think flex gap-1"><span></span><span></span><span></span></span>${files.length ? 'Reading attachments' : (S.repoId === GENERAL ? 'Thinking' : 'Retrieving relevant chunks')}${S.web !== 'off' ? ' · may search the web' : ''} <span id="${id}_t" class="font-mono text-xs text-slate-600">0s</span></div></div>`);
     col.insertAdjacentHTML('beforeend', `<div id="${id}" class="flex gap-3"><div class="w-7 h-7 rounded-lg bg-blue-600/15 border border-blue-500/25 flex items-center justify-center text-blue-400 shrink-0"><i data-lucide="bot" class="w-4 h-4"></i></div>
-        <div class="flex items-center gap-2.5 text-sm text-slate-400 pt-0.5"><span class="think flex gap-1"><span></span><span></span><span></span></span>${files.length ? 'Reading attachments' : (S.repoId === GENERAL ? 'Thinking' : 'Retrieving relevant chunks')}${S.web !== 'off' ? ' · may search the web' : ''} <span id="${id}_t" class="font-mono text-xs text-slate-600">0s</span></div></div>`);
+        <div class="flex items-center gap-2.5 text-sm text-slate-400 pt-0.5"><span class="think flex gap-1"><span></span><span></span><span></span></span><span id="${id}_s" class="min-w-0 break-words">${files.length ? 'Reading attachments' : (S.repoId === GENERAL ? 'Thinking' : 'Retrieving relevant chunks')}${S.web !== 'off' ? ' · may search the web' : ''}</span> <span id="${id}_t" class="font-mono text-xs text-slate-600 shrink-0">0s</span></div></div>`);
     icons(); scrollDown(true);
+    S.liveStatus = id + '_s';
     const t0 = performance.now();
     const tick = setInterval(() => { const el = $(id + '_t'); if (el) el.textContent = Math.floor((performance.now() - t0) / 1000) + 's'; }, 1000);
 
@@ -771,7 +781,7 @@ async function sendChatMessage(e) {
         S.files = files; renderAttachStrip(); // ...and the attachments
         showToast("Message failed", err.message, "error");
     } finally {
-        clearInterval(tick);
+        clearInterval(tick); S.liveStatus = null;
         S.sending = false; updateComposer(); input.focus();
     }
 }

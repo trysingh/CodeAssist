@@ -71,6 +71,10 @@ class EngineSettings(BaseSettings):
     change_max_output_tokens: int = Field(default=8192)
     change_plan_first: bool = Field(default=True)      # /change writes a short plan first (one extra model call); /plan always works
     change_call_check: bool = Field(default=True)      # fail a patch that calls methods no repo class defines
+    change_author_tests: bool = Field(default=True)    # after the edits pass the static checks, a model writes pytest tests for the changed code;
+                                                       # they run in the sandbox and must fail on the old code and pass on the new (one extra model call)
+    change_author_max_files: int = Field(default=3)    # changed source files shown to the test author
+    change_require_fail_to_pass: bool = Field(default=True)  # a generated test that also passes on the OLD code gets one rewrite request
 
     # Sandbox (Phase 2): isolated test runs for proposed changes
     sandbox_enabled: bool = Field(default=True)
@@ -90,7 +94,10 @@ class EngineSettings(BaseSettings):
     sandbox_prewarm_max_repos: int = Field(default=5)    # at startup warm this many repos, most recently chatted-with first
     sandbox_prune_images: bool = Field(default=False)    # after the startup warm-up remove coderag-sbx images no repo needs
     sandbox_available_ttl_s: int = Field(default=60)     # cache the "is Docker up" check (a "down" answer for at most 10 s); 0 = off
-    sandbox_build_retry_s: int = Field(default=600)  
+    sandbox_build_retry_s: int = Field(default=600)
+    sandbox_logs_keep: int = Field(default=20)            # raw console logs of sandbox runs kept per repo under <storage_dir>/sandbox_logs
+    sandbox_build_run: List[str] = Field(default=[])      # extra `RUN <cmd>` lines in the image build (the only step with network),
+                                                          # e.g. ["python -m nltk.downloader punkt"]; tiktoken's vocabulary is fetched automatically
 
     # Notifiations Configuration
     notify_at_os_level: bool = Field(default=False)
