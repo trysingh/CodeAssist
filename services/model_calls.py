@@ -11,12 +11,44 @@ import re
 from typing import Awaitable, Callable, Optional
 
 from config.settings import settings
+from contextlib import contextmanager
+from contextvars import ContextVar
 
 # (model, prompt, *, phase, repo_id, num_predict) -> text
 LLMText = Callable[..., Awaitable[str]]
 # (model, prompt, *, phase, repo_id) -> parsed dict or None
 LLMJson = Callable[..., Awaitable[Optional[dict]]]
 
+
+_model_override: ContextVar[str] = ContextVar("model_override", default="")
+
+@contextmanager
+def model_scope(model: str):
+    """User's reasoning-model pick for this request. Empty/invalid = keep the current (default)."""
+    model = (model or "").strip()
+    if not re.fullmatch(r"[\w.:/\-]{1,100}", model):
+        yield
+        return
+    token = _model_override.set(model)
+    try:
+        yield
+    finally:
+        _model_override.reset(token)
+
+def reasoning_model(default: str = "") -> str:
+    return _model_override.get() or default or settings.llm_model
+
+async def list_chat_models() -> list:
+    """Models on the Ollama endpoint (embedding models hidden). Never raises."""
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=3.0) as c:
+            r = await c.get(chat_base_url() + "/api/tags")
+            r.raise_for_status()
+            names = [m.get("name") or m.get("model") for m in r.json().get("models", [])]
+    except Exception:  # noqa: BLE001
+        names = []
+    return sorted({n for n in names if n and "embed" not in n.lower()})
 
 def _callbacks(model: str, repo_id: str, phase: str) -> list:
     try:
@@ -84,7 +116,7 @@ def parse_json_loose(raw: str) -> Optional[dict]:
 async def ask_json(model: str, prompt: str, *, phase: str = "DECIDE", repo_id: str = "") -> Optional[dict]:
     """Chat-model call that must answer in JSON. Any failure returns None so callers fall back."""
     try:
-        llm = _build(model, json_mode=True, num_predict=512, num_ctx=8192,
+        llm = _build(model, json_mode=True, num_predict=2048, num_ctx=16384,
                      repo_id=repo_id, phase=phase)
         resp = await llm.ainvoke(prompt)
         return parse_json_loose(resp.content if isinstance(resp.content, str) else str(resp.content))

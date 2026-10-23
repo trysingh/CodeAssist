@@ -11,6 +11,7 @@ from controllers.engine_controller import EngineController
 from models.schemas import ChatRequest
 from config.settings import settings
 from services.notifier import notifier
+from services.model_calls import list_chat_models 
 
 app = FastAPI(title="CodeRAG Pluggable Chunking & Multi-Thread RAG API")
 controller = EngineController()
@@ -25,6 +26,7 @@ class CreateThreadRequest(BaseModel):
 class ChangeRequest(BaseModel):
     request: str
     base_rev: int | None = None
+    model: str = ""
 
 @app.on_event("startup")
 async def startup_event():
@@ -45,6 +47,13 @@ async def shutdown_event():
 async def serve_dashboard(request: Request):
     """Serves the responsive dark-themed CodeRAG web dashboard."""
     return templates.TemplateResponse(request, "index.html")
+
+@app.get("/api/v1/models")
+async def list_models():
+    names = await list_chat_models()
+    if settings.llm_model not in names:
+        names.insert(0, settings.llm_model)
+    return {"default": settings.llm_model, "models": names}
 
 @app.get("/static/{file_type}/{file_name}")
 async def serve_static(file_type: str, file_name: str):
@@ -95,7 +104,7 @@ async def chat_endpoint(req: ChatRequest):
         await controller.db.save_chat_message(req.thread_id, "user", req.query)
         
         # Run RAG workflow
-        response = await controller.chat_with_repo(req.repo_id, req.thread_id, req.query, web=req.web)
+        response = await controller.chat_with_repo(req.repo_id, req.thread_id, req.query, web=req.web, model=req.model)
         
         # Save assistant response
         await controller.db.save_chat_message(req.thread_id, "assistant", response)
@@ -109,6 +118,7 @@ async def chat_with_attachments(
     thread_id: str = Form(...),
     query: str = Form(""),
     web: str = Form("auto"),
+    model: str = Form(""),
     files: List[UploadFile] = File(...),
 ):
     """Chat turn with pasted/uploaded attachments (image, pdf, docx, text). Extracted text is saved on the thread."""
@@ -136,7 +146,7 @@ async def chat_with_attachments(
     saved = await controller.store_attachments(thread_id, msg_id, prepared)
 
     # empty/vague text + an image that holds a request -> that request is acted on (see services/attachment_intent.py)
-    response = await controller.chat_with_repo(repo_id, thread_id, query, web=web, attachments=prepared)
+    response = await controller.chat_with_repo(repo_id, thread_id, query, web=web, attachments=prepared, model=model)
     await controller.db.save_chat_message(thread_id, "assistant", response)
     return {"repo_id": repo_id, "thread_id": thread_id, "answer": response, "attachments": saved}
 
@@ -144,7 +154,7 @@ async def chat_with_attachments(
 async def propose_change(repo_id: str, req: ChangeRequest):
     """Skips the ask/change router: always runs the change agents. Returns a proposal; writes nothing to disk."""
     try:
-        res = await controller.propose_change(repo_id, req.request, req.base_rev)
+        res = await controller.propose_change(repo_id, req.request, req.base_rev, model=req.model)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     return {**res.__dict__, "markdown": res.to_markdown()}

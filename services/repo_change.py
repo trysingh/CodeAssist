@@ -31,7 +31,7 @@ from langgraph.graph import END, START, StateGraph
 from config.settings import settings
 from services import call_check, static_check
 from services.decision import Choice, decide_choice
-from services.model_calls import LLMJson, LLMText, ask_json, ask_text
+from services.model_calls import LLMJson, LLMText, ask_json, ask_text, reasoning_model
 from services.patch_service import (apply_edits, diff_stats, make_diff, parse_edits,
                                     resolve_edit_paths)
 from services.repo_store import RepoStore, StaleRevision
@@ -469,7 +469,7 @@ class RepoChangeService:
         cands = list(dict.fromkeys(named + semantic))
         if not cands:
             # Nothing named, nothing found: let a small model choose from the file tree.
-            picker = settings.patcher_model or settings.llm_model       # a chat model; decision models cannot return file lists
+            picker = reasoning_model(settings.patcher_model)       # a chat model; decision models cannot return file lists
             try:
                 data = await self.llm_json(
                     picker,
@@ -484,7 +484,7 @@ class RepoChangeService:
             trace.append(f"file-tree pick: {len(cands)} file(s)")
         elif len(cands) > settings.change_max_files:
             data = await self.llm_json(
-                settings.patcher_model or settings.llm_model,
+                reasoning_model(settings.patcher_model),
                 "Pick the files that must be edited for this request. "
                 f"Reply ONLY JSON: {{\"files\": [paths]}} using at most {settings.change_max_files} "
                 f"paths from the list.\nREQUEST: {request}\nCANDIDATES:\n" + "\n".join(cands),
@@ -529,7 +529,7 @@ class RepoChangeService:
                                      heads="\n\n".join(heads),
                                      outline=await self._outline(state),
                                      known="\n".join(state["known"][:300]))
-        model = settings.patcher_model or settings.llm_model
+        model = reasoning_model(settings.patcher_model)
         self._emit(f"Planning with {model}")
         try:
             plan = (await self.llm_text(model, prompt, phase="PLAN", repo_id=state["repo_id"],
@@ -595,7 +595,7 @@ class RepoChangeService:
         plan = f"\nPLAN (follow it, keep edits within it):\n{state['plan']}\n" if state.get("plan") else ""
         prompt = _PROMPT.format(request=state["request"], context=self._ctx_block(state), plan=plan,
                                 feedback=fb, files="\n\n".join(blocks))
-        model = settings.patcher_model or settings.llm_model
+        model = reasoning_model(settings.patcher_model)
         self._emit(f"Attempt {attempt}: asking {model} for edits")
         try:
             raw = await self.llm_text(model, prompt, phase="PATCH", repo_id=state["repo_id"],
@@ -859,7 +859,7 @@ class RepoChangeService:
         feedback = ""
         if fb:
             feedback = f"\nTHE TEST FILE YOU WROTE BEFORE:\n{previous}\n\nPROBLEM WITH IT:\n{fb}\n"
-        model = settings.patcher_model or settings.llm_model
+        model = reasoning_model(settings.patcher_model) 
         problems: List[str] = []
         for round_ in range(2):                              # one repair round for an unusable reply
             extra = feedback + (("\nYOUR PREVIOUS REPLY WAS UNUSABLE:\n- " + "\n- ".join(problems) + "\n") if problems else "")

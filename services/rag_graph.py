@@ -12,8 +12,9 @@ from services.notifier import notifier
 from services.attachment_service import AttachmentService
 from services.web_search_service import WebSearchService, decide_web, now_str
 from models.schemas import GENERAL_REPO_ID
+from services.model_calls import reasoning_model
 import re
-MAX_FILE_CHARS = 70000
+MAX_FILE_CHARS = settings.change_context_chars
 
 
 def _history_pairs(messages, limit: int = 6) -> List[tuple]:
@@ -211,8 +212,9 @@ class RAGWorkflowManager:
                 f"Phase: {data['phase']} | Model: {data['model']} | Tokens: {data['total_tokens']} | Time: {data['duration_sec']:.3f}s",
                 level="INFO"
             )
+        model = reasoning_model()
         callback = StdoutTelemetryCallback(
-            model_name=settings.llm_model, 
+            model_name=model, 
             repo_id=repo_id,
             phase="RAG_GENERATION", 
             emitter=lambda data: notifier.notify("Telemetry Trace", data, level="INFO")
@@ -220,10 +222,10 @@ class RAGWorkflowManager:
         )
         
         llm = ChatOllama(
-            model=settings.llm_model,
+            model=model,
             base_url=settings.ollama_base_url,
             temperature=0.1,
-            num_ctx=32768,
+            num_ctx=settings.change_num_ctx,
             callbacks=[callback]
         )
         

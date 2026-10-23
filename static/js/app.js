@@ -101,6 +101,7 @@ const LS = {
 };
 const GENERAL = '__general__';
 const S = { web: LS.get('web', 'auto'), repoId: null, threadId: null, repos: [], tab: null, sending: false, files: [], unread: 0, collapsed: LS.get('collapsed', null), poll: null, stream: null, streamKey: '', tlimit: LS.get('tlimit', null) };
+S.model = LS.get('model', '');          // '' = server default
 const TABS = ['chat', 'repos', 'ingest', 'telemetry'];
 const TITLES = { chat: 'Chat', repos: 'Repositories', ingest: 'Ingest repository', telemetry: 'Telemetry & logs' };
 const isMobile = () => window.innerWidth < 1024;
@@ -113,6 +114,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     panel.dataset.open = String(isMobile() ? false : LS.get('threads', true));
     setupComposer();
     setupAttachments();
+    loadModels();
     syncLimitSelect(S.tlimit);
     setupNotificationStream();
     $('chat-messages').addEventListener('scroll', updateJumpBtn);
@@ -725,6 +727,18 @@ function renderAttachStrip() {
     icons();
 }
 
+async function loadModels() {
+    const sel = $('model-select'); if (!sel) return;
+    try {
+        const r = await (await fetch('/api/v1/models')).json();
+        sel.innerHTML = `<option value="">Default (${esc(r.default)})</option>` +
+            r.models.map(m => `<option value="${esc(m)}">${esc(m)}</option>`).join('');
+        if (!r.models.includes(S.model)) S.model = '';
+        sel.value = S.model;
+    } catch { /* stays on Default */ }
+    sel.onchange = () => { S.model = sel.value; LS.set('model', S.model); };
+}
+
 async function sendChatMessage(e) {
     if (e) e.preventDefault();
     if (S.sending) return;
@@ -758,14 +772,14 @@ async function sendChatMessage(e) {
         let res;
         if (files.length) {
             const fd = new FormData();
-            fd.append('repo_id', S.repoId); fd.append('thread_id', S.threadId); fd.append('query', query); fd.append('web', S.web);
+            fd.append('repo_id', S.repoId); fd.append('thread_id', S.threadId); fd.append('query', query); fd.append('web', S.web); fd.append('model', S.model); 
             files.forEach(f => fd.append('files', f, f.name));
             res = await fetch('/api/v1/chat/attach', { method: 'POST', body: fd });
         } else {
             res = await fetch('/api/v1/chat', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ repo_id: S.repoId, thread_id: S.threadId, query, web: S.web })
+                body: JSON.stringify({ repo_id: S.repoId, thread_id: S.threadId, query, web: S.web, model: S.model })
             });
         }
         if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || `Server returned ${res.status}`);

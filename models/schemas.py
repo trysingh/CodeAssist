@@ -58,3 +58,4 @@ class ChatRequest(BaseModel):
     thread_id: str
     query: str
     web: str = "auto"               # auto | on | off
+    model: str = ""                 # empty = server default

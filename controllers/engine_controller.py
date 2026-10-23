@@ -23,6 +23,7 @@ from services.web_search_service import split_web_prefix
 from models.schemas import GENERAL_REPO_ID
 from services.patch_service import make_diff
 from services.apply_service import apply_revision as apply_revision_to_disk
+from services.model_calls import model_scope
 
 class EngineController:
     """MVC Controller coordinating Repository Ingestion, Job Resumption, and Conversational RAG."""
@@ -340,7 +341,7 @@ class EngineController:
         return await self.db.list_repos()
 
     async def chat_with_repo(self, repo_id: str, thread_id: str, query: str, web: str = "auto",
-                             attachments: Optional[List[dict]] = None) -> str:
+                             attachments: Optional[List[dict]] = None, model: str = "") -> str:
         """attachments = prepared attachments of THIS message. When the typed text is empty or vague, a request
         written inside an uploaded image becomes the user's message (then routed like typed text)."""
         await self.db.init_db()
@@ -354,7 +355,7 @@ class EngineController:
                 query, note = found.request, found.note()
             elif not query.strip():
                 query = "Please review the attached content."
-        with repo_scope(repo_id):       # events raised while answering (web search, sandbox, ...) belong to this repo
+        with repo_scope(repo_id), model_scope(model):        # events raised while answering (web search, sandbox, ...) belong to this repo
             return note + await self._route_chat(repo_id, thread_id, query, web)
 
     async def _thread_context(self, thread_id: str, max_msgs: int = 6, per_msg: int = 700, total: int = 3000) -> str:
@@ -403,11 +404,12 @@ class EngineController:
         return await self.rag_manager.invoke_chat(repo_id, thread_id, decision.query, web=web)
 
     async def propose_change(self, repo_id: str, request: str, base_rev: Optional[int] = None,
-                             context: str = "", plan: str = "") -> ChangeResult:
+                             context: str = "", plan: str = "", model: str = "") -> ChangeResult:
         await self.db.init_db()
         if not await self.db.get_repo(repo_id):
             raise ValueError(f"Repository ID '{repo_id}' not found.")
-        return await self.change_service.run(repo_id, request, base_rev, context=context, plan=plan)
+        with model_scope(model):
+            return await self.change_service.run(repo_id, request, base_rev, context=context, plan=plan)
 
     async def list_revisions(self, repo_id: str) -> list:
         return await self.repo_store.list_revisions(repo_id)
