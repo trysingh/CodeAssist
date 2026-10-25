@@ -30,13 +30,14 @@ from typing import TYPE_CHECKING, Annotated, Dict, List, Optional, Tuple, TypedD
 from langgraph.graph import END, START, StateGraph
 
 from config.settings import settings
-from services import call_check, contract as ctr, splice, static_check, symbols as sym, tasks as tsk
+from services import call_check, contract as ctr, patch_targets, preserve, splice, static_check, symbols as sym, tasks as tsk
 from services.decision import Choice, decide_choice
 from services.model_calls import LLMJson, LLMText, ask_json, ask_text, reasoning_model
 from services.patch_service import (apply_edits, diff_stats, join_diffs, make_diff, parse_edits,
                                     resolve_edit_paths)
 from services.repo_store import RepoStore, StaleRevision
 from services.sandbox_service import CaseResult, SandboxService, SandboxVerdict
+from services import gates
 
 if TYPE_CHECKING:  # avoid importing chroma/ollama just to type-hint
     from models.database import DatabaseManager
@@ -184,6 +185,7 @@ class ChangeState(TypedDict, total=False):
     contract: List[dict]              # validated interface contract (CSym as dicts)
     stubbed: List[str]                # files in `working` that hold contract stubs
     contract_ok: bool                 # a contract was designed and validated
+    shared: List[dict]                # shared state the contract declared (ctr.Shared as dicts): one owner, one name, every task sees it
     ripple: List[str]                 # callers the new signatures break
     review_done: bool                 # the reviewer has had its one round
     review_fix: List[dict]            # symbols the reviewer pinned a finding on
@@ -323,7 +325,8 @@ REQUEST:
 {request}
 {context}{plan}
 Reply ONLY with JSON:
-{{"symbols": [{{"file": "<path>", "name": "<func | Class | Class.method>", "signature": "<one def / async def / class header, fully typed, no colon, no body>", "behavior": "<one sentence>", "depends_on": ["<path>::<name>"], "imports": ["<import line the signature's types need, only if the file lacks it>"]}}]}}
+{{"symbols": [{{"file": "<path>", "name": "<func | Class | Class.method>", "signature": "<one def / async def / class header, fully typed, no colon, no body>", "behavior": "<one sentence>", "depends_on": ["<path>::<name>"], "imports": ["<import line the signature's types need, only if the file lacks it>"]}}],
+ "shared": [{{"attr": "<Class.attribute>", "file": "<path>", "type": "<python type>", "purpose": "<one sentence>", "created_in": "<Class.method that assigns it, normally Class.__init__>", "used_by": ["<path>::<Class.method>"], "default": "<python expression the creator assigns, e.g. {{}} or None>"}}]}}
 
 RULES:
 - List every symbol that is NEW or whose signature or behaviour CHANGES, in each file that must change (route/view, controller,
@@ -335,6 +338,10 @@ RULES:
 - Do not invent request/response model classes unless the request needs one; if so, list it as its own `class` symbol.
 - Reuse what exists: if the CODE MAP already has a function that does the job, depend on it instead of adding a new one.
 - At most {limit} symbols.
+- SHARED STATE: when two or more symbols need the same registry, flag, cache or other state, declare it ONCE in "shared" and let every
+  symbol use that exact name. It must be an attribute of a class (`self.<name>`), assigned in a method of that class, normally
+  `__init__` (list that method in symbols too). A task cannot write module-level code: no module-level globals and no new module
+  for the state. Use "shared": [] when nothing is shared.
 {feedback}
 SIGNATURES OF THE FILES THAT WILL CHANGE (bodies left out):
 {sigs}
@@ -362,13 +369,15 @@ IMPORTS IN {file}:
 
 SIGNATURES YOU MAY CALL (bodies left out; every call must match them exactly):
 {deps}
-{tests}{feedback}
+{shared}{tests}{feedback}
 RULES:
 - Output the full `def` / `async def` of {name}. Decorators are optional (existing ones are kept). Put any new `import` line above it.
   No explanations. Fences are fine. The tool replaces the old function by position, so do not repeat any other code.
 - Keep the signature exactly. Never leave `raise NotImplementedError`. Do not change other functions.
 - Call only what is listed above, what is imported, or builtins and the standard library. Do not invent helpers; at most one small
   private helper (_name) may follow the function.
+- State shared with other functions is only what SHARED STATE lists, used as `self.<name>`. Never import a module that is not in
+  IMPORTS or in this repo, and never write a module-level global.
 - Match the code style of the file. Handle the edge cases the behaviour implies.
 """
 
@@ -399,10 +408,11 @@ Reply ONLY with JSON:
 """
 
 # a test that breaks the contract: wrong name or wrong arguments (not a missing implementation)
-_CONTRACT_VIOLATION = re.compile(r"ImportError|cannot import name|unexpected keyword argument|positional argument|missing \d+ required")
+_CONTRACT_VIOLATION = re.compile(r"ImportError|cannot import name|unexpected keyword argument|positional argument|missing \d+ required"
+                                 r"|does not have the attribute")        # the last one: mock.patch of a name that is not there (stubs are)
 
 # a failure that comes from a bug in the test itself, not from the missing code
-_TEST_SIDE_ERR = re.compile(r"fixture '[^']+' not found|NameError|SyntaxError|IndentationError")
+_TEST_SIDE_ERR = re.compile(r"fixture '[^']+' not found|NameError|SyntaxError|IndentationError|a coroutine was expected")
 
 
 class RepoChangeService:
@@ -774,6 +784,7 @@ class RepoChangeService:
             plan += ("\nCONTRACT (signatures are fixed). Each stub `raise NotImplementedError(\"contract: <name>\")` must become a real "
                      "body; keep its signature. [new] and [signature] symbols are stubbed in the files below:\n"
                      + ctr.render([ctr.CSym(**d) for d in state["contract"]]) + "\n")
+            plan += self._shared_block(state)
             if state.get("ripple"):
                 plan += "\nCALLERS THESE SIGNATURES BREAK (update them):\n- " + "\n- ".join(state["ripple"]) + "\n"
         if state.get("tasks"):
@@ -1170,20 +1181,27 @@ class RepoChangeService:
         plan = f"\nPLAN:\n{state['plan']}\n" if state.get("plan") else ""
         model = self._role_model("designer")
         feedback = ""
+        shared: List[ctr.Shared] = []
+        sprob: List[str] = []
         for round_ in range(2):                              # one repair round
             prompt = _CONTRACT_PROMPT.format(request=state["request"], context=self._ctx_block(state), plan=plan,
                                              limit=settings.change_contract_max_symbols, feedback=feedback, sigs=sigs,
                                              outline=outline, known="\n".join(state["known"][:200]))
             self._emit(f"Designing the contract with {model}" + (" (repair)" if round_ else ""))
             data = await self.llm_json(model, prompt, phase="CONTRACT", repo_id=state["repo_id"])
+            shared, sprob = [], []
             if data is None:
                 syms, stubs, problems = [], {}, ["the reply was not valid JSON"]
             else:
                 syms, problems = ctr.parse(data, base, state["known"], settings.change_contract_max_symbols)
                 stubs = {}
                 if not problems:
+                    shared, sprob = ctr.parse_shared(data, syms, base)
+                    ctr.mark_lazy(shared, ctr.init_bypassed(base))      # classes the tests build without __init__
+                    ctr.link_shared(syms, shared)            # users depend on the symbol that creates the state
                     stubs = ctr.apply_stubs(syms, base)
-                    problems = ctr.check_deps(syms, {**base, **stubs}) + await self._stub_static(state, stubs)
+                    # a bad `shared` entry earns the repair round; after it, the valid entries are kept and the bad ones dropped
+                    problems = ctr.check_deps(syms, {**base, **stubs}) + await self._stub_static(state, stubs) + (sprob if round_ == 0 else [])
             if not problems:
                 break
             feedback = "\nPROBLEMS WITH YOUR PREVIOUS CONTRACT (fix them):\n- " + "\n- ".join(problems[:8]) + "\n"
@@ -1191,11 +1209,15 @@ class RepoChangeService:
             msg = "contract skipped (never became valid): " + "; ".join(problems)[:200]
             self._emit(msg, "WARNING")
             return {"notes": notes + [msg], "trace": [msg]}
+        if sprob:
+            notes.append("shared state: " + "; ".join(sprob)[:200] + " (those entries were dropped)")
         ripple, owners = call_check.new_problems(base, {**base, **stubs})     # callers the new signatures break
         targets = list(state["targets"])
         targets += [p for p in dict.fromkeys(list(stubs) + owners) if p not in targets]
-        self._emit(f"Contract: {len(syms)} symbol(s), {len(stubs)} file(s) stubbed, {len(ripple)} caller(s) to update", "SUCCESS")
+        self._emit(f"Contract: {len(syms)} symbol(s), {len(stubs)} file(s) stubbed, {len(ripple)} caller(s) to update"
+                   + (f", {len(shared)} shared attribute(s)" if shared else ""), "SUCCESS")
         return {"working": {**state["working"], **stubs}, "contract": [asdict(s) for s in syms], "stubbed": sorted(stubs),
+                "shared": [asdict(x) for x in shared], "notes": notes,
                 "contract_ok": True, "targets": targets, "ripple": ripple[:8],
                 "trace": [f"contract: {len(syms)} symbols, {len(stubs)} stubbed file(s)"]}
 
@@ -1271,11 +1293,22 @@ class RepoChangeService:
                 return None, "skip", f"model call failed ({type(e).__name__})"
             if raw.startswith("NO_TESTS"):
                 return None, "skip", raw[:200]
+            
             text, problems = self._test_body(raw, path)
+            if text is not None:
+                problems += gates.unresolved_local_imports(text.encode(), set(state["known"]) | set(working))
+                if problems:
+                    previous, text = text, None   # ask once more, with the file and the problems
+                    continue
             if text is None:
                 previous = ""
                 continue
-            rep = await self.sandbox.verify_red(state["repo_id"], state["base_rev"], {**working, path: text.encode("utf-8")}, [path])
+            gone = patch_targets.coroutine_misuse(text) + patch_targets.missing_patch_targets(text, {**await self._py_sources(state), **working})
+            if gone:                                         # would fail at setup and look red: ask again, no container needed
+                problems, previous = gone, text
+                continue
+            rep = await self.sandbox.verify_red(state["repo_id"], state["base_rev"], {**working, path: text.encode("utf-8")}, [path],
+                                                timeout=settings.change_task_test_timeout_s)
             verdict, why = self._red_verdict(rep, tops, strict=bool(state.get("contract_ok")))
             if verdict == "red":
                 return text, "red", why
@@ -1302,7 +1335,8 @@ class RepoChangeService:
 
         path = self._gen_test_path({**state, "working": {p: b"" for p in src}})
         plan = f"\nPLAN:\n{state['plan']}\n" if state.get("plan") else ""
-        text, status, why = await self._red_tests(state, state["working"], request=state["request"], context=self._ctx_block(state),
+        text, status, why = await self._red_tests(state, state["working"], request=state["request"],
+                                                  context=self._ctx_block(state) + self._shared_block(state),
                                                   plan=plan, sigs=await self._sigs_block(state, src), path=path, label="tests first")
         if text is None:
             return skip(f"tests-first skipped: {why}" if status == "skip"
@@ -1312,6 +1346,12 @@ class RepoChangeService:
                 "tests_first": True, "trace": [f"tests first: {path} ({why})"]}
 
     # ------------------------------------------------------------------ review
+    @staticmethod
+    def _shared_block(state: ChangeState, me: Optional[Tuple[str, str]] = None) -> str:
+        """The contract's shared state as a prompt block ('' when there is none). `me` = (file, symbol) of the task."""
+        sh = [ctr.Shared(**d) for d in state.get("shared", [])]
+        return ("\n" + ctr.render_shared(sh, me) + "\n") if sh else ""
+
     @staticmethod
     def _role_model(role: str) -> str:
         """An explicit per-role model (designer / implementer / tester / reviewer) wins, even over the user's per-request pick, so
@@ -1469,6 +1509,8 @@ class RepoChangeService:
         for r in static_check.new_failures(static_check.check_files({t.file: tree[t.file]}), static_check.check_files({t.file: new})):
             problems.append(r.label() + self._snippet(new, r.line))
         probs, _ = call_check.new_problems(tree, {**tree, t.file: new})
+        problems += gates.unresolved_local_imports(new, set(tree))
+        problems += gates.lost_attributes(tree[t.file], new, t.name)
         return problems + probs[:5]
 
     def _green_problems(self, rep, tops: set) -> Optional[List[str]]:
@@ -1488,6 +1530,10 @@ class RepoChangeService:
         goal = state["request"][:400]
         model = self._role_model("implementer")
         tag = f"{t.file}::{t.name}"
+        shared = self._shared_block(state, (t.file, t.name))
+        shared_all = [ctr.Shared(**d) for d in state.get("shared", [])]
+        was = await self.store.get_file(state["repo_id"], t.file, state["base_rev"])       # the function as it was before the change
+        orig = was.data if was else b""
 
         test_path, test_text = None, None
         if t.kind == "implement" and settings.change_task_tests and self.sandbox.enabled:
@@ -1495,7 +1541,7 @@ class RepoChangeService:
             test_path = f"tests/test_change_r{state['base_rev'] + 1}_unit_{slug}.py"
             sigs = f"{t.file}\n    {t.sig}  # {t.behavior}\n" + self._dep_sigs(t, tree)
             text, status, why = await self._red_tests(
-                state, working, request=f"Test ONLY {tag}: {t.behavior}", context="", plan="", sigs=sigs,
+                state, working, request=f"Test ONLY {tag}: {t.behavior}", context=shared, plan="", sigs=sigs,
                 path=test_path, label=f"unit tests for {t.name}")
             if text is None:
                 test_path = None
@@ -1511,7 +1557,7 @@ class RepoChangeService:
             prompt = _TASK_PROMPT.format(
                 goal=goal, file=t.file, name=t.name, sig=t.sig, label="BEHAVIOUR" if t.kind == "implement" else "WHAT TO FIX",
                 behavior=t.behavior, current=splice.slice_of(old, t.name) or "(not found)", klass=self._class_block(old, t.name),
-                imports=self._imports_block(old), deps=self._dep_sigs(t, tree),
+                imports=self._imports_block(old), deps=self._dep_sigs(t, tree), shared=shared,
                 tests=(f"\nTESTS YOUR CODE MUST PASS (read-only):\n{test_text}\n" if test_text else ""), feedback=fb)
             self._emit(f"  {tag}: attempt {n} (~{len(prompt) // 4} tokens of context)")
             kw = {"num_ctx": settings.change_task_num_ctx} if settings.change_task_num_ctx else {}
@@ -1522,14 +1568,16 @@ class RepoChangeService:
             if new is None:
                 feedback, prev, last = [problem], raw, problem
                 continue
-            gate = await self._task_checks(t, tree, new)
+            gate = await self._task_checks(t, tree, new) + ctr.shared_problems(t, new, shared_all) \
+                + preserve.dropped_calls(orig, new, t.name, t.behavior)
             if gate:
                 feedback, prev, last = gate, raw, "; ".join(gate)[:200]
                 continue
             candidate = new
             if test_text:
                 overlay = {**working, t.file: new, test_path: test_text.encode("utf-8")}
-                rep = await self.sandbox.verify_red(state["repo_id"], state["base_rev"], overlay, [test_path], label="task-green")
+                rep = await self.sandbox.verify_red(state["repo_id"], state["base_rev"], overlay, [test_path], label="task-green",
+                                                    timeout=settings.change_task_test_timeout_s)
                 bad = self._green_problems(rep, tops)
                 if bad:
                     feedback, prev, last = bad, raw, "; ".join(bad)[:200]
@@ -1554,7 +1602,8 @@ class RepoChangeService:
             return {}
         tree = await self._py_sources(state)
         tree.update({p: b for p, b in state["working"].items() if p.endswith(".py") and not self._is_test_path(p)})   # files that exist only as stubs
-        plan_t, leftovers = tsk.plan_tasks([ctr.CSym(**d) for d in state["contract"]], state.get("ripple", []), tree)
+        plan_t, leftovers = tsk.plan_tasks([ctr.CSym(**d) for d in state["contract"]], state.get("ripple", []), tree,
+                                          [ctr.Shared(**d) for d in state.get("shared", [])])
         if len(plan_t) < settings.change_task_min:           # one symbol: the single patch is the fast path
             return {}
         working, notes, gen = dict(state["working"]), list(state["notes"]), list(state.get("gen_tests", []))

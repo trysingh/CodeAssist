@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Sequence, Tuple
 
 from services import splice
-from services.contract import CSym
+from services.contract import CSym, Shared
 
 _RIPPLE = re.compile(r"^(?P<path>[^:\s]+):(?P<line>\d+): (?P<msg>.*)$", re.S)
 
@@ -22,6 +22,7 @@ class Task:
     behavior: str               # what it must do / what to fix
     deps: List[str] = field(default_factory=list)       # "path::name" it may call
     change: str = "new"         # new | signature | behavior | caller
+    creates: List[str] = field(default_factory=list)    # shared-state attributes this task must assign
 
 
 def dep_key(d: str) -> Tuple[str, str]:
@@ -34,7 +35,8 @@ def _dep_keys(t: Task) -> List[Tuple[str, str]]:
     return [k for k in map(dep_key, t.deps) if k != ("", "")]
 
 
-def plan_tasks(syms: Sequence[CSym], ripple: Sequence[str], sources: Dict[str, bytes]) -> Tuple[List[Task], List[str]]:
+def plan_tasks(syms: Sequence[CSym], ripple: Sequence[str], sources: Dict[str, bytes],
+               shared: Sequence[Shared] = ()) -> Tuple[List[Task], List[str]]:
     """-> (ordered tasks, leftovers no task can cover; the single-patch stage handles those)."""
     impl: List[Task] = []
     leftovers: List[str] = []
@@ -44,7 +46,8 @@ def plan_tasks(syms: Sequence[CSym], ripple: Sequence[str], sources: Dict[str, b
             if s.change == "new" and not has_methods:
                 leftovers.append(f"{s.file}::{s.name}: new class with no method in the contract (its attributes need hand-written code)")
             continue
-        impl.append(Task("", "implement", s.file, s.name, s.sig, s.behavior, list(s.deps), s.change))
+        made = [x.attr.partition(".")[2] for x in shared if (x.file, x.created_in) == (s.file, s.name)]
+        impl.append(Task("", "implement", s.file, s.name, s.sig, s.behavior, list(s.deps), s.change, made))
     keys = {(t.file, t.name): t for t in impl}
 
     # dependency order (callee before caller); a cycle keeps the designer's order

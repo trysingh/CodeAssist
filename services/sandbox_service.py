@@ -348,7 +348,7 @@ _EXIT = re.compile(r"::SBX-EXIT:: (-?\d+)")
 _JUNIT = re.compile(r"::SBX-JUNIT-BEGIN::\n(.*?)\n::SBX-JUNIT-END::", re.DOTALL)
 
 
-def parse_run(raw: RawRun, mode: str, backend: str) -> RunReport:
+def parse_run(raw: RawRun, mode: str, backend: str, timeout_s: Optional[int] = None) -> RunReport:
     rep = RunReport(mode=mode, ran=False, backend=backend)
     if raw.error:
         rep.note = raw.error
@@ -370,7 +370,7 @@ def parse_run(raw: RawRun, mode: str, backend: str) -> RunReport:
     if raw.timed_out or rc == 124:
         rep.timed_out = True
         rep.failures.append(CaseResult("sandbox::timeout", "timeout",
-                                       f"run exceeded {settings.sandbox_test_timeout_s}s", _trim(rep.tail, 800)))
+                                       f"run exceeded {timeout_s or settings.sandbox_test_timeout_s}s", _trim(rep.tail, 800)))
         return rep
     if mode == "smoke":
         for line in console.splitlines():
@@ -843,7 +843,8 @@ class SandboxService:
         self._emit(line, "WARNING" if rep.failures else "INFO")
 
     async def _execute(self, tree: Dict[str, bytes], mode: str, selected: List[str],
-                       smoke: List[str], requirements: str, repo_id: str = "", label: str = "") -> RunReport:
+                       smoke: List[str], requirements: str, repo_id: str = "", label: str = "",
+                       timeout: Optional[int] = None) -> RunReport:
         extra: Dict[str, bytes] = {}
         if mode == "smoke":
             extra = {".sbx_smoke.py": _SMOKE_PY.encode(), ".sbx_smoke.json": json.dumps(smoke).encode()}
@@ -854,8 +855,8 @@ class SandboxService:
         if len(tar) > settings.sandbox_max_workspace_mb * 1024 * 1024:
             return RunReport(mode=mode, ran=False, backend=self.runner.name, note="workspace too large for the sandbox")
         t0 = time.monotonic()
-        raw = await self.runner.run(requirements, tar, argv, settings.sandbox_test_timeout_s)
-        rep = parse_run(raw, mode, self.runner.name)
+        raw = await self.runner.run(requirements, tar, argv, timeout or settings.sandbox_test_timeout_s)
+        rep = parse_run(raw, mode, self.runner.name, timeout)
         rep.duration = time.monotonic() - t0
         rep.selected = selected if mode == "pytest" else smoke
         rep.log_path = write_log(repo_id or "_", label or mode, raw.stdout or raw.error)
@@ -894,7 +895,7 @@ class SandboxService:
         return out
 
     async def verify_red(self, repo_id: str, base_rev: int, overlay: Dict[str, bytes], tests: Sequence[str],
-                         label: str = "red-check") -> RunReport:
+                         label: str = "red-check", timeout: Optional[int] = None) -> RunReport:
         """Run only `tests` on the base tree plus `overlay`: red check (tests + contract stubs) and per-task green check."""
         none = lambda note: RunReport(mode="none", ran=False, note=note, backend=self.runner.name)
         if not self.enabled:
@@ -911,7 +912,10 @@ class SandboxService:
                 if err:
                     return none(err)
                 self._ready.add(tag)
-        return await self._execute(tree, "pytest", list(tests), [], requirements, repo_id=repo_id, label=label)
+        rep = await self._execute(tree, "pytest", list(tests), [], requirements, repo_id=repo_id, label=label, timeout=timeout)
+        self._emit(f"{label}: {rep.passed} passed, {len(rep.failures)} failed in {rep.duration:.0f}s" + (" (TIMED OUT)" if rep.timed_out else ""),
+                   "WARNING" if rep.timed_out else "INFO")
+        return rep
 
     async def verify(self, repo_id: str, base_rev: int, working: Dict[str, bytes],
                      new_tests: Sequence[str] = ()) -> SandboxVerdict:

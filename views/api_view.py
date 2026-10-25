@@ -1,3 +1,4 @@
+import asyncio
 import uuid
 import secrets
 from pathlib import Path
@@ -98,18 +99,23 @@ async def get_thread_history(thread_id: str):
 
 @app.post("/api/v1/chat")
 async def chat_endpoint(req: ChatRequest):
-    """Processes a user query inside a specific repository thread and persists messages."""
+    """Processes a user query inside a specific repository thread and persists messages. Supports cancellation (499)."""
     try:
         await controller.db.init_db()
-        # Ensure thread record exists even if created ad-hoc
         await controller.db.create_thread(req.thread_id, req.repo_id, req.thread_id)
-        # Save user message
         await controller.db.save_chat_message(req.thread_id, "user", req.query)
-        
-        # Run RAG workflow
-        response = await controller.chat_with_repo(req.repo_id, req.thread_id, req.query, web=req.web, model=req.model)
-        
-        # Save assistant response
+        try:
+            response = await controller.chat_with_repo(req.repo_id, req.thread_id, req.query, web=req.web, model=req.model)
+        except asyncio.CancelledError:
+            return JSONResponse(
+                status_code=499,
+                content={
+                    "repo_id": req.repo_id,
+                    "thread_id": req.thread_id,
+                    "answer": "[Request stopped by user]",
+                    "detail": "cancelled"
+                }
+            )
         await controller.db.save_chat_message(req.thread_id, "assistant", response)
         return {"repo_id": req.repo_id, "thread_id": req.thread_id, "answer": response}
     except ValueError as e:
@@ -124,7 +130,7 @@ async def chat_with_attachments(
     model: str = Form(""),
     files: List[UploadFile] = File(...),
 ):
-    """Chat turn with pasted/uploaded attachments (image, pdf, docx, text). Extracted text is saved on the thread."""
+    """Chat turn with pasted/uploaded attachments (image, pdf, docx, text). Supports cancellation."""
     if len(files) > settings.max_attachments_per_message:
         raise HTTPException(status_code=413, detail=f"Max {settings.max_attachments_per_message} attachments per message.")
     limit = settings.max_attachment_mb * 1024 * 1024
@@ -139,7 +145,7 @@ async def chat_with_attachments(
     if not await controller.db.get_repo(repo_id):
         raise HTTPException(status_code=404, detail=f"Repository ID '{repo_id}' not found.")
     try:
-        prepared = await controller.prepare_attachments(raw)   # OCR / text extraction
+        prepared = await controller.prepare_attachments(raw)
     except ValueError as e:
         raise HTTPException(status_code=415, detail=str(e))
 
@@ -148,8 +154,19 @@ async def chat_with_attachments(
     msg_id = await controller.db.save_chat_message(thread_id, "user", query)
     saved = await controller.store_attachments(thread_id, msg_id, prepared)
 
-    # empty/vague text + an image that holds a request -> that request is acted on (see services/attachment_intent.py)
-    response = await controller.chat_with_repo(repo_id, thread_id, query, web=web, attachments=prepared, model=model)
+    try:
+        response = await controller.chat_with_repo(repo_id, thread_id, query, web=web, attachments=prepared, model=model)
+    except asyncio.CancelledError:
+        return JSONResponse(
+            status_code=499,
+            content={
+                "repo_id": repo_id,
+                "thread_id": thread_id,
+                "answer": "[Request stopped by user]",
+                "detail": "cancelled",
+                "attachments": saved
+            }
+        )
     await controller.db.save_chat_message(thread_id, "assistant", response)
     return {"repo_id": repo_id, "thread_id": thread_id, "answer": response, "attachments": saved}
 
@@ -263,3 +280,28 @@ async def api_reset_repo_index(repo_id: str):
         # Log the error and return a 500
         notifier.notify("Repository Index Reset", f"Indexes reset NOT successfull: {e}", level="ERROR", repo_id=repo_id)
         raise HTTPException(status_code=500, detail="Internal server error during index reset")
+@app.post("/api/v1/chat/stop")
+async def stop_chat_endpoint(thread_id: str, repo_id: Optional[str] = None):
+    """Terminate an ongoing chat session for a specific thread. Validates ownership if repo_id given."""
+    try:
+        await controller.db.init_db()
+        if repo_id:
+            try:
+                import aiosqlite
+                async with aiosqlite.connect(controller.db.db_path) as db:
+                    async with db.execute("SELECT repo_id FROM chat_threads WHERE thread_id=?", (thread_id,)) as cur:
+                        row = await cur.fetchone()
+                        if row and row[0] != repo_id:
+                            raise HTTPException(status_code=403, detail="Thread does not belong to this repo")
+            except HTTPException:
+                raise
+            except Exception:
+                pass
+        success = await controller.stop_chat(thread_id)
+        if not success:
+            return JSONResponse(status_code=404, content={"detail": f"No active chat session found for thread_id: {thread_id}"})
+        return JSONResponse(status_code=200, content={"detail": "Chat session terminated successfully", "thread_id": thread_id})
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

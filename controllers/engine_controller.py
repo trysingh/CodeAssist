@@ -3,6 +3,7 @@ import os
 import sys
 import time
 import re
+import asyncio
 import orjson
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Callable
@@ -39,6 +40,8 @@ class EngineController:
         # Builds sandbox dependency images in the background. Inert until warmer.start() is called from the
         # running application (views/api_view.py); the file watcher's short-lived controllers never start one.
         self.warmer = SandboxWarmer(self.change_service.sandbox, self._warm_repo_ids)
+        self.active_chats: Dict[str, asyncio.Task] = {}
+        self._chat_lock = asyncio.Lock()
 
     async def _warm_repo_ids(self) -> List[str]:
         await self.db.init_db()
@@ -341,10 +344,9 @@ class EngineController:
         await self.db.init_db()
         return await self.db.list_repos()
 
-    async def chat_with_repo(self, repo_id: str, thread_id: str, query: str, web: str = "auto",
-                             attachments: Optional[List[dict]] = None, model: str = "") -> str:
-        """attachments = prepared attachments of THIS message. When the typed text is empty or vague, a request
-        written inside an uploaded image becomes the user's message (then routed like typed text)."""
+    async def _chat_impl(self, repo_id: str, thread_id: str, query: str, web: str,
+                       attachments: Optional[List[dict]], model: str) -> str:
+        """Actual chat execution - extracted for task tracking and cancellation support."""
         await self.db.init_db()
         repo = await self.db.get_repo(repo_id)
         if not repo:
@@ -356,8 +358,57 @@ class EngineController:
                 query, note = found.request, found.note()
             elif not query.strip():
                 query = "Please review the attached content."
-        with repo_scope(repo_id), model_scope(model):        # events raised while answering (web search, sandbox, ...) belong to this repo
+        with repo_scope(repo_id), model_scope(model):
             return note + await self._route_chat(repo_id, thread_id, query, web)
+
+    async def chat_with_repo(self, repo_id: str, thread_id: str, query: str, web: str = "auto",
+                             attachments: Optional[List[dict]] = None, model: str = "") -> str:
+        """Attachments = prepared attachments of THIS message. Supports cancellation via stop_chat()."""
+        if not hasattr(self, 'active_chats'):
+            self.active_chats = {}
+        if not hasattr(self, '_chat_lock'):
+            self._chat_lock = asyncio.Lock()
+
+        async with self._chat_lock:
+            prev = self.active_chats.get(thread_id)
+            if prev and not prev.done():
+                prev.cancel()
+            task = asyncio.create_task(
+                self._chat_impl(repo_id, thread_id, query, web, attachments, model),
+                name=f"chat-{thread_id}"
+            )
+            self.active_chats[thread_id] = task
+
+        try:
+            return await task
+        except asyncio.CancelledError:
+            raise
+        finally:
+            async with self._chat_lock:
+                if self.active_chats.get(thread_id) is task:
+                    self.active_chats.pop(thread_id, None)
+
+    async def stop_chat(self, thread_id: str) -> bool:
+        """Cancels the asyncio task associated with the given thread ID."""
+        if not hasattr(self, 'active_chats'):
+            self.active_chats = {}
+        if not hasattr(self, '_chat_lock'):
+            self._chat_lock = asyncio.Lock()
+
+        async with self._chat_lock:
+            task = self.active_chats.pop(thread_id, None)
+
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+            return True
+        return False
+
 
     async def _thread_context(self, thread_id: str, max_msgs: int = 6, per_msg: int = 700, total: int = 3000) -> str:
         """Last few turns of this thread, so '/change ... as discussed above' has something to refer to."""

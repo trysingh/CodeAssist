@@ -100,7 +100,7 @@ const LS = {
     set(k, v) { try { localStorage.setItem('crag.' + k, JSON.stringify(v)); } catch { /* storage unavailable */ } }
 };
 const GENERAL = '__general__';
-const S = { web: LS.get('web', 'auto'), repoId: null, threadId: null, repos: [], tab: null, sending: false, files: [], unread: 0, collapsed: LS.get('collapsed', null), poll: null, stream: null, streamKey: '', tlimit: LS.get('tlimit', null) };
+const S = { web: LS.get('web', 'auto'), repoId: null, threadId: null, repos: [], tab: null, sending: false, files: [], unread: 0, collapsed: LS.get('collapsed', null), poll: null, stream: null, streamKey: '', tlimit: LS.get('tlimit', null), abortController: null };
 S.model = LS.get('model', '');          // '' = server default
 const TABS = ['chat', 'repos', 'ingest', 'telemetry'];
 const TITLES = { chat: 'Chat', repos: 'Repositories', ingest: 'Ingest repository', telemetry: 'Telemetry & logs' };
@@ -689,6 +689,17 @@ function updateComposer() {
     t.placeholder = ready ? (S.repoId === GENERAL ? 'Ask anything (uses the web when needed)' : 'Ask anything about the codebase') : (S.repoId ? 'Loading thread…' : 'Select a repository to start chatting');
     $('send-btn').disabled = !ready || S.sending;
     $('attach-btn').disabled = !ready || S.sending;
+    const stopBtn = $('stop-chat-btn');
+    const sendBtn = $('send-btn');
+    if (stopBtn) {
+        stopBtn.classList.toggle('hidden', !S.sending);
+        stopBtn.classList.toggle('flex', S.sending);
+        stopBtn.disabled = !S.sending;
+    }
+    if (sendBtn) {
+        sendBtn.classList.toggle('hidden', S.sending);
+        sendBtn.classList.toggle('flex', !S.sending);
+    }
 }
 
 function setupComposer() {
@@ -775,6 +786,27 @@ async function loadModels() {
 async function sendChatMessage(e) {
     if (e) e.preventDefault();
     if (S.sending) return;
+
+    S.abortController = new AbortController();
+    const stopBtn = $('stop-chat-btn');
+    if (stopBtn) {
+        stopBtn.onclick = async () => {
+            try {
+                const params = new URLSearchParams({ thread_id: S.threadId });
+                if (S.repoId) params.set('repo_id', S.repoId);
+                const res = await fetch(`/api/v1/chat/stop?${params.toString()}`, { method: 'POST' });
+                if (res.ok) {
+                    S.abortController.abort();
+                    showToast("Cancelled", "Chat request terminated.", "info");
+                } else if (res.status === 404) {
+                    S.abortController.abort();
+                }
+            } catch (err) {
+                console.error("Stop request failed:", err);
+                S.abortController.abort();
+            }
+        };
+    }
     if (!S.repoId || !S.threadId) {
         showToast("Selection required", "Select a repository and thread first.", "warning");
         return;
@@ -803,17 +835,24 @@ async function sendChatMessage(e) {
 
     try {
         let res;
+        const signal = S.abortController.signal;
         if (files.length) {
             const fd = new FormData();
             fd.append('repo_id', S.repoId); fd.append('thread_id', S.threadId); fd.append('query', query); fd.append('web', S.web); fd.append('model', S.model);
             files.forEach(f => fd.append('files', f, f.name));
-            res = await fetch('/api/v1/chat/attach', { method: 'POST', body: fd });
+            res = await fetch('/api/v1/chat/attach', { method: 'POST', body: fd, signal });
         } else {
             res = await fetch('/api/v1/chat', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ repo_id: S.repoId, thread_id: S.threadId, query, web: S.web, model: S.model })
+                body: JSON.stringify({ repo_id: S.repoId, thread_id: S.threadId, query, web: S.web, model: S.model }),
+                signal
             });
+        }
+        if (res.status === 499) {
+            $(id)?.remove();
+            showToast("Stopped", "Request cancelled by user.", "info");
+            return;
         }
         if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || `Server returned ${res.status}`);
         const result = await res.json();
@@ -823,13 +862,18 @@ async function sendChatMessage(e) {
         icons();
         col.lastElementChild.scrollIntoView({ block: 'start' }); // start reading at the top of the answer
     } catch (err) {
-        $(id)?.remove();
-        input.value = query; autosize(); // give the question back so it can be retried
-        S.files = files; renderAttachStrip(); // ...and the attachments
-        showToast("Message failed", err.message, "error");
+        if (err.name === 'AbortError') {
+            $(id)?.remove();
+            showToast("Stopped", "Request cancelled by user.", "info");
+        } else {
+            $(id)?.remove();
+            input.value = query; autosize();
+            S.files = files; renderAttachStrip();
+            showToast("Message failed", err.message, "error");
+        }
     } finally {
         clearInterval(tick); S.liveStatus = null;
-        S.sending = false; updateComposer(); input.focus();
+        S.sending = false; S.abortController = null; updateComposer(); input.focus();
     }
 }
 

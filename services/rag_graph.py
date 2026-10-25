@@ -11,6 +11,7 @@ from services.telemetry import StdoutTelemetryCallback
 from services.notifier import notifier
 from services.attachment_service import AttachmentService
 from services.web_search_service import WebSearchService, decide_web, now_str
+import asyncio
 from models.schemas import GENERAL_REPO_ID
 from services.model_calls import reasoning_model
 import re
@@ -252,8 +253,11 @@ class RAGWorkflowManager:
         async with AsyncSqliteSaver.from_conn_string(settings.checkpoint_path) as checkpointer:
             graph = builder.compile(checkpointer=checkpointer)
             config = {"configurable": {"thread_id": f"{repo_id}:{thread_id}"}}
-            result = await graph.ainvoke(
-                {"messages": [HumanMessage(content=user_input)], "repo_id": repo_id, "thread_id": thread_id, "web_mode": web},
-                config=config
-            )
-            return result["messages"][-1].content + (result.get("web_footer") or "")
+            try:
+                result = await graph.ainvoke(
+                    {"messages": [HumanMessage(content=user_input)], "repo_id": repo_id, "thread_id": thread_id, "web_mode": web},
+                    config=config
+                )
+                return result["messages"][-1].content + (result.get("web_footer") or "")
+            except asyncio.CancelledError:
+                raise

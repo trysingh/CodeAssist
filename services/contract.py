@@ -10,7 +10,7 @@ import ast
 import posixpath
 import re
 from dataclasses import dataclass, field
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from services import symbols as sym
 
@@ -27,6 +27,19 @@ class CSym:
     deps: List[str] = field(default_factory=list)       # "path::name"
     imports: List[str] = field(default_factory=list)    # import lines the signature's types need
     change: str = "new"                         # new | signature (stubbed) | behavior (body changes, signature does not)
+
+
+@dataclass
+class Shared:
+    """State that several symbols use. A task cannot write module-level code, so it is always a `self.` attribute."""
+    attr: str                                   # "Class.attribute"
+    file: str
+    type: str
+    purpose: str
+    created_in: str                             # "Class.method" (normally Class.__init__): the contract symbol that assigns it
+    used_by: List[str] = field(default_factory=list)    # "path::name" contract symbols that read it
+    default: str = ""                           # the Python expression the creator assigns, e.g. "{}" (optional)
+    lazy: bool = False                          # existing tests build the class with __new__: __init__ does not always run
 
 
 def _is_test(p: str) -> bool:
@@ -240,3 +253,133 @@ def render(syms: Sequence[CSym], limit: int = 6000) -> str:
         rows.append(row)
         used += len(row)
     return "\n".join(rows)
+
+
+_ATTR = re.compile(r"^[A-Za-z_]\w*\.[A-Za-z_]\w*$")
+
+
+def parse_shared(data, syms: Sequence[CSym], sources: Dict[str, bytes]) -> Tuple[List[Shared], List[str]]:
+    """The designer's `shared` list -> (valid items, problems). Invalid items are left out of the result."""
+    items = data.get("shared") if isinstance(data, dict) else None
+    if not items:
+        return [], []
+    if not isinstance(items, list):
+        return [], ['"shared" must be a list of {"attr", "file", "type", "purpose", "created_in", "used_by"}']
+    have = {(s.file, s.name) for s in syms}
+    new_classes = {(s.file, s.name) for s in syms if s.kind == "class"}
+    out, problems, seen = [], [], set()
+    for i, it in enumerate(items[:8], 1):
+        tag = f"shared {i}"
+        if not isinstance(it, dict):
+            problems.append(f"{tag}: must be an object")
+            continue
+        attr, f, typ, why, made = (str(it.get(k) or "").strip() for k in ("attr", "file", "type", "purpose", "created_in"))
+        f = f.replace("\\", "/")
+        if not _ATTR.match(attr):
+            problems.append(f"{tag}: attr '{attr}' must be `Class.attribute`: a task cannot write module-level code, so shared state lives on `self`")
+            continue
+        cls = attr.split(".")[0]
+        if not _safe(f) or _is_test(f):
+            problems.append(f"{tag} ({attr}): bad file path '{f}'")
+            continue
+        exists = any(x.qualname == cls and x.kind == "class" for x in sym.symbols(sources.get(f, b"")))
+        if not (exists or (f, cls) in new_classes):
+            problems.append(f"{tag} ({attr}): class {cls} is not in {f}; put the state on an existing class (or list a new class in symbols). "
+                            "Do not create a module just for it")
+            continue
+        if (f, made) not in have or not made.startswith(cls + "."):
+            problems.append(f"{tag} ({attr}): created_in '{made}' must be a `{cls}.<method>` that is also listed in symbols for {f} "
+                            f"(normally {cls}.__init__)")
+            continue
+        if attr in seen:
+            continue
+        seen.add(attr)
+        users = []
+        for u in it.get("used_by") or []:
+            uf, _, un = str(u).replace("\\", "/").partition("::")
+            if (uf.strip(), un.strip()) in have and f"{uf.strip()}::{un.strip()}" not in users:
+                users.append(f"{uf.strip()}::{un.strip()}")       # a name that is not a contract symbol is dropped, not an error
+        dflt = str(it.get("default") or "").strip()
+        try:
+            ast.parse(dflt, mode="eval") if dflt else None
+        except SyntaxError:
+            dflt = ""                                         # a default that is not an expression is ignored, not an error
+        out.append(Shared(attr, f, typ or "object", why, made, users, dflt))
+    return out, problems
+
+
+def link_shared(syms: Sequence[CSym], shared: Sequence[Shared]) -> None:
+    """Every user depends on the symbol that creates the state: it is implemented first, and if it fails the users are skipped."""
+    by_key = {f"{s.file}::{s.name}": s for s in syms}
+    for x in shared:
+        maker = f"{x.file}::{x.created_in}"
+        for u in x.used_by:
+            s = by_key.get(u)
+            if s is not None and u != maker and maker not in s.deps:
+                s.deps.append(maker)
+
+
+def render_shared(shared: Sequence[Shared], me: Optional[Tuple[str, str]] = None, limit: int = 2500) -> str:
+    """The shared state as an implementer sees it. `me` = (file, name) of the symbol being written."""
+    rows, used = [], 0
+    for x in shared:
+        cls, _, attr = x.attr.partition(".")
+        who = "YOU assign it in this function" if me == (x.file, x.created_in) else f"assigned in {x.created_in}"
+        row = f"- self.{attr}: {x.type}   (on {cls} in {x.file}; {who}) {x.purpose}".rstrip()
+        if x.lazy:
+            read = f"self.__dict__.setdefault({attr!r}, {x.default})" if x.default else f"getattr(self, {attr!r}, None) (and cope with None)"
+            row += (f"\n  ! Existing tests build {cls} with {cls}.__new__, so __init__ may not have run. Outside {x.created_in}, never use "
+                    f"self.{attr} directly: read it as {read}")
+        if used + len(row) > limit:
+            break
+        rows.append(row)
+        used += len(row)
+    if not rows:
+        return ""
+    return ("SHARED STATE (use exactly these names; invent no other state, no module-level globals, no new module for it):\n"
+            + "\n".join(rows))
+
+
+_NEW_BYPASS = (re.compile(r"\b(\w+)\.__new__\(\s*\1\s*\)"), re.compile(r"\bobject\.__new__\(\s*(\w+)\s*\)"))
+
+
+def init_bypassed(sources: Dict[str, bytes]) -> set:
+    """Classes the repo's tests build with `Cls.__new__(Cls)`: their __init__ does not run there."""
+    out = set()
+    for p, src in sources.items():
+        if p.endswith(".py") and _is_test(p):
+            text = src.decode("utf-8", "replace")
+            for rx in _NEW_BYPASS:
+                out |= set(rx.findall(text))
+    return out
+
+
+def mark_lazy(shared: Sequence[Shared], bypassed: set) -> None:
+    for x in shared:
+        x.lazy = x.attr.split(".")[0] in bypassed
+
+
+def shared_problems(t, new: bytes, shared: Sequence[Shared] = ()) -> List[str]:
+    """What a task owes the shared state. The creator (`t.creates`) must assign the attribute. When existing tests build the
+    class without __init__ (`x.lazy`), every other method of that class must read it defensively."""
+    creates = getattr(t, "creates", None) or []
+    cls, _, meth = t.name.rpartition(".")
+    lazy = [x.attr.partition(".")[2] for x in shared if x.lazy and x.file == t.file and cls and x.attr.split(".")[0] == cls.split(".")[-1]]
+    if not (creates or lazy):
+        return []
+    try:
+        tree = ast.parse(new.decode("utf-8", "replace"))
+    except SyntaxError:
+        return []
+    for c in ast.walk(tree):
+        if isinstance(c, ast.ClassDef) and c.name == cls.split(".")[-1]:
+            for f in c.body:
+                if isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef)) and f.name == meth:
+                    uses = [n for n in ast.walk(f) if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id == "self"]
+                    stored = {n.attr for n in uses if isinstance(n.ctx, ast.Store)}
+                    loaded = {n.attr for n in uses if isinstance(n.ctx, ast.Load)}
+                    out = [f"`self.{a}` is shared state (see SHARED STATE): this function must assign it" for a in creates if a not in stored]
+                    out += [f"`self.{a}` is read directly, but existing tests build this class without __init__ (see SHARED STATE): "
+                            f"read it with the form given there" for a in lazy if a in loaded and a not in stored]
+                    return out
+    return []

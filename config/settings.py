@@ -99,6 +99,7 @@ class EngineSettings(BaseSettings):
     sandbox_cpus: str = Field(default="2")
     sandbox_pids: int = Field(default=256)
     sandbox_test_timeout_s: int = Field(default=180)
+    change_task_test_timeout_s: int = Field(default=60)       # one red check or per-task unit-test run; the full run keeps sandbox_test_timeout_s
     sandbox_all_max_files: int = Field(default=12)      # no test refers to the change and the suite is bigger than this: do not run it all
                                                         # (it would hit the time cap and prove nothing); 0 = always run everything
     sandbox_build_timeout_s: int = Field(default=1500)
