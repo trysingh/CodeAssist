@@ -68,6 +68,7 @@ async def _svc(llm, files, runner=None):
 @pytest.fixture
 def authoring(monkeypatch):
     monkeypatch.setattr(settings, "change_author_tests", True)
+    monkeypatch.setattr(settings, "change_tests_first", False)     # these tests cover the after-the-edit author step (the fallback)
 
 
 # ----------------------------------------------------------------------------- reading the container's report

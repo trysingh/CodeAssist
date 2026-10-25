@@ -1,8 +1,9 @@
 import uuid
+import secrets
 from pathlib import Path
 from typing import List, Optional
 from pydantic import BaseModel
-from fastapi import FastAPI, BackgroundTasks, HTTPException, Request, File, Form, UploadFile
+from fastapi import FastAPI, BackgroundTasks, HTTPException, Request, File, Form, UploadFile, Header
 from fastapi.responses import HTMLResponse, FileResponse, PlainTextResponse, Response, JSONResponse
 from fastapi.templating import Jinja2Templates
 from sse_starlette.sse import EventSourceResponse
@@ -11,7 +12,9 @@ from controllers.engine_controller import EngineController
 from models.schemas import ChatRequest
 from config.settings import settings
 from services.notifier import notifier
-from services.model_calls import list_chat_models 
+from services.model_calls import list_chat_models
+
+
 
 app = FastAPI(title="CodeRAG Pluggable Chunking & Multi-Thread RAG API")
 controller = EngineController()
@@ -164,11 +167,27 @@ async def list_revisions(repo_id: str):
     return await controller.list_revisions(repo_id)
 
 @app.get("/api/v1/repos/{repo_id}/revisions/{rev}/diff", response_class=PlainTextResponse)
-async def revision_diff(repo_id: str, rev: int):
-    diff = await controller.revision_diff(repo_id, rev)
+async def revision_diff(repo_id: str, rev: int, from_disk: bool = False):
+    diff = await controller.revision_diff(repo_id, rev, from_disk)
     if diff is None:
         raise HTTPException(status_code=404, detail="Revision not found")
     return diff
+
+@app.get("/api/v1/repos/{repo_id}/revisions/{rev}/patch")
+async def revision_patch(repo_id: str, rev: int, from_disk: bool = True):
+    """The patch as a file download (exact bytes, so nothing re-encodes or trims the final newline). By default it is
+    cumulative against the repo as the engine last saw it, i.e. what a working tree matches, so it applies without the earlier
+    revisions; from_disk=false gives only what this revision changed on top of the revision before it.
+    Check with `git apply --check <file>`. Files that changed on disk since are named in `#` lines at the top and in the
+    X-Patch-Conflicts header."""
+    res = await controller.revision_patch(repo_id, rev, from_disk)
+    if res is None:
+        raise HTTPException(status_code=404, detail="Revision not found")
+    diff, conflicts = res
+    headers = {"Content-Disposition": f'attachment; filename="{repo_id}_rev{rev}.patch"'}
+    if conflicts:
+        headers["X-Patch-Conflicts"] = str(len(conflicts))
+    return Response(content=diff.encode("utf-8"), media_type="text/x-diff; charset=utf-8", headers=headers)
 
 @app.get("/api/v1/repos/{repo_id}/revisions/{rev}/download")
 async def revision_download(repo_id: str, rev: int):
@@ -179,8 +198,15 @@ async def revision_download(repo_id: str, rev: int):
                     headers={"Content-Disposition": f'attachment; filename="{repo_id}_rev{rev}.zip"'})
 
 @app.post("/api/v1/repos/{repo_id}/revisions/{rev}/apply")
-async def apply_revision(repo_id: str, rev: int, force: bool = False):
+async def apply_revision(repo_id: str, rev: int, force: bool = False,
+                         x_confirm_phrase: str = Header(default="")):
     """Writes the revision into the repo folder. 409 + conflicts if files changed on disk since ingest."""
+    phrase = settings.apply_confirmation_phrase
+    if phrase:
+        if not x_confirm_phrase:
+            raise HTTPException(status_code=428, detail="Confirmation phrase required")
+        if not secrets.compare_digest(x_confirm_phrase.encode(), phrase.encode()):
+            raise HTTPException(status_code=403, detail="Wrong confirmation phrase")
     try:
         res = await controller.apply_revision(repo_id, rev, force)
     except ValueError as e:

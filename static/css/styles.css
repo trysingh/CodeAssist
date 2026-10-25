@@ -39,17 +39,39 @@ code, pre {
 ::-webkit-scrollbar-track {
   background: #0b0f19;
 }
+html:not(.dark) ::-webkit-scrollbar-track {
+  background: #f1f5f9;
+}
 ::-webkit-scrollbar-thumb {
   background: #1f2937;
   border-radius: 3px;
 }
+html:not(.dark) ::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+}
 ::-webkit-scrollbar-thumb:hover {
   background: #374151;
 }
-@media (max-width: 639px) {
+html:not(.dark) ::-webkit-scrollbar-thumb:hover {
+  background: #94a3b8;
+}
+@media (max-width: 639px) and (max-height: 900px) {
   ::-webkit-scrollbar {
     width: 4px;
     height: 4px;
+  }
+  body {
+    font-size: 1.1rem;
+  }
+}
+
+@media (max-width: 639px) and (min-height: 901px) {
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  body {
+    font-size: 1.2rem;
   }
 }
 
@@ -134,7 +156,7 @@ aside {
   }
   #chat-col table {
     white-space: normal;
-    font-size: 13px;
+    font-size: 14px;
   }
   #chat-col th, #chat-col td {
     padding: 6px 8px !important;

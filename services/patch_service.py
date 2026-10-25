@@ -338,27 +338,104 @@ def apply_edits(edits: List[Edit], contents: Dict[str, Optional[bytes]]) -> Appl
 
 
 # --------------------------------------------------------------------------- diff
+# A diff that `git apply` accepts must be byte-faithful:
+#   * lines are split on "\n" ONLY (str.splitlines also splits on \x0b \x0c \x1c-\x1e \x85 \u2028 \u2029 and would
+#     corrupt any file that contains one) and every line keeps its own ending, so CRLF files diff as CRLF;
+#   * a last line without a newline is followed by "\\ No newline at end of file";
+#   * the text ends with a newline, and chunks of several files are joined WITHOUT inserting blank lines;
+#   * every file starts with `diff --git`, new/deleted files carry their mode line, odd names are C-quoted.
+_NO_EOL = "\\ No newline at end of file\n"
+
+
+def _split_keepends(data: bytes) -> Optional[List[str]]:
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    out: List[str] = []
+    start = 0
+    while True:
+        i = text.find("\n", start)
+        if i < 0:
+            if start < len(text):
+                out.append(text[start:])
+            return out
+        out.append(text[start:i + 1])
+        start = i + 1
+
+
+def _git_name(prefix: str, path: str) -> str:
+    """`a/<path>` the way git writes it: unquoted unless it holds quotes, backslashes, control or non-ASCII chars."""
+    full = prefix + path
+    if all(0x20 <= ord(c) < 0x7F and c not in '"\\' for c in full):
+        return full
+    esc = []
+    for ch in full:
+        o = ord(ch)
+        if ch == '"':
+            esc.append('\\"')
+        elif ch == "\\":
+            esc.append("\\\\")
+        elif ch == "\t":
+            esc.append("\\t")
+        elif ch == "\n":
+            esc.append("\\n")
+        elif 0x20 <= o < 0x7F:
+            esc.append(ch)
+        else:
+            esc.extend(f"\\{b:03o}" for b in ch.encode("utf-8"))
+    return '"' + "".join(esc) + '"'
+
+
 def make_diff(path: str, old: Optional[bytes], new: Optional[bytes]) -> str:
-    def lines(b: Optional[bytes]) -> List[str]:
-        return [] if b is None else b.decode("utf-8", errors="replace").replace("\r\n", "\n").split("\n")
-    a, b = lines(old), lines(new)
-    if a and a[-1] == "":
-        a.pop()
-    if b and b[-1] == "":
-        b.pop()
-    diff = difflib.unified_diff(
-        a, b,
-        fromfile="/dev/null" if old is None else f"a/{path}",
-        tofile="/dev/null" if new is None else f"b/{path}",
-        lineterm="")
-    return "\n".join(diff)
+    """Unified diff of one file (old/new = bytes, None = absent) that `git apply` accepts. Always ends in a newline.
+    Returns "" when nothing differs. Files that are not UTF-8 text cannot be expressed as a text hunk: a one-line
+    comment names them (git ignores text between file diffs) instead of corrupting the patch."""
+    if old == new:
+        return ""
+    a = [] if old is None else _split_keepends(old)
+    b = [] if new is None else _split_keepends(new)
+    if a is None or b is None:
+        return f"# binary or non-UTF-8 file not included in this patch: {path}\n"
+
+    na, nb = _git_name("a/", path), _git_name("b/", path)
+    out: List[str] = [f"diff --git {na} {nb}\n"]
+    if old is None:
+        out.append("new file mode 100644\n")
+    elif new is None:
+        out.append("deleted file mode 100644\n")
+    if not a and not b:                      # empty file created or deleted: git needs no hunks
+        return "".join(out)
+
+    tab = "\t" if " " in path else ""          # git marks names that hold a space with a trailing tab
+    out.append(f"--- {'/dev/null' if old is None else na}{tab}\n")
+    out.append(f"+++ {'/dev/null' if new is None else nb}{tab}\n")
+    body = list(difflib.unified_diff(a, b, "", "", n=3, lineterm="\n"))[2:]       # drop difflib's own two headers
+    for ln in body:
+        out.append(ln)
+        if ln[:1] in " +-" and not ln.endswith("\n"):       # last line of a file that has no trailing newline
+            out.append("\n" + _NO_EOL)
+    text = "".join(out)
+    return text if text.endswith("\n") else text + "\n"
+
+
+def join_diffs(chunks: Sequence[str]) -> str:
+    """Concatenate per-file diffs into one patch (each chunk already ends in a newline; no separators added)."""
+    return "".join(c if c.endswith("\n") else c + "\n" for c in chunks if c)
 
 
 def diff_stats(diff: str) -> Tuple[int, int]:
+    """(added, removed) counted inside hunks only, so a changed line that starts with '--' or '++' is not mistaken for a header."""
     added = removed = 0
+    in_hunk = False
     for l in diff.split("\n"):
-        if l.startswith("+") and not l.startswith("+++"):
-            added += 1
-        elif l.startswith("-") and not l.startswith("---"):
-            removed += 1
+        if l.startswith("diff --git "):
+            in_hunk = False
+        elif l.startswith("@@"):
+            in_hunk = True
+        elif in_hunk:
+            if l.startswith("+"):
+                added += 1
+            elif l.startswith("-"):
+                removed += 1
     return added, removed

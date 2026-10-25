@@ -21,8 +21,9 @@ from services.sandbox_warmer import SandboxWarmer, is_requirements_path, request
 from services.intent_router import COMMANDS_HELP, route_intent
 from services.web_search_service import split_web_prefix
 from models.schemas import GENERAL_REPO_ID
-from services.patch_service import make_diff
+from services.patch_service import join_diffs, make_diff
 from services.apply_service import apply_revision as apply_revision_to_disk
+from services.apply_service import disk_conflicts
 from services.model_calls import model_scope
 
 class EngineController:
@@ -414,14 +415,47 @@ class EngineController:
     async def list_revisions(self, repo_id: str) -> list:
         return await self.repo_store.list_revisions(repo_id)
 
-    async def revision_diff(self, repo_id: str, rev: int) -> Optional[str]:
+    async def revision_diff(self, repo_id: str, rev: int, from_disk: bool = False) -> Optional[str]:
+        """Patch for `git apply`. Default: what this revision changed relative to the revision it was built on.
+        from_disk=True: cumulative, ingest snapshot (what is on disk) -> this revision, so it applies to the untouched
+        repo even when earlier revisions were never applied."""
         if rev < 1 or not await self.repo_store.get_revision(repo_id, rev):
             return None
+        if from_disk:
+            base_idx = await self.repo_store.index(repo_id, 0)
+            view_idx = await self.repo_store.index(repo_id, rev)
+            chunks = []
+            for p in sorted(set(base_idx) | set(view_idx)):
+                if base_idx.get(p) == view_idx.get(p):
+                    continue
+                before = await self.repo_store.get_file(repo_id, p, 0)
+                after = await self.repo_store.get_file(repo_id, p, rev)
+                chunks.append(make_diff(p, before.data if before else None, after.data if after else None))
+            return join_diffs(chunks)
         changed = await self.repo_store.changed_files(repo_id, rev)
-        return "\n".join(make_diff(p, b, a) for p, (b, a) in changed.items())
+        return join_diffs([make_diff(p, b, a) for p, (b, a) in changed.items()])
+
+    async def revision_patch(self, repo_id: str, rev: int, from_disk: bool = True) -> Optional[Tuple[str, List[dict]]]:
+        """(patch text, conflicts) for a `git apply` download. Default is cumulative against the repo as the engine last saw it
+        (the same base the Apply button uses), because that is what a working tree matches; conflicts lists files that changed
+        on disk since, whose hunks git will reject. They are also written as `#` lines before the first file diff, which git
+        and patch ignore."""
+        diff = await self.revision_diff(repo_id, rev, from_disk)
+        if diff is None:
+            return None
+        conflicts: List[dict] = []
+        repo = await self.db.get_repo(repo_id)
+        if from_disk and repo:
+            conflicts = await disk_conflicts(self.repo_store, repo_id, rev, Path(repo.root_path))
+        if conflicts:
+            head = ["# WARNING: these files differ on disk from the snapshot this revision was built on, so git will reject their hunks.",
+                    "# Re-ingest the repo and redo the change, or Apply with force from the app:"]
+            head += [f"#   {c['path']}: {c['reason']}" for c in conflicts]
+            diff = "\n".join(head) + "\n" + diff
+        return diff, conflicts
 
     async def revision_zip(self, repo_id: str, rev: int) -> Optional[bytes]:
-        diff = await self.revision_diff(repo_id, rev)
+        diff = await self.revision_diff(repo_id, rev, from_disk=True)
         if diff is None:
             return None
         return await self.repo_store.export_zip(repo_id, rev, extra={"changes.diff": diff.encode("utf-8")})

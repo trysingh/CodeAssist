@@ -13,10 +13,6 @@ from bs4 import BeautifulSoup, Tag
 from goose3 import Goose
 from newspaper import Article
 from readability import Document
-
-# from config import get_settings
-cfg = get_settings()
-
 from config.settings import settings as cfg
 
 

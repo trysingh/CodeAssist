@@ -1,5 +1,5 @@
 const Render = {
-    escapeHtml: function(s) {
+    escapeHtml: function (s) {
         return String(s == null ? "" : s)
             .replace(/&/g, "&amp;")
             .replace(/</g, "&lt;")
@@ -7,7 +7,7 @@ const Render = {
             .replace(/"/g, "&quot;")
             .replace(/'/g, "&#39;");
     },
-    formatInline: function(s) {
+    formatInline: function (s) {
         let cleaned = s
             .replace(/\$?\\rightarrow\$?/g, "→")
             .replace(/\$?\\leftarrow\$?/g, "←")
@@ -15,13 +15,13 @@ const Render = {
         return cleaned
             // 1. Markdown Links [text](url)
             .replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, '<a href="$2" class="text-blue-400 hover:underline inline-flex items-center gap-1" target="_blank" rel="noopener noreferrer">$1</a>')
-            .replace(/`([^`\n]+)`/g, "<code class='bg-slate-950 text-emerald-300 px-1.5 py-0.5 rounded font-mono text-xs border border-slate-800'>$1</code>")
-            .replace(/\*\*\*([^*\n]+)\*\*\*/g, "<strong class='text-white font-semibold'><em>$1</em></strong>")
-            .replace(/\*\*([^*\n]+)\*\*/g, "<strong class='text-white font-semibold'>$1</strong>")
-            .replace(/__([^_\n]+)__/g, "<strong class='text-white font-semibold'>$1</strong>")
+            .replace(/`([^`\n]+)`/g, "<code class='bg-slate-100 text-emerald-700 dark:bg-slate-950 dark:text-emerald-300 px-1.5 py-0.5 rounded font-mono text-xs border border-slate-300 dark:border-slate-800'>$1</code>")
+            .replace(/\*\*\*([^*\n]+)\*\*\*/g, "<strong class='text-slate-900 dark:text-white font-semibold'><em>$1</em></strong>")
+            .replace(/\*\*([^*\n]+)\*\*/g, "<strong class='text-slate-900 dark:text-white font-semibold'>$1</strong>")
+            .replace(/__([^_\n]+)__/g, "<strong class='text-slate-900 dark:text-white font-semibold'>$1</strong>")
             .replace(/(^|[\s(])\*([^*\n]+)\*(?=[\s.,!?:;)]|$)/g, "$1<em>$2</em>");
     },
-    renderBlock: function(raw) {
+    renderBlock: function (raw) {
         let normalized = String(raw == null ? "" : raw)
             .replace(/\r\n/g, "\n")
             .replace(/([^\n])\s+(#{1,6}\s+)/g, "$1\n$2")
@@ -38,10 +38,10 @@ const Render = {
                 if (/^\s*\|[\s\-:|]+\|\s*$/.test(line)) continue;
                 const cells = line.trim().slice(1, -1).split("|").map(c => this.formatInline(c.trim()));
                 if (!inTable) {
-                    out.push("<div class='overflow-x-auto'><table class='w-full text-left border-collapse my-3 text-xs border border-slate-700'><thead><tr class='bg-slate-900 border-b border-slate-700'>" + cells.map(c => "<th class='p-2 font-semibold text-slate-200'>" + c + "</th>").join("") + "</tr></thead><tbody>");
+                    out.push("<div class='overflow-x-auto'><table class='w-full text-left border-collapse my-3 text-xs border border-slate-300 dark:border-slate-700'><thead><tr class='bg-slate-100 dark:bg-slate-900 border-b border-slate-300 dark:border-slate-700'>" + cells.map(c => "<th class='p-2 font-semibold text-slate-700 dark:text-slate-200'>" + c + "</th>").join("") + "</tr></thead><tbody>");
                     inTable = true;
                 } else {
-                    out.push("<tr class='border-b border-slate-800'>" + cells.map(c => "<td class='p-2 text-slate-300'>" + c + "</td>").join("") + "</tr>");
+                    out.push("<tr class='border-b border-slate-200 dark:border-slate-800'>" + cells.map(c => "<td class='p-2 text-slate-600 dark:text-slate-300'>" + c + "</td>").join("") + "</tr>");
                 }
                 continue;
             } else if (inTable) {
@@ -52,12 +52,12 @@ const Render = {
             const h = line.match(/^(&gt;\s*)?(#{1,6})\s+(.*)$/);
             if (h) {
                 const lvl = Math.min(h[2].length + 1, 6);
-                out.push(`<h${lvl} class="font-bold text-white mt-4 mb-1.5 text-base">${this.formatInline(h[3])}</h${lvl}>`);
+                out.push(`<h${lvl} class="font-bold text-slate-900 dark:text-white mt-4 mb-1.5 text-base">${this.formatInline(h[3])}</h${lvl}>`);
                 continue;
             }
 
             if (/^\s*([-*_]){3,}\s*$/.test(line)) {
-                out.push("<hr class='border-slate-700 my-3'>");
+                out.push("<hr class='border-slate-300 dark:border-slate-700 my-3'>");
                 continue;
             }
 
@@ -78,15 +78,15 @@ const Render = {
         if (inTable) out.push("</tbody></table></div>");
         return out.join("");
     },
-    renderMarkdown: function(text) {
+    renderMarkdown: function (text) {
         return String(text == null ? "" : text).split("```").map((part, i) => {
             if (i % 2 === 0) return this.renderBlock(part);
             const lang = (part.match(/^([^\n]*)\n/) || [, ""])[1].trim();
             const cleaned = part.replace(/^[^\n]*\n/, "").replace(/\n$/, "");
-            return "<div class='codeblock my-3 rounded-xl border border-slate-300 bg-slate-100 overflow-hidden'>" +
-                "<div class='flex items-center justify-between px-3 py-1.5 bg-slate-200/80 border-b border-slate-300 text-[11px] text-slate-600 font-mono'><span>" + this.escapeHtml(lang || "code") + "</span>" +
-                "<button type='button' data-copy='code' class='hover:text-slate-900'><span>Copy</span></button></div>" +
-                "<pre class='p-3.5 font-mono text-xs overflow-x-auto text-slate-800'><code>" + this.escapeHtml(cleaned) + "</code></pre></div>";
+            return "<div class='codeblock my-3 rounded-xl border border-slate-300 dark:border-slate-700 bg-slate-100 dark:bg-slate-950 overflow-hidden'>" +
+                "<div class='flex items-center justify-between px-3 py-1.5 bg-slate-200/80 dark:bg-slate-900/80 border-b border-slate-300 dark:border-slate-800 text-[11px] text-slate-600 dark:text-slate-400 font-mono'><span>" + this.escapeHtml(lang || "code") + "</span>" +
+                "<button type='button' data-copy='code' class='hover:text-slate-900 dark:hover:text-white'><span>Copy</span></button></div>" +
+                "<pre class='p-3.5 font-mono text-xs overflow-x-auto text-slate-800 dark:text-slate-200'><code>" + this.escapeHtml(cleaned) + "</code></pre></div>";
         }).join("");
     }
 };
@@ -109,6 +109,8 @@ const GENERAL_SUGGESTIONS = ['What is new in the latest FastAPI release?', 'Comp
 const SUGGESTIONS = ['Give me an architecture overview', 'Where is the main entry point?', 'Which modules have the most dependencies?', 'Spot risky or untested code paths'];
 
 document.addEventListener('DOMContentLoaded', async () => {
+    const theme = LS.get('theme', 'dark');
+    document.documentElement.classList.toggle('dark', theme === 'dark');
     icons();
     const panel = $('thread-panel');
     panel.dataset.open = String(isMobile() ? false : LS.get('threads', true));
@@ -174,6 +176,11 @@ function toggleThreads() {
 }
 function toggleFocus() { document.body.classList.toggle('focus'); }
 
+function toggleTheme() {
+    const isDark = document.documentElement.classList.toggle('dark');
+    LS.set('theme', isDark ? 'dark' : 'light');
+}
+
 document.addEventListener('keydown', e => {
     const typing = /INPUT|TEXTAREA|SELECT/.test(document.activeElement?.tagName || '');
     if (e.altKey && !e.ctrlKey && !e.metaKey) {
@@ -196,8 +203,8 @@ function showToast(title, message, type = 'info') {
     if (!container) return;
     const bar = { success: 'bg-emerald-500', error: 'bg-red-500', warning: 'bg-amber-500' }[type] || 'bg-blue-500';
     const toast = document.createElement('div');
-    toast.className = 'pointer-events-auto flex rounded-xl border border-slate-700 shadow-2xl bg-slate-800 text-white overflow-hidden cursor-pointer';
-    toast.innerHTML = `<span class="w-1 ${bar} shrink-0"></span><div class="flex-1 px-3.5 py-3"><h5 class="text-xs font-semibold">${esc(title)}</h5><p class="text-[11px] text-slate-300 mt-0.5 break-words">${esc(message)}</p></div>`;
+    toast.className = 'pointer-events-auto flex rounded-xl border border-slate-300 dark:border-slate-700 shadow-2xl bg-white dark:bg-slate-800 text-slate-900 dark:text-white overflow-hidden cursor-pointer';
+    toast.innerHTML = `<span class="w-1 ${bar} shrink-0"></span><div class="flex-1 px-3.5 py-3"><h5 class="text-xs font-semibold">${esc(title)}</h5><p class="text-[11px] text-slate-600 dark:text-slate-300 mt-0.5 break-words">${esc(message)}</p></div>`;
     toast.onclick = () => toast.remove();
     container.appendChild(toast);
     setTimeout(() => toast.remove(), 4500);
@@ -267,7 +274,7 @@ function telemetryLine(ev) {
     const level = String(ev.level || 'info').toLowerCase();
     const colour = { error: 'text-red-400', warning: 'text-amber-400', success: 'text-emerald-400' }[level] || 'text-blue-300';
     const line = document.createElement('div');
-    line.className = `${colour} border-b border-slate-900 pb-1`;
+    line.className = `${colour} border-b border-slate-200 dark:border-slate-900 pb-1`;
     line.textContent = `${fmtTs(ev.ts)}  [${ev.level}] ${ev.scope === 'repo' ? '(repo) ' : ''}${ev.title} — ${prettyMessage(ev)}`;
     return line;
 }
@@ -335,6 +342,14 @@ function setupNotificationStream() {
 function clearConsole() { $('telemetry-console').innerHTML = ''; }
 function copyConsole() { copyText($('telemetry-console').innerText).then(() => showToast('Copied', 'Telemetry log copied to clipboard.', 'success')); }
 
+function openTelemetryLegend() {
+    $('telemetry-legend-modal').classList.remove('hidden');
+    icons();
+}
+function closeTelemetryLegend() {
+    $('telemetry-legend-modal').classList.add('hidden');
+}
+
 function copyText(text) {
     if (navigator.clipboard && window.isSecureContext) return navigator.clipboard.writeText(text);
     const ta = document.createElement('textarea');
@@ -361,7 +376,7 @@ document.addEventListener('click', e => {
 let ingestTimer = null;
 function renderRecentPaths() {
     const paths = LS.get('recent', []);
-    $('recent-paths').innerHTML = paths.map(p => `<button type="button" data-path="${esc(p)}" class="text-[11px] font-mono text-slate-400 hover:text-white bg-slate-900 border border-slate-800 hover:border-slate-600 rounded-lg px-2.5 py-1 max-w-full truncate" title="${esc(p)}">${esc(p)}</button>`).join('');
+    $('recent-paths').innerHTML = paths.map(p => `<button type="button" data-path="${esc(p)}" class="text-[11px] font-mono text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white bg-slate-100 dark:bg-slate-900 border border-slate-300 dark:border-slate-800 hover:border-slate-400 dark:hover:border-slate-600 rounded-lg px-2.5 py-1 max-w-full truncate" title="${esc(p)}">${esc(p)}</button>`).join('');
 }
 document.addEventListener('click', e => {
     const b = e.target.closest('[data-path]');
@@ -401,8 +416,8 @@ const DONE = /complete|ready|done|ingested|success/i, FAILED = /fail|error/i;
 function statusChip(status) {
     const s = String(status || 'unknown');
     const cls = DONE.test(s) ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20'
-              : FAILED.test(s) ? 'bg-red-500/10 text-red-400 border-red-500/20'
-              : 'bg-amber-500/10 text-amber-400 border-amber-500/20 animate-pulse';
+        : FAILED.test(s) ? 'bg-red-500/10 text-red-400 border-red-500/20'
+            : 'bg-amber-500/10 text-amber-400 border-amber-500/20 animate-pulse';
     return `<span class="px-2 py-1 rounded-full text-[10px] border ${cls}">${esc(s)}</span>`;
 }
 
@@ -411,13 +426,13 @@ function renderRepos() {
     const rows = S.repos.filter(r => `${r.repo_id} ${r.title} ${r.root_path}`.toLowerCase().includes(q));
     $('repo-table-body').innerHTML = rows.length ? rows.map(r => {
         const pct = r.total_files ? Math.round((r.processed_files / r.total_files) * 100) : 0;
-        return `<tr class="hover:bg-slate-900/40">
-            <td class="py-3.5 px-5 font-mono text-xs"><span class="text-blue-400 font-semibold">${esc(r.repo_id)}</span><br><span class="text-slate-400">${esc(r.title)}</span></td>
+        return `<tr class="hover:bg-slate-100 dark:hover:bg-slate-900/40">
+            <td class="py-3.5 px-5 font-mono text-xs"><span class="text-blue-600 dark:text-blue-400 font-semibold">${esc(r.repo_id)}</span><br><span class="text-slate-500 dark:text-slate-400">${esc(r.title)}</span></td>
             <td class="py-3.5 px-5">${statusChip(r.status)}</td>
-            <td class="py-3.5 px-5 font-mono text-xs"><div>${esc(r.processed_files)}/${esc(r.total_files)}</div><div class="w-20 h-1 bg-slate-800 rounded-full mt-1.5"><div class="h-1 bg-blue-500 rounded-full" style="width:${pct}%"></div></div></td>
-            <td class="py-3.5 px-5 font-mono text-xs text-blue-400 font-semibold">${esc(r.total_chunks)}</td>
-            <td class="py-3.5 px-5 font-mono text-xs text-slate-400 truncate max-w-xs" title="${esc(r.root_path)}">${esc(r.root_path)}</td>
-            <td class="py-3.5 px-5 text-right"><button data-chat-repo="${esc(r.repo_id)}" class="bg-blue-600/20 hover:bg-blue-600/30 text-blue-400 border border-blue-500/30 px-3 py-1.5 rounded-lg text-xs">Open chat</button></td>
+            <td class="py-3.5 px-5 font-mono text-xs"><div>${esc(r.processed_files)}/${esc(r.total_files)}</div><div class="w-20 h-1 bg-slate-200 dark:bg-slate-800 rounded-full mt-1.5"><div class="h-1 bg-blue-500 rounded-full" style="width:${pct}%"></div></div></td>
+            <td class="py-3.5 px-5 font-mono text-xs text-blue-600 dark:text-blue-400 font-semibold">${esc(r.total_chunks)}</td>
+            <td class="py-3.5 px-5 font-mono text-xs text-slate-500 dark:text-slate-400 truncate max-w-xs" title="${esc(r.root_path)}">${esc(r.root_path)}</td>
+            <td class="py-3.5 px-5 text-right"><button data-chat-repo="${esc(r.repo_id)}" class="bg-blue-600/20 hover:bg-blue-600/30 text-blue-600 dark:text-blue-400 border border-blue-500/30 px-3 py-1.5 rounded-lg text-xs">Open chat</button></td>
             <td class="py-3 px-4 text-right">
                 <button data-reset-repo="${esc(r.repo_id)}" 
                         class="text-xs bg-red-900/30 hover:bg-red-900/50 text-red-400 border border-red-800/50 px-2 py-1 rounded transition-colors">
@@ -430,16 +445,16 @@ function renderRepos() {
 
 async function resetRepoIndex(repoId) {
     if (!confirm(`Are you sure you want to reset the index for ${repoId}? This will permanently delete all search indexes and chunks for this repository.`)) return;
-    
+
     try {
         const res = await fetch(`/api/v1/repos/${encodeURIComponent(repoId)}/reset-index`, { method: 'POST' });
         if (!res.ok) throw new Error(`Server returned ${res.status}`);
-        
+
         // Assuming showToast is a global function in your app.js
         showToast("Index reset", `Successfully reset index for ${repoId}`, "success");
-        
+
         // Refresh the list to show updated status
-        await loadRepositories(); 
+        await loadRepositories();
     } catch (err) {
         showToast("Reset failed", err.message, "error");
     }
@@ -492,11 +507,29 @@ function quickChat(repoId) {
 function renderThreads(threads) {
     const list = $('thread-list');
     list.innerHTML = threads.length ? threads.map(t =>
-        `<div id="thread_btn_${esc(t.thread_id)}" data-thread="${esc(t.thread_id)}" data-title="${esc(t.title)}" title="${esc(t.title)}"  role="button" tabindex="0" class="thread-item px-2.5 py-2 rounded-lg cursor-pointer hover:bg-slate-800 text-xs text-slate-300 flex items-center gap-2 transition-colors">
-            <i data-lucide="message-square" class="w-3.5 h-3.5 text-blue-400 shrink-0"></i><span class="truncate">${esc(t.title)}</span><button type="button" data-del="${esc(t.thread_id)}" title="Delete chat" aria-label="Delete chat" class="ml-auto p-1 shrink-0 text-slate-500 hover:text-red-400"><i data-lucide="trash-2" class="w-3.5 h-3.5"></i></button></div>`).join('')
+        `<div id="thread_btn_${esc(t.thread_id)}" data-thread="${esc(t.thread_id)}" data-title="${esc(t.title)}" data-tip="${esc(t.title)}"  role="button" tabindex="0" class="thread-item px-2.5 py-2 rounded-lg cursor-pointer hover:bg-slate-200 dark:hover:bg-slate-800 text-xs text-slate-600 dark:text-slate-300 flex items-center gap-2 transition-colors">
+            <i data-lucide="message-square" class="w-3.5 h-3.5 text-blue-600 dark:text-blue-400 shrink-0"></i><span class="truncate">${esc(t.title)}</span><button type="button" data-del="${esc(t.thread_id)}" title="Delete chat" aria-label="Delete chat" class="ml-auto p-1 shrink-0 text-slate-400 dark:text-slate-500 hover:text-red-500 dark:hover:text-red-400"><i data-lucide="trash-2" class="w-3.5 h-3.5"></i></button></div>`).join('')
         : '<div class="text-xs text-slate-500 text-center py-6">Select a repository to see its threads</div>';
     icons();
 }
+
+/* Thread title tooltip */
+const threadTip = document.body.appendChild(Object.assign(document.createElement('div'), { id: 'thread-tip' }));
+const hideThreadTip = () => { threadTip.style.display = 'none'; };
+
+document.addEventListener('mouseover', e => {
+    const item = e.target.closest('.thread-item');
+    if (!item) return hideThreadTip();
+    const label = item.querySelector('span.truncate');
+    if (!label || label.scrollWidth <= label.clientWidth) return hideThreadTip(); // show only if truncated
+    const r = item.getBoundingClientRect();
+    threadTip.textContent = item.dataset.tip;
+    threadTip.style.left = `${r.right + 8}px`;
+    threadTip.style.top = `${r.top + r.height / 2}px`;
+    threadTip.style.display = 'block';
+});
+document.addEventListener('scroll', hideThreadTip, true); // capture: catches #thread-list scroll
+
 document.addEventListener('click', e => {
     const d = e.target.closest('[data-del]');
     if (d) return deleteThread(d.dataset.del);
@@ -587,9 +620,9 @@ function msgHtml(role, content, meta = '', atts = []) {
     return `<div class="flex gap-3 group scroll-mt-4">
         <div class="w-7 h-7 mt-0.5 rounded-lg bg-blue-600/15 border border-blue-500/25 flex items-center justify-center text-blue-400 shrink-0"><i data-lucide="bot" class="w-4 h-4"></i></div>
         <div class="min-w-0 flex-1" data-raw="${esc(content)}">
-            <div class="text-sm text-slate-200 leading-relaxed break-words">${Render.renderMarkdown(content)}</div>
+            <div class="text-sm text-slate-700 dark:text-slate-200 leading-relaxed break-words">${Render.renderMarkdown(content)}</div>
             <div class="mt-1 flex items-center gap-3 text-[11px] text-slate-500 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity">
-                <button data-copy="msg" class="hover:text-slate-200 flex items-center gap-1"><i data-lucide="copy" class="w-3 h-3"></i><span>Copy</span></button>${meta}
+                <button data-copy="msg" class="hover:text-slate-900 dark:hover:text-slate-200 flex items-center gap-1"><i data-lucide="copy" class="w-3 h-3"></i><span>Copy</span></button>${meta}
             </div>
         </div></div>`;
 }
@@ -599,14 +632,14 @@ function showEmpty(kind, title = '') {
     if (kind === 'thread') {
         col.innerHTML = `<div data-welcome class="pt-[12vh] text-center space-y-5">
             <div class="mx-auto w-11 h-11 rounded-xl bg-blue-600/15 border border-blue-500/25 flex items-center justify-center text-blue-400"><i data-lucide="sparkles" class="w-5 h-5"></i></div>
-            <div><h3 class="text-lg font-semibold text-white">Ask about ${esc(title)}</h3><p class="text-sm text-slate-400 mt-1">${S.repoId === GENERAL ? 'General questions. The web is searched when needed (see the Web chip below).' : 'Answers are grounded in the ingested chunks of this repository.'}</p></div>
-            <div class="flex flex-wrap justify-center gap-2">${(S.repoId === GENERAL ? GENERAL_SUGGESTIONS : SUGGESTIONS).map(s => `<button type="button" data-suggest class="text-xs text-slate-300 bg-slate-900 hover:bg-slate-800 border border-slate-700 rounded-full px-3.5 py-2 transition-colors">${esc(s)}</button>`).join('')}</div></div>`;
+            <div><h3 class="text-lg font-semibold text-slate-900 dark:text-white">Ask about ${esc(title)}</h3><p class="text-sm text-slate-500 dark:text-slate-400 mt-1">${S.repoId === GENERAL ? 'General questions. The web is searched when needed (see the Web chip below).' : 'Answers are grounded in the ingested chunks of this repository.'}</p></div>
+            <div class="flex flex-wrap justify-center gap-2">${(S.repoId === GENERAL ? GENERAL_SUGGESTIONS : SUGGESTIONS).map(s => `<button type="button" data-suggest class="text-xs text-slate-600 dark:text-slate-300 bg-slate-100 dark:bg-slate-900 hover:bg-slate-200 dark:hover:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-full px-3.5 py-2 transition-colors">${esc(s)}</button>`).join('')}</div></div>`;
     } else {
         const none = kind === 'none';
         col.innerHTML = `<div data-welcome class="pt-[14vh] text-center space-y-4">
-            <div class="mx-auto w-11 h-11 rounded-xl bg-slate-800 border border-slate-700 flex items-center justify-center text-slate-400"><i data-lucide="${none ? 'folder-git-2' : 'database'}" class="w-5 h-5"></i></div>
-            <div><h3 class="text-lg font-semibold text-white">${none ? 'No repositories yet' : 'Choose a repository'}</h3>
-            <p class="text-sm text-slate-400 mt-1">${none ? 'Ingest a codebase to start asking questions about it.' : 'Pick one from the selector above to load its threads.'}</p></div>
+            <div class="mx-auto w-11 h-11 rounded-xl bg-slate-200 dark:bg-slate-800 border border-slate-300 dark:border-slate-700 flex items-center justify-center text-slate-500 dark:text-slate-400"><i data-lucide="${none ? 'folder-git-2' : 'database'}" class="w-5 h-5"></i></div>
+            <div><h3 class="text-lg font-semibold text-slate-900 dark:text-white">${none ? 'No repositories yet' : 'Choose a repository'}</h3>
+            <p class="text-sm text-slate-500 dark:text-slate-400 mt-1">${none ? 'Ingest a codebase to start asking questions about it.' : 'Pick one from the selector above to load its threads.'}</p></div>
             ${none ? '<button onclick="switchTab(\'ingest\')" class="bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium px-5 py-2.5 rounded-xl">Ingest a repository</button>' : ''}</div>`;
     }
     icons();
@@ -721,8 +754,8 @@ function renderAttachStrip() {
     strip.classList.toggle('flex', !!S.files.length);
     strip.innerHTML = S.files.map((f, i) => {
         if (isImg(f)) f._url = f._url || URL.createObjectURL(f);
-        const thumb = isImg(f) ? `<img src="${f._url}" alt="" class="w-8 h-8 rounded object-cover">` : `<i data-lucide="file-text" class="w-4 h-4 text-slate-400 mx-1"></i>`;
-        return `<div class="flex items-center gap-2 bg-slate-800 border border-slate-700 rounded-lg pl-1 pr-1.5 py-1 text-xs text-slate-300 max-w-[220px]">${thumb}<span class="truncate">${esc(f.name)}</span><button type="button" data-rm-file="${i}" class="text-slate-500 hover:text-white px-1" aria-label="Remove ${esc(f.name)}">✕</button></div>`;
+        const thumb = isImg(f) ? `<img src="${f._url}" alt="" class="w-8 h-8 rounded object-cover">` : `<i data-lucide="file-text" class="w-4 h-4 text-slate-400 dark:text-slate-500 mx-1"></i>`;
+        return `<div class="flex items-center gap-2 bg-slate-100 dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-lg pl-1 pr-1.5 py-1 text-xs text-slate-600 dark:text-slate-300 max-w-[220px]">${thumb}<span class="truncate">${esc(f.name)}</span><button type="button" data-rm-file="${i}" class="text-slate-400 dark:text-slate-500 hover:text-slate-900 dark:hover:text-white px-1" aria-label="Remove ${esc(f.name)}">✕</button></div>`;
     }).join('');
     icons();
 }
@@ -772,7 +805,7 @@ async function sendChatMessage(e) {
         let res;
         if (files.length) {
             const fd = new FormData();
-            fd.append('repo_id', S.repoId); fd.append('thread_id', S.threadId); fd.append('query', query); fd.append('web', S.web); fd.append('model', S.model); 
+            fd.append('repo_id', S.repoId); fd.append('thread_id', S.threadId); fd.append('query', query); fd.append('web', S.web); fd.append('model', S.model);
             files.forEach(f => fd.append('files', f, f.name));
             res = await fetch('/api/v1/chat/attach', { method: 'POST', body: fd });
         } else {
@@ -824,22 +857,40 @@ document.addEventListener('click', async e => {
     if (a.dataset.busy) return;
     a.dataset.busy = '1';
     const label = a.textContent;
-    const post = async (force) => {
-        const r = await fetch(a.getAttribute('href') + (force ? '?force=true' : ''), { method: 'POST' });
-        return { ok: r.ok, status: r.status, body: await r.json().catch(() => ({})) };
-    };
     try {
+        const post = async (force) => {
+            const headers = phrase ? { 'X-Confirm-Phrase': phrase } : {};
+            const r = await fetch(a.getAttribute('href') + (force ? '?force=true' : ''), { method: 'POST', headers });
+            return { ok: r.ok, status: r.status, body: await r.json().catch(() => ({})) };
+        };
+        // try {
         a.textContent = 'Applying...';
+        let phrase = '';
         let res = await post(false);
+        console.log('Apply response:', res);
+        if (res.status === 428) {                       // server wants the phrase: ask once, reuse it
+            phrase = prompt('Enter the confirmation phrase to apply to the repo:');
+            if (phrase === null) { a.textContent = label; return; }
+            res = await post(false, phrase);
+        }
         if (res.status === 409 && (res.body.conflicts || []).length) {
             const names = res.body.conflicts.map(c => c.path).join('\n');
             if (confirm('These files changed on disk since ingest:\n' + names + '\n\nOverwrite them anyway?')) res = await post(true);
             else { a.textContent = label; return; }
         }
-        a.textContent = res.ok ? `Applied (${res.body.written.length + res.body.deleted.length} file(s))`
-                               : 'Apply failed: ' + (res.body.detail || res.body.note || res.status);
+        // a.textContent = res.ok ? `Applied (${res.body.written.length + res.body.deleted.length} file(s))`
+        //                        : 'Apply failed: ' + (res.body.detail || res.body.note || res.status);
+        if (res.ok) {
+            a.textContent = `Applied ${res.body.count || 0} files`;
+            showToast('Success', `Successfully applied changes to the repository.`, 'success');
+        } else {
+            const errorMsg = res.body.detail || res.body.note || `Error code: ${res.status}`;
+            a.textContent = 'Apply failed';
+            showToast('Apply Failed', errorMsg, 'error');
+        }
     } catch (err) {
         a.textContent = 'Apply failed';
+        showToast('Apply Failed', err.message, 'error');
     } finally {
         delete a.dataset.busy;
     }

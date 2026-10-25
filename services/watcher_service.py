@@ -1,4 +1,4 @@
-import time
+import threading
 from pathlib import Path
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
@@ -6,10 +6,13 @@ from services.notifier import notifier
 import asyncio
 
 class RepoChangeHandler(FileSystemEventHandler):
+    DEBOUNCE_S = 1.5
+
     def __init__(self, repo_id: str, root_path: Path):
         self.repo_id = repo_id
         self.root_path = root_path
-        self._last_processed = 0
+        self._timers = {}                       # path -> pending debounce timer
+        self._lock = threading.Lock()
 
     def on_modified(self, event):
         if event.is_directory:
@@ -31,14 +34,26 @@ class RepoChangeHandler(FileSystemEventHandler):
         if controller.is_excluded(fpath, self.root_path):
             return
 
-        now = time.time()
-        if now - self._last_processed < 1.5:
-            return
-        self._last_processed = now
+        # Debounce PER FILE, trailing edge: re-index a file 1.5 s after its LAST event. A single shared timer silently dropped
+        # every file but the first when several were written together (git apply, copying a folder, a formatter run), which left
+        # the stored snapshot stale and made later patches fail against it; it also re-indexed half-written saves.
+        key = str(fpath)
+        with self._lock:
+            pending = self._timers.pop(key, None)
+            if pending:
+                pending.cancel()
+            timer = threading.Timer(self.DEBOUNCE_S, self._reingest, args=(fpath,))
+            timer.daemon = True
+            self._timers[key] = timer
+            timer.start()
 
+    def _reingest(self, fpath: Path):
+        with self._lock:
+            self._timers.pop(str(fpath), None)
         try:
             rel_path = str(fpath.relative_to(self.root_path))
-            asyncio.run(controller.incremental_reingest_file(self.repo_id, self.root_path, rel_path))
+            from controllers.engine_controller import EngineController
+            asyncio.run(EngineController().incremental_reingest_file(self.repo_id, self.root_path, rel_path))
         except Exception as exc:
             notifier.notify("Incremental Ingestion Error", f"Failed to refresh {fpath.name}: {exc}", level="ERROR", repo_id=self.repo_id)
 

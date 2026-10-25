@@ -31,6 +31,30 @@ def _target(root: Path, rel: str) -> Path:
     return t
 
 
+async def disk_conflicts(store: RepoStore, repo_id: str, rev: int, root: Path) -> List[dict]:
+    """The conflicts apply_revision would report, without writing anything: files the revision changes whose bytes on disk
+    no longer match the snapshot the revision was built from. `git apply` of a cumulative patch fails on exactly these."""
+    root = Path(root).resolve()
+    if not root.is_dir():
+        return [{"path": str(root), "reason": "repo root not found on disk"}]
+    base_idx = await store.index(repo_id, 0)
+    view_idx = await store.index(repo_id, rev)
+    out: List[dict] = []
+    for p in sorted(set(base_idx) | set(view_idx)):
+        if base_idx.get(p) == view_idx.get(p):
+            continue
+        rel = safe_rel_path(p)
+        t = _target(root, rel)
+        disk = t.read_bytes() if t.is_file() else None
+        if disk is None and rel in base_idx:
+            out.append({"path": rel, "reason": "file was deleted on disk since ingest"})
+        elif disk is not None and rel not in base_idx:
+            out.append({"path": rel, "reason": "file exists on disk but is not tracked by the engine"})
+        elif disk is not None and _sha(disk) != base_idx.get(rel):
+            out.append({"path": rel, "reason": "file changed on disk since ingest"})
+    return out
+
+
 async def apply_revision(store: RepoStore, repo_id: str, rev: int, root: Path, force: bool = False) -> dict:
     latest = await store.latest_rev(repo_id)
     if rev < 1 or rev > latest:

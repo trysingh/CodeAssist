@@ -75,6 +75,20 @@ class EngineSettings(BaseSettings):
                                                        # they run in the sandbox and must fail on the old code and pass on the new (one extra model call)
     change_author_max_files: int = Field(default=3)    # changed source files shown to the test author
     change_require_fail_to_pass: bool = Field(default=True)  # a generated test that also passes on the OLD code gets one rewrite request
+    change_tests_first: bool = Field(default=True)     # needs change_author_tests: tests are written BEFORE the code, must be red on the old code, and are read-only for the patcher
+    change_contract: bool = Field(default=True)        # design typed signatures first, apply them as in-memory stubs, check them before any body exists
+    change_contract_max_symbols: int = Field(default=15)
+    change_tasks: bool = Field(default=True)           # needs a contract: implement it one symbol at a time (callee first), each with its own small prompt
+    change_task_min: int = Field(default=2)            # fewer tasks than this: the single patch is the fast path
+    change_task_attempts: int = Field(default=2)       # tries per task (first reply + repairs)
+    change_task_tests: bool = Field(default=True)      # per-task unit tests, red on the stub first (needs the sandbox)
+    change_task_num_ctx: int = Field(default=0)        # 0 = change_num_ctx. A smaller value (e.g. 8192) makes task calls cheaper, but Ollama may reload the model whenever num_ctx changes between calls
+    change_review: bool = Field(default=True)          # a fresh-context reviewer checks coverage per requirement and unrequested edits (one round)
+    change_review_max_chars: int = Field(default=24000)  # diff budget for the reviewer
+    designer_model: str = Field(default="")            # per-role models; empty = patcher model. An explicit role model also ignores the user's per-request pick
+    implementer_model: str = Field(default="")
+    reviewer_model: str = Field(default="")
+    tester_model: str = Field(default="")              # test author; empty = patcher model. Set a different model than patcher_model for independent tests
 
     # Sandbox (Phase 2): isolated test runs for proposed changes
     sandbox_enabled: bool = Field(default=True)
@@ -85,6 +99,8 @@ class EngineSettings(BaseSettings):
     sandbox_cpus: str = Field(default="2")
     sandbox_pids: int = Field(default=256)
     sandbox_test_timeout_s: int = Field(default=180)
+    sandbox_all_max_files: int = Field(default=12)      # no test refers to the change and the suite is bigger than this: do not run it all
+                                                        # (it would hit the time cap and prove nothing); 0 = always run everything
     sandbox_build_timeout_s: int = Field(default=1500)
     sandbox_max_workspace_mb: int = Field(default=64)
     sandbox_requirements_files: List[str] = Field(default=["requirements-test.txt", "requirements-dev.txt", "requirements.txt"])
@@ -140,6 +156,9 @@ class EngineSettings(BaseSettings):
         "*.orig", 
         "*.rej"
     ])
+
+    # Keep the phrase ASCII-only,
+    apply_confirmation_phrase: str = Field(default="TYPE_APPLY_TO_CONFIRM")   # env: ENGINE_APPLY_CONFIRMATION_PHRASE; empty = no check
     
     model_config = SettingsConfigDict(env_prefix="ENGINE_", env_file=".env", extra="ignore")
 

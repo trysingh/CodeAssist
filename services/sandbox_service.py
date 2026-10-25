@@ -189,6 +189,14 @@ def _imports(src: str) -> Set[str]:
                 out.add(f"{base}.{a.name}" if base else a.name)
     return out
 
+def closest_tests(tests: Iterable[str], changed: Iterable[str]) -> List[str]:
+    """Narrow a too-big 'affected' set to changed test files and tests named after a changed file
+    (services/contract.py -> tests/test_contract.py)."""
+    changed = list(changed)
+    stems = {c.rsplit("/", 1)[-1].rsplit(".", 1)[0] for c in changed if c.endswith(".py")} - {"__init__"}
+    return sorted(t for t in tests
+                  if t in changed or any(s in t.rsplit("/", 1)[-1] for s in stems))
+
 
 def select_tests(tree: Dict[str, bytes], changed: Iterable[str]) -> Tuple[List[str], str]:
     """-> (test file paths, strategy). strategy: affected | all | none."""
@@ -261,6 +269,21 @@ def pytest_argv(paths: Sequence[str]) -> List[str]:
 def _trim(s: str, n: int) -> str:
     s = (s or "").strip()
     return s if len(s) <= n else s[:n] + " ..."
+
+
+_PROGRESS = re.compile(r"^[.FEsxX]+(?:\s+\[\s*\d+%\])?\s*$")
+
+
+def pytest_progress(console: str) -> Tuple[int, int]:
+    """(passed, failed) counted from pytest -q's progress characters. A run killed at the time cap writes no JUnit report,
+    but the dots it printed before it died still say how far it got."""
+    ok = bad = 0
+    for ln in (console or "").splitlines():
+        if _PROGRESS.match(ln.strip()):
+            body = ln.strip().split()[0]
+            ok += body.count(".")
+            bad += body.count("F") + body.count("E")
+    return ok, bad
 
 
 def _tail(s: str, n: int) -> str:
@@ -674,6 +697,10 @@ def _unverified(report: RunReport, preexisting: int = 0) -> SandboxVerdict:
     why = report.note
     if not why and report.timed_out:
         why = f"run exceeded {settings.sandbox_test_timeout_s}s"
+        ok, bad = pytest_progress(report.tail)
+        if ok or bad:
+            why += (f" after {ok + bad} test(s) ({ok} passed, {bad} failed so far); raise ENGINE_SANDBOX_TEST_TIMEOUT_S "
+                    f"or run fewer tests")
     if not why and report.failures:
         why = report.failures[0].message
     if not why and report.skipped:
@@ -866,6 +893,26 @@ class SandboxService:
                    "SUCCESS" if failing else "WARNING")
         return out
 
+    async def verify_red(self, repo_id: str, base_rev: int, overlay: Dict[str, bytes], tests: Sequence[str],
+                         label: str = "red-check") -> RunReport:
+        """Run only `tests` on the base tree plus `overlay`: red check (tests + contract stubs) and per-task green check."""
+        none = lambda note: RunReport(mode="none", ran=False, note=note, backend=self.runner.name)
+        if not self.enabled:
+            return none("sandbox disabled")
+        ok, info = await self.runner.available()
+        if not ok:
+            return none(info)
+        tree = {**await self.store.snapshot_bytes(repo_id, base_rev), **overlay}
+        requirements = self._requirements(tree)
+        if self.runner.name == "docker":
+            tag = self.runner.image_tag(requirements)
+            if tag not in self._ready:
+                err = await self.runner.prepare(requirements)
+                if err:
+                    return none(err)
+                self._ready.add(tag)
+        return await self._execute(tree, "pytest", list(tests), [], requirements, repo_id=repo_id, label=label)
+
     async def verify(self, repo_id: str, base_rev: int, working: Dict[str, bytes],
                      new_tests: Sequence[str] = ()) -> SandboxVerdict:
         """Run the proposal. `working` = {path: new bytes} on top of the repo at `base_rev`.
@@ -884,6 +931,18 @@ class SandboxService:
         gen = sorted(p for p in new_tests if p in working)
         src_changed = [c for c in changed if c not in gen] or changed
         selected, strategy = select_tests(tree, src_changed)       # existing tests chosen by what the SOURCE change touches
+        cap = settings.sandbox_all_max_files
+        if strategy == "all" and cap and len(selected) > cap:
+            self._emit(f"No test refers to the changed file(s) and the suite has {len(selected)} test files (limit {cap}), so it is "
+                       f"not run in full: it would hit the {settings.sandbox_test_timeout_s}s cap and prove nothing. "
+                       f"ENGINE_SANDBOX_ALL_MAX_FILES=0 always runs everything", "WARNING")
+            selected, strategy = [], "limited"
+        elif strategy == "affected" and cap and len(selected) > cap:
+            n = len(selected)
+            selected = closest_tests(selected, src_changed)
+            strategy = "narrowed"
+            self._emit(f"{n} test files import the changed file(s) (limit {cap}); running the {len(selected)} closest instead. "
+                        f"ENGINE_SANDBOX_ALL_MAX_FILES=0 runs all {n}", "WARNING")
         if gen:
             selected = sorted(set(selected) | set(gen))
         smoke: List[str] = []
@@ -919,6 +978,14 @@ class SandboxService:
             if gen and mode == "pytest":
                 verdict.proof = await self._prove(repo_id, base_tree, tree, gen, requirements, report)
             return verdict
+
+        if report.timed_out and all(c.kind == "timeout" for c in report.failures):
+            ok, bad = pytest_progress(report.tail)
+            if ok and not bad:
+                # Tests were passing and the cap simply cut the run off (the suite is too big for it): no verdict either way, and
+                # the untouched base would only hit the same cap, so do not wait for a second one. A run that produced NO
+                # progress (a hang at import or in the first test) still goes to the base comparison below.
+                return _unverified(report)
 
         # failures: subtract what was already broken before the change
         key = (repo_id, base_rev, mode, tuple(selected), tuple(smoke), hashlib.sha256(requirements.encode()).hexdigest())

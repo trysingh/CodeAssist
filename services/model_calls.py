@@ -89,9 +89,9 @@ def _build(model: str, *, json_mode: bool, num_predict: Optional[int], num_ctx: 
 
 
 async def ask_text(model: str, prompt: str, *, phase: str = "CHANGE", repo_id: str = "",
-                   num_predict: Optional[int] = None) -> str:
+                   num_predict: Optional[int] = None, num_ctx: Optional[int] = None) -> str:
     llm = _build(model, json_mode=False, num_predict=num_predict or settings.change_max_output_tokens,
-                 num_ctx=settings.change_num_ctx, repo_id=repo_id, phase=phase)
+                 num_ctx=num_ctx or settings.change_num_ctx, repo_id=repo_id, phase=phase)
     resp = await llm.ainvoke(prompt)
     return resp.content if isinstance(resp.content, str) else str(resp.content)
 
