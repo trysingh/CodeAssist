@@ -871,6 +871,13 @@ async function sendChatMessage(e) {
         col.insertAdjacentHTML('beforeend', msgHtml('assistant', result.answer, `<span>${((performance.now() - t0) / 1000).toFixed(1)}s</span>`));
         icons();
         col.lastElementChild.scrollIntoView({ block: 'start' }); // start reading at the top of the answer
+        if (result && result.base_system) {
+            const connLabel = document.getElementById('conn-label');
+            if (connLabel) {
+                connLabel.innerText = `Live (${result.base_system})`;
+            }
+        }
+
     } catch (err) {
         if (err.name === 'AbortError') {
             $(id)?.remove();

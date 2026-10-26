@@ -1,3 +1,4 @@
+import platform
 import asyncio
 import uuid
 import secrets
@@ -117,7 +118,7 @@ async def chat_endpoint(req: ChatRequest):
                 }
             )
         await controller.db.save_chat_message(req.thread_id, "assistant", response)
-        return {"repo_id": req.repo_id, "thread_id": req.thread_id, "answer": response}
+        return {"repo_id": req.repo_id, "thread_id": req.thread_id, "base_system": platform.system(), "answer": response}
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
