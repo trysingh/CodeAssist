@@ -107,13 +107,18 @@ async def _none(*a, **k):
 
 
 class SpyRunner(sbx.LocalRunner):
+    """Records the cap the engine asks for, but enforces a floor: the test checks that the cap is PASSED, not that this host
+    starts pytest within it. A slow host (Windows + antivirus) that overran a 17 s cap would make the red check time out ->
+    tests-first skipped -> the after-the-edit author asks the model once more (a 4th prompt)."""
+    FLOOR_S = 120
+
     def __init__(self):
         super().__init__()
         self.timeouts = []
 
     async def run(self, requirements, tar, argv, timeout):
         self.timeouts.append(timeout)
-        return await super().run(requirements, tar, argv, timeout)
+        return await super().run(requirements, tar, argv, max(timeout, self.FLOOR_S))
 
 
 def go(llm, runner):
@@ -133,6 +138,8 @@ def test_a_test_that_patches_a_missing_name_is_rewritten_before_any_container_ru
     monkeypatch.setattr(settings, "change_task_test_timeout_s", 17)
     llm, runner = Script(T_BAD, T_OK, CODE), SpyRunner()
     res = go(llm, runner)
-    assert res.ok and len(llm.prompts) == 3
+    assert res.ok, res.notes
+    # 4 prompts = the red check did not complete (see SpyRunner), so tests-first was skipped and the author step asked again
+    assert len(llm.prompts) == 3, res.notes
     assert "patch target `calc.helper_that_is_not_there` does not exist" in llm.prompts[1]
     assert runner.timeouts[0] == 17 and len(runner.timeouts) >= 2       # the red check runs with the per-task cap

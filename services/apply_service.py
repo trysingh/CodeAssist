@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import shutil
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -110,6 +111,8 @@ async def apply_revision(store: RepoStore, repo_id: str, rev: int, root: Path, f
                 t.parent.mkdir(parents=True, exist_ok=True)
                 tmp = t.with_name(t.name + ".coderag-tmp")
                 tmp.write_bytes(data)
+                if t.exists():
+                    shutil.copymode(t, tmp)          # keep the executable bit (scripts) on macOS/Linux
                 os.replace(tmp, t)
             done.append(rel)
     except Exception as e:  # noqa: BLE001 — roll back what was already written

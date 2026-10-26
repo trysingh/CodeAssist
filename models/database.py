@@ -1,8 +1,19 @@
-from datetime import datetime
+from datetime import datetime, timezone 
 import aiosqlite
 from typing import List, Dict, Optional, Any
 from config.settings import settings
 from models.schemas import GENERAL_REPO_ID, RepoInfo, JobStatus 
+
+def _utc_now_iso() -> str:
+    """Return an ISO-8601 UTC timestamp compatible with Python 3.10-3.13+."""
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _normalize_path(path_str: str) -> str:
+    """Normalize file paths across Windows, macOS, and Linux to POSIX style."""
+    if not path_str:
+        return ""
+    return str(path_str).replace("\\", "/")
 
 class DatabaseManager:
     """Manages SQLite persistence for repository metadata, job states, and multi-thread chat history."""
@@ -118,9 +129,25 @@ class DatabaseManager:
             """)
             await db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_telemetry_scope_repo ON telemetry_events(scope, repo_id, id)")
+
+            # One-time migration (PRAGMA user_version 0 -> 1): older rows may hold Windows "a\\b.py" paths. Rewrite them to
+            # POSIX "a/b.py" so every lookup uses a single key. If a POSIX twin already exists it wins (worst case: one re-index).
+            async with db.execute("PRAGMA user_version") as cur:
+                ver = (await cur.fetchone())[0]
+            if ver < 1:
+                await db.execute("""
+                    DELETE FROM file_jobs WHERE instr(file_path, char(92)) > 0 AND EXISTS (
+                        SELECT 1 FROM file_jobs t WHERE t.repo_id = file_jobs.repo_id
+                        AND t.file_path = replace(file_jobs.file_path, char(92), '/'))
+                """)
+                await db.execute("UPDATE file_jobs SET file_path = replace(file_path, char(92), '/') "
+                                 "WHERE instr(file_path, char(92)) > 0")
+                await db.execute("UPDATE code_chunks SET file_path = replace(file_path, char(92), '/') "
+                                 "WHERE instr(file_path, char(92)) > 0")
+                await db.execute("PRAGMA user_version = 1")
             await db.execute(
                 "INSERT OR IGNORE INTO repositories (repo_id, title, root_path, status, total_files, created_at) "
-                "VALUES (?, 'General (web)', '', 'COMPLETED', 0, ?)", (GENERAL_REPO_ID, datetime.utcnow().isoformat()))
+                "VALUES (?, 'General (web)', '', 'COMPLETED', 0, ?)", (GENERAL_REPO_ID, datetime.now(timezone.utc).isoformat()))
             await db.commit()
 
     async def create_thread(self, thread_id: str, repo_id: str, title: str):
@@ -185,7 +212,8 @@ class DatabaseManager:
                 return [{"id": r[0], "filename": r[1], "kind": r[2], "text": r[3] or ""} for r in await cursor.fetchall()]
 
     async def upsert_repo(self, repo_id: str, title: str, root_path: str, status: JobStatus, total_files: int):
-        now_iso = datetime.utcnow().isoformat()
+        now_iso = datetime.now(timezone.utc).isoformat()
+        norm_root = _normalize_path(root_path)
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute("""
                 INSERT INTO repositories (repo_id, title, root_path, status, total_files, created_at)
@@ -195,7 +223,7 @@ class DatabaseManager:
                     root_path=excluded.root_path,
                     status=excluded.status,
                     total_files=excluded.total_files
-            """, (repo_id, title, root_path, status.value, total_files, now_iso))
+            """, (repo_id, title, norm_root, status.value, total_files, now_iso))
             await db.commit()
 
     async def update_repo_status(self, repo_id: str, status: JobStatus):
@@ -220,7 +248,7 @@ class DatabaseManager:
                 row = await cursor.fetchone()
                 if not row:
                     return None
-                created_val = row[7] if row[7] else datetime.utcnow().isoformat()
+                created_val = row[7] if row[7] else datetime.now(timezone.utc).isoformat()
                 return RepoInfo(
                     repo_id=row[0], title=row[1], root_path=row[2],
                     status=JobStatus(row[3]), total_files=row[4],
@@ -241,7 +269,7 @@ class DatabaseManager:
                         count_row = await count_cursor.fetchone()
                         processed = count_row[0] if count_row else 0
                     
-                    created_val = row[7] if row[7] else datetime.utcnow().isoformat()
+                    created_val = row[7] if row[7] else datetime.now(timezone.utc).isoformat()
                     results.append(RepoInfo(
                         repo_id=row[0], title=row[1], root_path=row[2],
                         status=JobStatus(row[3]), total_files=row[4],
@@ -269,30 +297,38 @@ class DatabaseManager:
                 return [row[0] for row in await cursor.fetchall()]
 
     async def record_file_job(self, repo_id: str, file_path: str, file_hash: str, status: JobStatus, error: Optional[str] = None):
-        now_iso = datetime.utcnow().isoformat()
+        now_iso = datetime.now(timezone.utc).isoformat()
+        norm_path = _normalize_path(file_path)
         async with aiosqlite.connect(self.db_path) as db:
             cursor = await db.execute("""
                 UPDATE file_jobs
                 SET file_hash = ?, status = ?, error = ?, updated_at = ?
                 WHERE repo_id = ? AND file_path = ?
-            """, (file_hash, status.value, error, now_iso, repo_id, file_path))
+            """, (file_hash, status.value, error, now_iso, repo_id, norm_path))
             if cursor.rowcount == 0:
                 await db.execute("""
                     INSERT INTO file_jobs (repo_id, file_path, file_hash, status, error, updated_at)
                     VALUES (?, ?, ?, ?, ?, ?)
-                """, (repo_id, file_path, file_hash, status.value, error, now_iso))
+                """, (repo_id, norm_path, file_hash, status.value, error, now_iso))
             await db.commit()
 
     async def get_completed_file_hashes(self, repo_id: str) -> Dict[str, str]:
         async with aiosqlite.connect(self.db_path) as db:
             async with db.execute("SELECT file_path, file_hash FROM file_jobs WHERE repo_id = ? AND status = 'COMPLETED'", (repo_id,)) as cursor:
                 rows = await cursor.fetchall()
-                return {row[0]: row[1] for row in rows}
+                return {_normalize_path(row[0]): row[1] for row in rows}
 
     async def save_chunks_batch(self, repo_id: str, chunk_records: List[tuple]):
         async with aiosqlite.connect(self.db_path) as db:
             if chunk_records:
-                file_paths = list({r[2] for r in chunk_records})
+                normalized_records = [
+                    (
+                        r[0], r[1], _normalize_path(r[2]), r[3],
+                        r[4], r[5], r[6], r[7], r[8], r[9]
+                    )
+                    for r in chunk_records
+                ]
+                file_paths = list({r[2] for r in normalized_records})
                 placeholders = ",".join("?" for _ in file_paths)
                 await db.execute(
                     f"DELETE FROM code_chunks WHERE repo_id = ? AND file_path IN ({placeholders})",
@@ -304,7 +340,7 @@ class DatabaseManager:
                         prev_chunk_id, next_chunk_id, sibling_group_id,
                         structural_context, content, metadata_json
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, chunk_records)
+                """, normalized_records)
 
             async with db.execute("SELECT COUNT(*) FROM code_chunks WHERE repo_id = ?", (repo_id,)) as cursor:
                 row = await cursor.fetchone()
@@ -328,7 +364,7 @@ class DatabaseManager:
                 return [
                     {
                         "chunk_id": r[0],
-                        "file_path": r[1],
+                        "file_path": _normalize_path(r[1]),
                         "chunk_index": r[2],
                         "structural_context": r[3],
                         "content": r[4]
@@ -339,7 +375,7 @@ class DatabaseManager:
     async def list_file_paths(self, repo_id: str) -> List[str]:
         async with aiosqlite.connect(self.db_path) as db:
             async with db.execute("SELECT DISTINCT file_path FROM code_chunks WHERE repo_id=?", (repo_id,)) as c:
-                return [r[0] for r in await c.fetchall()]
+                return [_normalize_path(r[0]) for r in await c.fetchall()]
 
     async def delete_thread(self, thread_id: str) -> bool:
         async with aiosqlite.connect(self.db_path) as db:
@@ -400,8 +436,9 @@ class DatabaseManager:
             return cur.rowcount or 0
 
     async def get_file_chunks(self, repo_id: str, file_path: str) -> List[Dict[str, Any]]:
+        norm_path = _normalize_path(file_path)
         async with aiosqlite.connect(self.db_path) as db:
             async with db.execute(
                 "SELECT file_path, chunk_index, content FROM code_chunks "
-                "WHERE repo_id=? AND file_path=? ORDER BY chunk_index", (repo_id, file_path)) as c:
-                return [{"file_path": r[0], "chunk_index": r[1], "content": r[2]} for r in await c.fetchall()]
+                "WHERE repo_id=? AND file_path=? ORDER BY chunk_index", (repo_id, norm_path)) as c:
+                return [{"file_path": _normalize_path(r[0]), "chunk_index": r[1], "content": r[2]} for r in await c.fetchall()]

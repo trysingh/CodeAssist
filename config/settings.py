@@ -3,11 +3,14 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import AliasChoices, Field
 from typing import List
 
+# Root project directory anchor (relative to settings.py)
+PROJECT_ROOT = Path(__file__).resolve().parent.parent if Path(__file__).resolve().parent.name == "core" else Path(__file__).resolve().parent
 DEFAULT_MODEL = "gemma4:31b-cloud"
 
 class EngineSettings(BaseSettings):
     app_name: str = "CodeRAG Chunking Engine"
-    storage_dir: Path = Field(default=Path("./.engine_storage"))
+    # Anchored to project root to avoid cwd-dependence across OS shells
+    storage_dir: Path = Field(default_factory=lambda: PROJECT_ROOT / ".engine_storage")
     sqlite_db_name: str = "metadata_and_jobs.db"
     checkpoint_db_name: str = "langgraph_checkpoints.db"
     chroma_dir_name: str = "chroma_vectors"
@@ -105,6 +108,15 @@ class EngineSettings(BaseSettings):
     sandbox_build_timeout_s: int = Field(default=1500)
     sandbox_max_workspace_mb: int = Field(default=64)
     sandbox_requirements_files: List[str] = Field(default=["requirements-test.txt", "requirements-dev.txt", "requirements.txt"])
+                                                        # ALL that exist are merged (earlier files win a version clash); `-r other.txt` lines are inlined
+    sandbox_baseline: str = Field(default="disk")        # which code decides "this failure was already there": "disk" = the repo as it is on your disk
+                                                        # (failures that only exist on top of unapplied revisions still count), "base" = the latest
+                                                        # revision, unapplied ones included (the old rule)
+    sandbox_network: str = Field(default="none")         # "none" (default, safest) or "bridge": opt in to let test containers reach the network.
+                                                        # Anything else is treated as "none". Generated code then runs with network access.
+    sandbox_env_files: List[str] = Field(default=[".env.sandbox", ".env.example", ".env.sample", ".env.template"])
+                                                        # placeholder env for the test run (first file wins per key): stored in the raw store although
+                                                        # dot-files are normally skipped, and exposed to the tests as .env + environment variables
 
      # Sandbox pre-warm: build the dependency image in the background instead of on the first change request
     sandbox_prewarm: bool = Field(default=True)          # warm at startup, after ingest, and when a requirements file changes
@@ -136,7 +148,7 @@ class EngineSettings(BaseSettings):
     # Exclusions Configuration
     exclude_dirs: List[str] = Field(default=[
         ".git", "node_modules", "venv", ".venv", "__pycache__", 
-        "dist", "build", ".engine_storage", ".idea", ".vscode", "target", "data", "workspaces"
+        "dist", "build", ".engine_storage", ".idea", ".vscode", "target", "data", "workspaces", "__MACOSX"
     ])
     exclude_patterns: List[str] = Field(default=[
         "* copy.*", 
@@ -169,7 +181,10 @@ class EngineSettings(BaseSettings):
 
     @property
     def sqlite_url(self) -> str:
-        return f"sqlite+aiosqlite:///{self.storage_dir / self.sqlite_db_name}"
+        # return f"sqlite+aiosqlite:///{self.storage_dir / self.sqlite_db_name}"
+        # POSIX:   '/path/to/db'  -> sqlite+aiosqlite:////path/to/db   (3 slashes + the leading '/')
+        # Windows: 'C:/path/to/db' -> sqlite+aiosqlite:///C:/path/to/db
+        return f"sqlite+aiosqlite:///{(self.storage_dir.resolve() / self.sqlite_db_name).as_posix()}"
 
     @property
     def checkpoint_path(self) -> str:
@@ -180,4 +195,7 @@ class EngineSettings(BaseSettings):
         return str(self.storage_dir / self.chroma_dir_name)
 
 settings = EngineSettings()
+
+# Note: Call settings.ensure_dirs() during FastAPI lifespan/startup,
+# rather than at module import level, to avoid permission issues during builds/tests.
 settings.ensure_dirs()

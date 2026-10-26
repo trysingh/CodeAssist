@@ -25,10 +25,13 @@ const Render = {
         let normalized = String(raw == null ? "" : raw)
             .replace(/\r\n/g, "\n")
             .replace(/([^\n])\s+(#{1,6}\s+)/g, "$1\n$2")
-            .replace(/([.:;!?])\s+(\*\s+\*\*)/g, "$1\n$2");
+            .replace(/([.:;!?])\s+(\*\s+\*\*)/g, "$1\n$2")
+            .replace(/^\n+|\n+$/g, "");      // no spacer at the edges of a block next to a code fence
 
         const lines = this.escapeHtml(normalized).split("\n");
         const out = [];
+        const SPACER = "<div class='h-2'></div>";
+        const BLOCK_START = /^\s*(\||(&gt;\s*)?#{1,6}\s|[-*]\s|\d+\.\s|([-*_]){3,}\s*$)/;
         let inTable = false;
 
         for (let i = 0; i < lines.length; i++) {
@@ -49,6 +52,11 @@ const Render = {
                 inTable = false;
             }
 
+            if (!line.trim()) {                       // blank line: one small spacer, never stacked
+                if (out.length && out[out.length - 1] !== SPACER) out.push(SPACER);
+                continue;
+            }
+
             const h = line.match(/^(&gt;\s*)?(#{1,6})\s+(.*)$/);
             if (h) {
                 const lvl = Math.min(h[2].length + 1, 6);
@@ -63,17 +71,19 @@ const Render = {
 
             const ul = line.match(/^(\s*)[-*]\s+(.*)$/);
             if (ul) {
-                out.push(`<div class="flex items-start space-x-2 my-1.5 pl-2"><span class="text-blue-400 font-bold">•</span><div class="flex-1">${this.formatInline(ul[2])}</div></div>`);
+                out.push(`<div class="flex items-start space-x-2 my-1.5 pl-2"><span class="text-blue-400 font-bold">•</span><div class="flex-1 min-w-0">${this.formatInline(ul[2])}</div></div>`);
                 continue;
             }
 
             const ol = line.match(/^(\s*)(\d+\.)\s+(.*)$/);
             if (ol) {
-                out.push(`<div class="flex items-start space-x-2 my-1.5 pl-2"><span class="text-blue-400 font-mono text-xs font-bold">${ol[2]}</span><div class="flex-1">${this.formatInline(ol[3])}</div></div>`);
+                out.push(`<div class="flex items-start space-x-2 my-1.5 pl-2"><span class="text-blue-400 font-mono text-xs font-bold">${ol[2]}</span><div class="flex-1 min-w-0">${this.formatInline(ol[3])}</div></div>`);
                 continue;
             }
 
-            out.push(this.formatInline(line) + (i < lines.length - 1 ? "<br>" : ""));
+            const next = lines[i + 1];                // soft line break only when another plain text line follows
+            const softBreak = next !== undefined && next.trim() !== "" && !BLOCK_START.test(next);
+            out.push(this.formatInline(line) + (softBreak ? "<br>" : ""));
         }
         if (inTable) out.push("</tbody></table></div>");
         return out.join("");
@@ -144,6 +154,7 @@ function switchTab(tabId) {
         b.classList.toggle('active', on);
         on ? b.setAttribute('aria-current', 'page') : b.removeAttribute('aria-current');
     });
+    document.querySelectorAll('.mob-nav-btn').forEach(b => b.classList.toggle('active', b.dataset.mobTab === tabId));
     $('current-tab-title').textContent = TITLES[tabId];
     $('current-tab-title').classList.toggle('hidden', tabId === 'chat');
     $('chat-ctx').classList.toggle('hidden', tabId !== 'chat');
@@ -204,7 +215,7 @@ function showToast(title, message, type = 'info') {
     const bar = { success: 'bg-emerald-500', error: 'bg-red-500', warning: 'bg-amber-500' }[type] || 'bg-blue-500';
     const toast = document.createElement('div');
     toast.className = 'pointer-events-auto flex rounded-xl border border-slate-300 dark:border-slate-700 shadow-2xl bg-white dark:bg-slate-800 text-slate-900 dark:text-white overflow-hidden cursor-pointer';
-    toast.innerHTML = `<span class="w-1 ${bar} shrink-0"></span><div class="flex-1 px-3.5 py-3"><h5 class="text-xs font-semibold">${esc(title)}</h5><p class="text-[11px] text-slate-600 dark:text-slate-300 mt-0.5 break-words">${esc(message)}</p></div>`;
+    toast.innerHTML = `<span class="w-1 ${bar} shrink-0"></span><div class="flex-1 min-w-0 px-3.5 py-3"><h5 class="text-xs font-semibold">${esc(title)}</h5><p class="text-[11px] text-slate-600 dark:text-slate-300 mt-0.5 break-words">${esc(message)}</p></div>`;
     toast.onclick = () => toast.remove();
     container.appendChild(toast);
     setTimeout(() => toast.remove(), 4500);
@@ -427,17 +438,16 @@ function renderRepos() {
     $('repo-table-body').innerHTML = rows.length ? rows.map(r => {
         const pct = r.total_files ? Math.round((r.processed_files / r.total_files) * 100) : 0;
         return `<tr class="hover:bg-slate-100 dark:hover:bg-slate-900/40">
-            <td class="py-3.5 px-5 font-mono text-xs"><span class="text-blue-600 dark:text-blue-400 font-semibold">${esc(r.repo_id)}</span><br><span class="text-slate-500 dark:text-slate-400">${esc(r.title)}</span></td>
-            <td class="py-3.5 px-5">${statusChip(r.status)}</td>
-            <td class="py-3.5 px-5 font-mono text-xs"><div>${esc(r.processed_files)}/${esc(r.total_files)}</div><div class="w-20 h-1 bg-slate-200 dark:bg-slate-800 rounded-full mt-1.5"><div class="h-1 bg-blue-500 rounded-full" style="width:${pct}%"></div></div></td>
-            <td class="py-3.5 px-5 font-mono text-xs text-blue-600 dark:text-blue-400 font-semibold">${esc(r.total_chunks)}</td>
-            <td class="py-3.5 px-5 font-mono text-xs text-slate-500 dark:text-slate-400 truncate max-w-xs" title="${esc(r.root_path)}">${esc(r.root_path)}</td>
-            <td class="py-3.5 px-5 text-right"><button data-chat-repo="${esc(r.repo_id)}" class="bg-blue-600/20 hover:bg-blue-600/30 text-blue-600 dark:text-blue-400 border border-blue-500/30 px-3 py-1.5 rounded-lg text-xs">Open chat</button></td>
-            <td class="py-3 px-4 text-right">
-                <button data-reset-repo="${esc(r.repo_id)}" 
-                        class="text-xs bg-red-900/30 hover:bg-red-900/50 text-red-400 border border-red-800/50 px-2 py-1 rounded transition-colors">
-                    Reset Index
-                </button>
+            <td data-cell="name" class="py-3.5 px-5 font-mono text-xs"><span class="text-blue-600 dark:text-blue-400 font-semibold">${esc(r.repo_id)}</span><br><span class="text-slate-500 dark:text-slate-400">${esc(r.title)}</span></td>
+            <td data-cell="status" class="py-3.5 px-5">${statusChip(r.status)}</td>
+            <td data-cell="files" class="py-3.5 px-5 font-mono text-xs"><div class="whitespace-nowrap">${esc(r.processed_files)}/${esc(r.total_files)}</div><div class="repo-bar w-full min-w-[3rem] h-1 bg-slate-200 dark:bg-slate-800 rounded-full mt-1.5"><div class="h-1 bg-blue-500 rounded-full" style="width:${pct}%"></div></div></td>
+            <td data-cell="chunks" class="py-3.5 px-5 font-mono text-xs text-blue-600 dark:text-blue-400 font-semibold">${esc(r.total_chunks)}</td>
+            <td data-cell="path" class="py-3.5 px-5 font-mono text-xs text-slate-500 dark:text-slate-400 truncate max-w-xs" title="${esc(r.root_path)}">${esc(r.root_path)}</td>
+            <td data-cell="actions" class="py-3.5 px-5">
+                <div class="repo-actions flex justify-end gap-2">
+                    <button data-chat-repo="${esc(r.repo_id)}" class="bg-blue-600/20 hover:bg-blue-600/30 text-blue-600 dark:text-blue-400 border border-blue-500/30 px-3 py-1.5 rounded-lg text-xs whitespace-nowrap">Open chat</button>
+                    <button data-reset-repo="${esc(r.repo_id)}" class="bg-red-500/10 hover:bg-red-500/20 text-red-600 dark:text-red-400 border border-red-500/30 px-3 py-1.5 rounded-lg text-xs whitespace-nowrap transition-colors">Reset index</button>
+                </div>
             </td>
         </tr>`;
     }).join('') : `<tr><td colspan="6" class="py-14 text-center text-sm text-slate-500">${S.repos.length ? 'No repositories match your filter.' : 'No repositories yet. <button class="text-blue-400 hover:underline" onclick="switchTab(\'ingest\')">Ingest your first one</button>.'}</td></tr>`;
@@ -615,13 +625,13 @@ async function createThreadRequest(title) {
 function msgHtml(role, content, meta = '', atts = []) {
     if (role === 'user') {
         const chips = atts.length ? `<div class="flex flex-wrap gap-1.5 ${content ? 'mb-2' : ''}">${atts.map(a => `<span class="inline-flex items-center gap-1 bg-blue-800/60 rounded-md px-2 py-0.5 text-xs"><i data-lucide="${a.kind === 'image' ? 'image' : 'file-text'}" class="w-3 h-3"></i>${esc(a.filename)}</span>`).join('')}</div>` : '';
-        return `<div class="flex justify-end"><div class="bg-blue-600 text-white rounded-2xl rounded-br-md px-4 py-2.5 text-sm max-w-[85%] whitespace-pre-wrap break-words">${chips}${esc(content)}</div></div>`;
+        return `<div class="flex justify-end"><div class="bg-blue-600 text-white rounded-2xl rounded-br-md px-4 py-2.5 text-sm max-w-[92%] sm:max-w-[85%] whitespace-pre-wrap break-words">${chips}${esc(content)}</div></div>`;
     }
     return `<div class="flex gap-3 group scroll-mt-4">
-        <div class="w-7 h-7 mt-0.5 rounded-lg bg-blue-600/15 border border-blue-500/25 flex items-center justify-center text-blue-400 shrink-0"><i data-lucide="bot" class="w-4 h-4"></i></div>
+        <div class="msg-avatar w-7 h-7 mt-0.5 rounded-lg bg-blue-600/15 border border-blue-500/25 flex items-center justify-center text-blue-400 shrink-0"><i data-lucide="bot" class="w-4 h-4"></i></div>
         <div class="min-w-0 flex-1" data-raw="${esc(content)}">
             <div class="text-sm text-slate-700 dark:text-slate-200 leading-relaxed break-words">${Render.renderMarkdown(content)}</div>
-            <div class="mt-1 flex items-center gap-3 text-[11px] text-slate-500 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity">
+            <div class="msg-actions mt-1 flex items-center gap-3 text-[11px] text-slate-500 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity">
                 <button data-copy="msg" class="hover:text-slate-900 dark:hover:text-slate-200 flex items-center gap-1"><i data-lucide="copy" class="w-3 h-3"></i><span>Copy</span></button>${meta}
             </div>
         </div></div>`;
@@ -630,13 +640,13 @@ function msgHtml(role, content, meta = '', atts = []) {
 function showEmpty(kind, title = '') {
     const col = $('chat-col');
     if (kind === 'thread') {
-        col.innerHTML = `<div data-welcome class="pt-[12vh] text-center space-y-5">
+        col.innerHTML = `<div data-welcome class="pt-[5vh] sm:pt-[12vh] text-center space-y-5">
             <div class="mx-auto w-11 h-11 rounded-xl bg-blue-600/15 border border-blue-500/25 flex items-center justify-center text-blue-400"><i data-lucide="sparkles" class="w-5 h-5"></i></div>
             <div><h3 class="text-lg font-semibold text-slate-900 dark:text-white">Ask about ${esc(title)}</h3><p class="text-sm text-slate-500 dark:text-slate-400 mt-1">${S.repoId === GENERAL ? 'General questions. The web is searched when needed (see the Web chip below).' : 'Answers are grounded in the ingested chunks of this repository.'}</p></div>
             <div class="flex flex-wrap justify-center gap-2">${(S.repoId === GENERAL ? GENERAL_SUGGESTIONS : SUGGESTIONS).map(s => `<button type="button" data-suggest class="text-xs text-slate-600 dark:text-slate-300 bg-slate-100 dark:bg-slate-900 hover:bg-slate-200 dark:hover:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-full px-3.5 py-2 transition-colors">${esc(s)}</button>`).join('')}</div></div>`;
     } else {
         const none = kind === 'none';
-        col.innerHTML = `<div data-welcome class="pt-[14vh] text-center space-y-4">
+        col.innerHTML = `<div data-welcome class="pt-[6vh] sm:pt-[14vh] text-center space-y-4">
             <div class="mx-auto w-11 h-11 rounded-xl bg-slate-200 dark:bg-slate-800 border border-slate-300 dark:border-slate-700 flex items-center justify-center text-slate-500 dark:text-slate-400"><i data-lucide="${none ? 'folder-git-2' : 'database'}" class="w-5 h-5"></i></div>
             <div><h3 class="text-lg font-semibold text-slate-900 dark:text-white">${none ? 'No repositories yet' : 'Choose a repository'}</h3>
             <p class="text-sm text-slate-500 dark:text-slate-400 mt-1">${none ? 'Ingest a codebase to start asking questions about it.' : 'Pick one from the selector above to load its threads.'}</p></div>
@@ -824,9 +834,9 @@ async function sendChatMessage(e) {
     S.sending = true; updateComposer();
 
     const id = 'loader_' + Date.now();
-    // col.insertAdjacentHTML('beforeend', `<div id="${id}" class="flex gap-3"><div class="w-7 h-7 rounded-lg bg-blue-600/15 border border-blue-500/25 flex items-center justify-center text-blue-400 shrink-0"><i data-lucide="bot" class="w-4 h-4"></i></div>
+    // col.insertAdjacentHTML('beforeend', `<div id="${id}" class="flex gap-3"><div class="msg-avatar w-7 h-7 rounded-lg bg-blue-600/15 border border-blue-500/25 flex items-center justify-center text-blue-400 shrink-0"><i data-lucide="bot" class="w-4 h-4"></i></div>
     //     <div class="flex items-center gap-2.5 text-sm text-slate-400 pt-0.5"><span class="think flex gap-1"><span></span><span></span><span></span></span>${files.length ? 'Reading attachments' : (S.repoId === GENERAL ? 'Thinking' : 'Retrieving relevant chunks')}${S.web !== 'off' ? ' · may search the web' : ''} <span id="${id}_t" class="font-mono text-xs text-slate-600">0s</span></div></div>`);
-    col.insertAdjacentHTML('beforeend', `<div id="${id}" class="flex gap-3"><div class="w-7 h-7 rounded-lg bg-blue-600/15 border border-blue-500/25 flex items-center justify-center text-blue-400 shrink-0"><i data-lucide="bot" class="w-4 h-4"></i></div>
+    col.insertAdjacentHTML('beforeend', `<div id="${id}" class="flex gap-3"><div class="msg-avatar w-7 h-7 rounded-lg bg-blue-600/15 border border-blue-500/25 flex items-center justify-center text-blue-400 shrink-0"><i data-lucide="bot" class="w-4 h-4"></i></div>
         <div class="flex items-center gap-2.5 text-sm text-slate-400 pt-0.5"><span class="think flex gap-1"><span></span><span></span><span></span></span><span id="${id}_s" class="min-w-0 break-words">${files.length ? 'Reading attachments' : (S.repoId === GENERAL ? 'Thinking' : 'Retrieving relevant chunks')}${S.web !== 'off' ? ' · may search the web' : ''}</span> <span id="${id}_t" class="font-mono text-xs text-slate-600 shrink-0">0s</span></div></div>`);
     icons(); scrollDown(true);
     S.liveStatus = id + '_s';

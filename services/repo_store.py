@@ -49,9 +49,64 @@ def safe_rel_path(p: str) -> str:
     return "/".join(parts)
 
 
-def is_secret_path(path: str) -> bool:
-    name = path.replace("\\", "/").rsplit("/", 1)[-1].lower()
+# Source / markup files whose NAME merely looks secret (token_service.py, credentials.py, cookie_utils.py ...).
+# They are judged by CONTENT (secret_content_reason) instead. Data files (token.json, credentials.yaml, *.txt) stay name-filtered.
+_SOURCE_EXT = frozenset({".py", ".pyi", ".js", ".jsx", ".mjs", ".ts", ".tsx", ".java", ".kt", ".go", ".rs", ".rb", ".php",
+                         ".cs", ".c", ".h", ".cpp", ".hpp", ".swift", ".sh", ".sql", ".html", ".htm", ".jinja", ".j2",
+                         ".css", ".scss", ".md", ".rst"})
+
+
+def _name_of(path: str) -> str:
+    return path.replace("\\", "/").rsplit("/", 1)[-1].lower()
+
+
+def _name_hit(path: str) -> bool:
+    name = _name_of(path)
     return any(fnmatch.fnmatch(name, pat.lower()) for pat in settings.raw_store_exclude_patterns)
+
+
+def _judged_by_content(path: str) -> bool:
+    """A secret-looking NAME that is safe to let in because the file is source code or a placeholder env template."""
+    name = _name_of(path)
+    return name in {n.lower() for n in settings.sandbox_env_files} or PurePosixPath(name).suffix in _SOURCE_EXT
+
+
+def is_secret_path(path: str) -> bool:
+    """True = never stored, never written by Apply. Looks at the file NAME only."""
+    return _name_hit(path) and not _judged_by_content(path)
+
+
+def needs_content_check(path: str) -> bool:
+    """The name looks secret but the file type is let in: its content must be scanned before it is stored."""
+    return _name_hit(path) and _judged_by_content(path)
+
+
+_PLACEHOLDER = re.compile(r"your|example|changeme|change_me|placeholder|dummy|sample|fake|test|todo|x{4,}|\*{3,}|<|>|\$\{",
+                          re.IGNORECASE)
+_STRONG_SECRETS = (
+    ("private key block", re.compile(r"-----BEGIN (?:[A-Z]+ )?PRIVATE KEY-----")),
+    ("AWS access key id", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
+    ("GitHub token", re.compile(r"\b(?:ghp|gho|ghs|ghu)_[A-Za-z0-9]{36}\b|\bgithub_pat_[A-Za-z0-9_]{50,}\b")),
+    ("Slack token", re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{20,}\b")),
+    ("API key (sk-...)", re.compile(r"\bsk-[A-Za-z0-9_\-]{32,}\b")),
+    ("Google API key", re.compile(r"\bAIza[0-9A-Za-z_\-]{35}\b")),
+)
+# NAME = "long-literal" or NAME=long-literal where NAME says key / secret / token / password
+_ASSIGNED = re.compile(r"(?im)^\s*(?:export\s+)?[\"']?[A-Za-z0-9_.\-]*(?:key|secret|token|passw(?:or)?d)[A-Za-z0-9_.\-]*[\"']?"
+                       r"\s*[:=]\s*[\"']?([A-Za-z0-9_\-+/=.]{24,})[\"']?\s*,?\s*(?:#.*)?$")
+
+
+def secret_content_reason(data: bytes) -> Optional[str]:
+    """Why this text looks like it embeds a real credential (None = looks clean). Deliberately conservative:
+    well-known token shapes, or a long literal assigned to a key/secret/token/password name that is not a placeholder."""
+    text = data[:200_000].decode("utf-8", errors="replace")
+    for label, rx in _STRONG_SECRETS:
+        if rx.search(text):
+            return label
+    for m in _ASSIGNED.finditer(text):
+        if not _PLACEHOLDER.search(m.group(1)):
+            return "long literal assigned to a secret-like name"
+    return None
 
 
 def is_text_bytes(data: bytes) -> bool:
@@ -145,6 +200,11 @@ class RepoStore:
                 if not is_text_bytes(data):
                     out["skipped"].append((path, "not UTF-8 text"))
                     continue
+                if needs_content_check(path):
+                    why = secret_content_reason(data)
+                    if why:
+                        out["skipped"].append((path, f"looks like it contains a credential ({why})"))
+                        continue
                 digest = sha256_hex(data)
                 async with db.execute(
                     "SELECT sha256 FROM repo_files WHERE repo_id=? AND rev=0 AND file_path=?",

@@ -11,7 +11,7 @@ Docker design (why it looks like this)
   * `docker run -i --rm`, workspace arrives on stdin as a tar and is unpacked into a
     tmpfs: no bind mounts, so no Windows path/permission/line-ending surprises and no
     host directory is ever exposed to generated code
-  * --network none, --read-only root, --cap-drop ALL, no-new-privileges, non-root user,
+  * --network none (opt-in: ENGINE_SANDBOX_NETWORK=bridge), --read-only root, --cap-drop ALL, no-new-privileges, non-root user,
     memory / cpu / pid limits, hard timeout (in-container AND host side)
   * dependencies are baked into an image tagged by the hash of requirements, built once
     (the only step that needs network)
@@ -43,6 +43,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 from services.notifier import notifier
+from services.requirements_merge import collect, include_targets, merge_requirements, requirements_from
 
 from config.settings import settings
 
@@ -74,8 +75,11 @@ def hint_for(text: str, local_tops: Optional[Set[str]] = None) -> str:
         hm = _HOST.search(text)
         host = next((g for g in (hm.groups() if hm else ()) if g), "")
         extra = " (tiktoken downloads its vocabulary on first use)" if "tiktoken" in text else ""
-        return (f"code tried to reach {host or 'the network'}{extra}, but the sandbox runs with --network none. Fetch it while "
-                f"the image is built (settings.sandbox_build_run) or mock it in the test")
+        if network_mode() == "bridge":
+            return (f"code could not reach {host or 'the network'}{extra} even though sandbox networking is on. The host name may be "
+                    f"wrong or the service down; a service on your own machine is reachable as host.docker.internal, not localhost")
+        return (f"code tried to reach {host or 'the network'}{extra}, but the sandbox runs with --network none. Mock it in the test, "
+                f"fetch it while the image is built (settings.sandbox_build_run), or opt in with ENGINE_SANDBOX_NETWORK=bridge")
     if re.search(r"Read-only file system|\[Errno 30\]", text):
         return "code wrote to the read-only root filesystem; only /tmp and /work are writable in the sandbox"
     if re.search(r"PermissionError|Permission denied", text):
@@ -139,6 +143,9 @@ class SandboxVerdict:
     preexisting_cases: List[CaseResult] = field(default_factory=list)
     hints: List[str] = field(default_factory=list)
     proof: dict = field(default_factory=dict)       # fail->pass evidence for generated tests
+    not_run: str = ""                               # why nothing was verified (reason code, see NOT_RUN); "" = something ran
+    on_unapplied: List[str] = field(default_factory=list)   # files this run saw that differ from disk (earlier proposals not applied yet)
+    baseline: str = ""                              # what "already failing" was measured against: disk | base
 
     @property
     def ran(self) -> bool:
@@ -157,7 +164,19 @@ class SandboxVerdict:
                 "exit_code": r.exit_code, "log": r.log_path,
                 "new_failure_details": [_case_dict(c) for c in self.new_failures[:8]],
                 "preexisting_details": [_case_dict(c) for c in self.preexisting_cases[:8]],
-                "hints": self.hints[:3], "proof": self.proof}
+                "hints": self.hints[:3], "proof": self.proof, "not_run": self.not_run,
+                "on_unapplied_n": len(self.on_unapplied), "on_unapplied": self.on_unapplied[:8], "baseline": self.baseline}
+
+
+# Why a verification did not happen. Stable codes so a UI / the telemetry can count which one dominates.
+NOT_RUN = {
+    "disabled": "sandbox disabled", "docker_down": "Docker not reachable", "image_build": "dependency image could not be built",
+    "no_target": "no tests and nothing importable changed (templates, JS, config ...)",
+    "workspace_too_large": "workspace over the size limit", "infra": "the container could not run the command",
+    "timeout": "run hit the time cap", "all_skipped": "every selected test was skipped",
+    "collected_nothing": "pytest collected no tests", "failing_on_baseline": "everything fails the same way without the change",
+    "no_result": "no test produced a result",
+}
 
 
 # --------------------------------------------------------------------------- test selection
@@ -258,10 +277,18 @@ for m in json.load(open(".sbx_smoke.json")):
 '''
 
 
+# pytest11 plugins of observability packages. They autoload into EVERY pytest run and import their whole client/server stack;
+# generated tests never need them. Measured on a dev host: arize-phoenix's `phoenix` plugin alone was ~13 of the 17 s of each
+# sandbox run (phoenix.session.session -> phoenix.server.app -> pydantic_ai -> anthropic ...). Blocking a plugin that is not
+# installed is a no-op, so this is safe in the Docker image too. Names are the ENTRY-POINT names (sandbox_pytest_timing.py, section 3).
+_BLOCKED_PYTEST_PLUGINS = ("phoenix", "langsmith_plugin")
+
+
 def pytest_argv(paths: Sequence[str]) -> List[str]:
     # --continue-on-collection-errors: one test file that cannot be imported (offline download, missing package) must not
     # abort the whole session, otherwise NOT A SINGLE test runs and the run proves nothing
-    return ["python", "-m", "pytest", "-q", "-p", "no:cacheprovider", "--maxfail=25", "--tb=short",
+    block = [a for name in _BLOCKED_PYTEST_PLUGINS for a in ("-p", f"no:{name}")]
+    return ["python", "-m", "pytest", "-q", "-p", "no:cacheprovider", *block, "--maxfail=25", "--tb=short",
             "--continue-on-collection-errors",
             "-o", "junit_family=xunit2", f"--junitxml={_REPORT}", *paths]
 
@@ -393,7 +420,7 @@ def parse_run(raw: RawRun, mode: str, backend: str, timeout_s: Optional[int] = N
             rep.failures.append(CaseResult("pytest::report", "error", "unreadable JUnit report", _trim(rep.tail, 800)))
     if rc == 5:
         rep.note = "pytest collected no tests"
-    elif rc in (137, 9):
+    elif rc in (137, 9, -9):          # -9: SIGKILL seen directly by the local runner on macOS/Linux
         rep.failures.append(CaseResult("sandbox::killed", "killed",
                                        f"process killed (exit {rc}, out of memory? the sandbox limit is {settings.sandbox_memory})",
                                        _trim(rep.tail, 800)))
@@ -412,6 +439,50 @@ def _exec(args: List[str], stdin: Optional[bytes], timeout: float,
         return p.returncode, (p.stdout or b"") + (p.stderr or b""), False
     except subprocess.TimeoutExpired as e:
         return None, (e.stdout or b"") + (e.stderr or b""), True
+
+
+def network_mode() -> str:
+    """'none' unless the operator explicitly opted in with ENGINE_SANDBOX_NETWORK=bridge. No other value is honoured."""
+    return "bridge" if (settings.sandbox_network or "").strip().lower() == "bridge" else "none"
+
+
+_RESERVED_ENV = frozenset({"PATH", "PYTHONPATH", "PYTHONHOME", "HOME", "USERPROFILE", "LD_PRELOAD", "LD_LIBRARY_PATH"})
+_ENV_LINE = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$")
+_SITE_PY = """import json, os
+try:
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".sbx_env.json"), encoding="utf-8") as _f:
+        for _k, _v in json.load(_f).items():
+            os.environ.setdefault(_k, _v)
+except Exception:
+    pass
+"""
+
+
+def sandbox_env(tree: Dict[str, bytes]) -> Dict[str, str]:
+    """Placeholder environment for the test run, read from the repo's env template(s) (settings.sandbox_env_files,
+    first file wins per key). Empty values ('KEY=') are left unset: 'fill me in' is not a value."""
+    out: Dict[str, str] = {}
+    for name in settings.sandbox_env_files:
+        raw = tree.get(name)
+        if raw is None:
+            continue
+        for line in raw.decode("utf-8", errors="replace").splitlines():
+            m = _ENV_LINE.match(line)
+            if not m or line.lstrip().startswith("#"):
+                continue
+            key, val = m.group(1), m.group(2)
+            q = re.match(r"""^(["'])(.*?)\1(?:\s+#.*)?$""", val)
+            val = q.group(2) if q else re.split(r"\s+#", val, maxsplit=1)[0].strip()
+            if not val or len(val) > 1000 or key in _RESERVED_ENV or key.startswith("SBX_") or key in out:
+                continue
+            out[key] = val
+            if len(out) >= 200:
+                return out
+    return out
+
+
+def dotenv_text(env: Dict[str, str]) -> str:
+    return "".join('%s="%s"\n' % (k, v.replace("\\", "\\\\").replace('"', '\\"')) for k, v in env.items())
 
 
 ENTRY_SH = """#!/bin/sh
@@ -468,8 +539,11 @@ class DockerRunner:
         return f"{settings.sandbox_image_prefix}:{h}"
 
     def docker_args(self, tag: str, name: str, timeout: int, argv: List[str]) -> List[str]:
-        return ["docker", "run", "--rm", "-i", "--name", name,
-                "--network", "none", "--read-only", "--cap-drop", "ALL",
+        # Docker Desktop (Windows/macOS) resolves host.docker.internal itself; a native Linux engine needs it mapped.
+        host_map = (["--add-host", "host.docker.internal:host-gateway"]
+                    if network_mode() == "bridge" and sys.platform.startswith("linux") else [])
+        return ["docker", "run", "--rm", "-i", "--name", name, *host_map,
+                "--network", network_mode(), "--read-only", "--cap-drop", "ALL",
                 "--security-opt", "no-new-privileges", "--user", "1000:1000",
                 "--memory", settings.sandbox_memory, "--cpus", settings.sandbox_cpus,
                 "--pids-limit", str(settings.sandbox_pids),
@@ -503,7 +577,11 @@ class DockerRunner:
         except Exception as e:  # noqa: BLE001
             return False, f"Docker check failed: {type(e).__name__}"
         if rc != 0:
-            return False, "Docker is installed but the daemon is not reachable (is Docker Desktop running?)"
+            if b"permission denied" in out.lower():          # Linux: user is not in the 'docker' group
+                return False, ("Docker is installed but this user may not use it (permission denied on the Docker socket). "
+                               "Linux: sudo usermod -aG docker $USER, then log in again")
+            how = "start Docker Desktop" if sys.platform in ("win32", "darwin") else "sudo systemctl start docker"
+            return False, f"Docker is installed but the daemon is not reachable ({how})"
         return True, out.decode(errors="replace").strip()
 
     def _recent_failure(self, tag: str) -> Optional[str]:
@@ -706,9 +784,19 @@ def _unverified(report: RunReport, preexisting: int = 0) -> SandboxVerdict:
     if not why and report.skipped:
         why = f"all {report.skipped} selected test(s) were skipped"
     last = next((ln.strip() for ln in reversed(report.tail.splitlines()) if ln.strip()), "")
+    if report.timed_out:
+        code = "timeout"
+    elif report.skipped and not (report.passed or report.failed):
+        code = "all_skipped"
+    elif "collected no tests" in (report.note or ""):
+        code = "collected_nothing"
+    elif preexisting:
+        code = "failing_on_baseline"
+    else:
+        code = "no_result"
     report.ran = False
     report.note = "no test produced a result (" + (why or "nothing executed") + ")" + (f": {_trim(last, 200)}" if last else "")
-    return SandboxVerdict(report, preexisting=preexisting)
+    return SandboxVerdict(report, preexisting=preexisting, not_run=code)
 
 
 # --------------------------------------------------------------------------- service
@@ -733,24 +821,30 @@ class SandboxService:
 
     @staticmethod
     def _requirements(tree: Dict[str, bytes]) -> str:
-        for name in settings.sandbox_requirements_files:
-            if name in tree:
-                return tree[name].decode("utf-8", errors="replace")
-        return ""
+        """The text the image is built from: every root requirements file merged, `-r` includes inlined (see requirements_merge)."""
+        return requirements_from(lambda n: tree[n].decode("utf-8", errors="replace") if n in tree else None,
+                                 settings.sandbox_requirements_files)
 
     # ------------------------------------------------------------------ pre-warm
     async def requirements_for(self, repo_id: str, rev: Optional[int] = None) -> str:
         """The requirements text verify() would use for the repo view at `rev` (default: latest).
-        Same file order as _requirements(), but reads only those files, not the whole repo."""
+        Same result as _requirements(), but reads only the requirements files (and what they include), not the whole repo."""
         rev = await self.store.latest_rev(repo_id) if rev is None else rev
-        for name in settings.sandbox_requirements_files:
+        roots = settings.sandbox_requirements_files
+        loaded: Dict[str, Optional[str]] = {}
+        todo = list(roots)
+        while todo and len(loaded) < 40:                  # fetch breadth-first; the pure collect() below bounds what is used
+            name = todo.pop(0)
+            if name in loaded:
+                continue
             try:
                 f = await self.store.get_file(repo_id, name, rev)
             except ValueError:
-                continue
-            if f is not None:
-                return f.data.decode("utf-8", errors="replace")
-        return ""
+                f = None
+            loaded[name] = f.data.decode("utf-8", errors="replace") if f is not None else None
+            if loaded[name] is not None:
+                todo.extend(include_targets(name, loaded[name]))
+        return merge_requirements(collect(loaded.get, roots), roots)
 
     async def prewarm(self, repo_id: str, rev: Optional[int] = None) -> dict:
         """Build the dependency image for a repo ahead of the first change request. Never raises for
@@ -851,6 +945,13 @@ class SandboxService:
             argv = ["python", ".sbx_smoke.py"]
         else:
             argv = pytest_argv(selected)
+        env = sandbox_env(tree)
+        if env:                                  # placeholder config so code that reads settings at import time can start
+            extra[".sbx_env.json"] = json.dumps(env).encode("utf-8")
+            if ".env" not in tree:
+                extra[".env"] = dotenv_text(env).encode("utf-8")           # pydantic-settings / python-dotenv
+            if "sitecustomize.py" not in tree:
+                extra["sitecustomize.py"] = _SITE_PY.encode("utf-8")       # plain os.environ readers (never overrides)
         tar = build_tar(tree, extra)
         if len(tar) > settings.sandbox_max_workspace_mb * 1024 * 1024:
             return RunReport(mode=mode, ran=False, backend=self.runner.name, note="workspace too large for the sandbox")
@@ -922,14 +1023,27 @@ class SandboxService:
         """Run the proposal. `working` = {path: new bytes} on top of the repo at `base_rev`.
         `new_tests` = generated test files inside `working`: they always run, and (when everything passes) are re-run
         against the OLD code to prove they fail without the change."""
-        none = lambda note: SandboxVerdict(RunReport(mode="none", ran=False, note=note, backend=self.runner.name))
+        none = lambda note, code="infra": SandboxVerdict(
+            RunReport(mode="none", ran=False, note=note, backend=self.runner.name), not_run=code)
         if not self.enabled:
-            return none("sandbox disabled")
+            return none("sandbox disabled", "disabled")
         ok, info = await self.runner.available()
         if not ok:
-            return none(info)
+            return none(info, "docker_down")
 
         base_tree = await self.store.snapshot_bytes(repo_id, base_rev)
+        # Revisions are proposals layered on the disk snapshot (rev 0). base_rev may include proposals nobody applied yet.
+        disk_tree, on_unapplied = base_tree, []
+        if base_rev > 0:
+            disk_tree = await self.store.snapshot_bytes(repo_id, 0)
+            on_unapplied = sorted(p for p in set(base_tree) | set(disk_tree) if base_tree.get(p) != disk_tree.get(p))
+        use_base = (settings.sandbox_baseline or "").strip().lower() == "base"
+        ref_rev, ref_tree, ref_name = (base_rev, base_tree, "base") if use_base else (0, disk_tree, "disk")
+
+        def done(v: SandboxVerdict) -> SandboxVerdict:
+            v.on_unapplied, v.baseline = on_unapplied, ref_name
+            return v
+
         tree = {**base_tree, **working}
         changed = sorted(working)
         gen = sorted(p for p in new_tests if p in working)
@@ -954,7 +1068,7 @@ class SandboxService:
         if not selected:
             smoke = smoke_modules(tree, changed)
             if not smoke:
-                return none("no tests in the repo and no importable python module changed")
+                return done(none("no tests in the repo and no importable python module changed", "no_target"))
             mode, strategy = "smoke", "smoke"
         requirements = self._requirements(tree)
 
@@ -965,20 +1079,23 @@ class SandboxService:
                            "a first build can take minutes)")
                 err = await self.runner.prepare(requirements)
                 if err:
-                    return none(err)
+                    return done(none(err, "image_build"))
                 self._ready.add(tag)
 
+        if on_unapplied:
+            self._emit(f"Running on top of {len(on_unapplied)} file(s) from earlier proposals that are not applied to your disk yet "
+                       f"({', '.join(on_unapplied[:3])}{' ...' if len(on_unapplied) > 3 else ''}): the result holds for that stack, not for the disk as it is")
         self._emit(f"Running {len(selected) if mode == 'pytest' else len(smoke)} "
                    f"{'test file(s)' if mode == 'pytest' else 'module import(s)'} [{strategy}] in {self.runner.name}")
         report = await self._execute(tree, mode, selected, smoke, requirements, repo_id=repo_id, label="change")
         report.strategy = strategy
         self._announce(report)
         if not report.ran:
-            return SandboxVerdict(report)
+            return done(SandboxVerdict(report, not_run="workspace_too_large" if "too large" in (report.note or "") else "infra"))
         if not report.failures:
             if report.passed + report.failed == 0:
-                return _unverified(report)
-            verdict = SandboxVerdict(report)
+                return done(_unverified(report))
+            verdict = done(SandboxVerdict(report))
             if gen and mode == "pytest":
                 verdict.proof = await self._prove(repo_id, base_tree, tree, gen, requirements, report)
             return verdict
@@ -989,21 +1106,21 @@ class SandboxService:
                 # Tests were passing and the cap simply cut the run off (the suite is too big for it): no verdict either way, and
                 # the untouched base would only hit the same cap, so do not wait for a second one. A run that produced NO
                 # progress (a hang at import or in the first test) still goes to the base comparison below.
-                return _unverified(report)
+                return done(_unverified(report))
 
         # failures: subtract what was already broken before the change
-        key = (repo_id, base_rev, mode, tuple(selected), tuple(smoke), hashlib.sha256(requirements.encode()).hexdigest())
+        key = (repo_id, ref_rev, mode, tuple(selected), tuple(smoke), hashlib.sha256(requirements.encode()).hexdigest())
         if key not in self._baseline:
-            b_selected = [p for p in selected if p in base_tree]
-            b_smoke = [m for m in smoke if (m.replace(".", "/") + ".py") in base_tree
-                       or (m.replace(".", "/") + "/__init__.py") in base_tree]
+            b_selected = [p for p in selected if p in ref_tree]
+            b_smoke = [m for m in smoke if (m.replace(".", "/") + ".py") in ref_tree
+                       or (m.replace(".", "/") + "/__init__.py") in ref_tree]
             if (mode == "pytest" and not b_selected) or (mode == "smoke" and not b_smoke):
                 self._baseline[key] = (set(), False)
             else:
                 self._emit("Failures found, checking whether they already existed before the change", "WARNING")
-                base_report = await self._execute(base_tree, mode, b_selected, b_smoke, requirements,
-                                                  repo_id=repo_id, label="base")
-                self._announce(base_report, "untouched base: ")
+                base_report = await self._execute(ref_tree, mode, b_selected, b_smoke, requirements,
+                                                  repo_id=repo_id, label="base" if use_base or not on_unapplied else "disk")
+                self._announce(base_report, "untouched base: " if ref_name == "base" else "your disk as it is: ")
                 self._baseline[key] = ({c.id for c in base_report.failures}, base_report.timed_out)
             if len(self._baseline) > 64:
                 self._baseline.pop(next(iter(self._baseline)))
@@ -1013,7 +1130,8 @@ class SandboxService:
         old_cases = [c for c in report.failures if c not in fresh]
         hints = self._hints(report.failures, tree)
         if old_cases:
-            self._emit(f"{len(old_cases)} of {len(report.failures)} failure(s) also occur on the untouched base, so they are not "
+            self._emit(f"{len(old_cases)} of {len(report.failures)} failure(s) also occur on the untouched "
+                       f"{'base' if ref_name == 'base' else 'disk'}, so they are not "
                        f"caused by this change: {', '.join(c.id for c in old_cases[:4])}", "WARNING")
         for h in hints:
             self._emit(f"Likely cause: {h}", "WARNING")
@@ -1024,8 +1142,8 @@ class SandboxService:
             v.preexisting_cases, v.hints = old_cases, hints
             if hints:
                 v.report.note += f" Likely cause: {hints[0]}"
-            return v
-        v = SandboxVerdict(report, new_failures=fresh, preexisting=len(old_cases), preexisting_cases=old_cases, hints=hints)
+            return done(v)
+        v = done(SandboxVerdict(report, new_failures=fresh, preexisting=len(old_cases), preexisting_cases=old_cases, hints=hints))
         if v.ok and gen and mode == "pytest":
             v.proof = await self._prove(repo_id, base_tree, tree, gen, requirements, report)
         return v

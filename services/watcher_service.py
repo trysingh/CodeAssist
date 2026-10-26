@@ -24,14 +24,24 @@ class RepoChangeHandler(FileSystemEventHandler):
             return
         self._handle_file_change(event.src_path)
 
+    def on_moved(self, event):
+        # Atomic saves (vim, JetBrains safe-write, sed -i, os.replace) land as a rename: macOS/Linux report no
+        # "modified" event for the target, only "moved". Windows editors mostly write in place.
+        if event.is_directory:
+            return
+        self._handle_file_change(event.dest_path)
+
     def _handle_file_change(self, file_path_str: str):
         fpath = Path(file_path_str)
         
         from controllers.engine_controller import EngineController
         controller = EngineController()
         
-        # Skip if file matches exclusion rules
-        if controller.is_excluded(fpath, self.root_path):
+        # Skip if file matches exclusion rules (or lies outside the watched root, e.g. a resolved symlink / macOS /private path)
+        try:
+            if controller.is_excluded(fpath, self.root_path):
+                return
+        except ValueError:
             return
 
         # Debounce PER FILE, trailing edge: re-index a file 1.5 s after its LAST event. A single shared timer silently dropped
@@ -51,7 +61,7 @@ class RepoChangeHandler(FileSystemEventHandler):
         with self._lock:
             self._timers.pop(str(fpath), None)
         try:
-            rel_path = str(fpath.relative_to(self.root_path))
+            rel_path = fpath.relative_to(self.root_path).as_posix()
             from controllers.engine_controller import EngineController
             asyncio.run(EngineController().incremental_reingest_file(self.repo_id, self.root_path, rel_path))
         except Exception as exc:
@@ -72,8 +82,14 @@ class RepoWatcherManager:
 
         event_handler = RepoChangeHandler(repo_id, root_path)
         observer = Observer()
-        observer.schedule(event_handler, str(root_path), recursive=True)
-        observer.start()
+        try:
+            observer.schedule(event_handler, str(root_path), recursive=True)
+            observer.start()
+        except OSError as exc:      # Linux/inotify: "watch limit reached" (ENOSPC) or "too many open files"
+            notifier.notify("Watcher Not Started",
+                            f"Could not watch '{root_path.name}': {exc}. On Linux raise the limit: "
+                            f"sudo sysctl fs.inotify.max_user_watches=524288", level="ERROR", repo_id=repo_id)
+            return
         self.observers[repo_id] = observer
         notifier.notify("Watcher Active", f"Real-time monitoring enabled for repository: {root_path.name}", repo_id=repo_id)
 

@@ -1,5 +1,6 @@
 from pathlib import Path
 from typing import Dict, Type, List, Tuple
+import multiprocessing
 from concurrent.futures import ProcessPoolExecutor
 from services.chunking.base import BaseChunkingStrategy
 from services.chunking.strategies import (
@@ -66,6 +67,7 @@ def parallel_chunk_files(
     """Executes file reading and Rust-accelerated chunking across multiple processes."""
     if not tasks:
         return []
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+    # 'spawn' on every OS: Linux's default 'fork' is unsafe once the app runs threads (watchers, asyncio workers, SQLite)
+    with ProcessPoolExecutor(max_workers=max_workers, mp_context=multiprocessing.get_context("spawn")) as executor:
         results = list(executor.map(_worker_chunk_single_file, tasks))
     return results

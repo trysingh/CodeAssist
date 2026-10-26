@@ -1,3 +1,4 @@
+import fnmatch
 import hashlib
 import os
 import sys
@@ -53,6 +54,11 @@ class EngineController:
         return hashlib.sha1(resolved.encode("utf-8")).hexdigest()[:12]
 
     @staticmethod
+    def rel_key(fpath: Path, root_path: Path) -> str:
+        """The ONE repo-relative key used for DB / vector / raw-store lookups: POSIX separators on every OS."""
+        return fpath.relative_to(root_path).as_posix()
+
+    @staticmethod
     def compute_file_hash(file_path: Path) -> str:
         hasher = hashlib.sha256()
         with open(file_path, "rb") as f:
@@ -63,15 +69,21 @@ class EngineController:
     def is_excluded(self, fpath: Path, root_path: Path) -> bool:
         """Checks if a file or folder matches Pydantic exclusion rules."""
         rel_parts = fpath.relative_to(root_path).parts
-        
+
+        # Placeholder env templates (.env.example ...) are dot-files but belong to the raw store: the sandbox needs them.
+        if (fpath.name.lower() in {n.lower() for n in settings.sandbox_env_files}
+                and not any(p in settings.exclude_dirs or p.startswith(".") for p in rel_parts[:-1])):
+            return False
+
         # Check excluded directories
         for part in rel_parts:
             if part in settings.exclude_dirs or part.startswith("."):
                 return True
                 
         # Check file exclusion glob patterns
+        name = fpath.name.lower()      # same result on case-sensitive (Linux) and case-insensitive (Windows/macOS) disks
         for pattern in settings.exclude_patterns:
-            if fpath.match(pattern):
+            if fnmatch.fnmatchcase(name, pattern.lower()) or fpath.match(pattern):
                 return True
                 
         return False
@@ -84,7 +96,7 @@ class EngineController:
             dirnames[:] = [d for d in dirnames if d not in settings.exclude_dirs and not d.startswith(".")]
             for fname in filenames:
                 fpath = Path(dirpath) / fname
-                if fpath.suffix.lower() in supported_exts and not self.is_excluded(fpath, root_path):
+                if fpath.suffix.lower() in supported_exts and not self.is_excluded(fpath, root_path) and fpath.is_file():   # skips dangling symlinks
                     matched_files.append(fpath)
         return matched_files
 
@@ -110,8 +122,11 @@ class EngineController:
         )
         sys.stdout.flush()
 
-        # Non-blocking Windows/Unix console input reader with 5s timeout
+        # Console input reader with 5s timeout (Windows: msvcrt, macOS/Linux: select). Runs in a worker thread so the
+        # event loop (sandbox pre-warm etc.) is not frozen meanwhile; no terminal attached (service, Docker, nohup) = no prompt.
         def get_input_with_timeout(timeout: float = 5.0) -> str:
+            if not sys.stdin or not sys.stdin.isatty():
+                return ""
             start_t = time.time()
             buffer = []
             while time.time() - start_t < timeout:
@@ -142,7 +157,7 @@ class EngineController:
 
         selected_repos = repos
         try:
-            user_input = get_input_with_timeout(5.0)
+            user_input = await asyncio.to_thread(get_input_with_timeout, 5.0)
             if user_input:
                 chosen = []
                 for part in user_input.split():
@@ -173,7 +188,7 @@ class EngineController:
             
             offline_updates_count = 0
             for fpath in current_files:
-                rel_path = str(fpath.relative_to(root_path))
+                rel_path = self.rel_key(fpath, root_path)
                 current_hash = self.compute_file_hash(fpath)
                 
                 if completed_hashes.get(rel_path) != current_hash:
@@ -195,7 +210,7 @@ class EngineController:
 
     async def snapshot_raw_files(self, repo_id: str, root_path: Path) -> dict:
         """Persist verbatim copies of every non-excluded text file (rev 0). Cheap: unchanged files are skipped."""
-        kept, written, skipped, shadowed, batch = set(), 0, 0, {}, []
+        kept, written, skipped, shadowed, batch, withheld = set(), 0, 0, {}, [], []
 
         async def flush():
             nonlocal written, skipped, batch
@@ -204,6 +219,7 @@ class EngineController:
             out = await self.repo_store.upsert_base_files(repo_id, batch)
             kept.update(out["written"]); kept.update(out["unchanged"])
             written += len(out["written"]); skipped += len(out["skipped"])
+            withheld.extend(p for p, why in out["skipped"] if why.startswith(("secret-like", "looks like")))
             shadowed.update({p: b for p, b in batch if p in out["shadowed"]})
             batch = []
 
@@ -222,6 +238,11 @@ class EngineController:
         await flush()
         pruned = await self.repo_store.prune_base(repo_id, kept)
         sys.stdout.write(f"[RAW STORE] repo={repo_id} stored={len(kept)} updated={written} skipped={skipped} pruned={pruned}\n")
+        if withheld:        # silent drops used to look like "the sandbox cannot find my module"
+            notifier.notify("Files kept out of the sandbox",
+                            f"{len(withheld)} file(s) look like secrets and are not stored, so the sandbox and the patcher cannot see them: "
+                            f"{', '.join(sorted(withheld)[:6])}{' ...' if len(withheld) > 6 else ''}",
+                            level="WARNING", repo_id=repo_id)
         await self._record_disk_sync(repo_id, shadowed)
         return {"stored": len(kept), "updated": written, "skipped": skipped}
 
@@ -235,8 +256,14 @@ class EngineController:
                             level="WARNING", repo_id=repo_id)
 
     async def incremental_reingest_file(self, repo_id: str, root_path: Path, rel_path: str):
+        rel_path = rel_path.replace("\\", "/")          # callers may still pass a Windows-style key
         full_path = root_path / rel_path
         if not full_path.exists() or self.is_excluded(full_path, root_path):
+            return
+
+        if full_path.name.lower() in {n.lower() for n in settings.sandbox_env_files}:
+            # env templates live in the raw store only (sandbox config); they are not searchable code
+            await self.repo_store.upsert_base_files(repo_id, [(rel_path.replace("\\", "/"), full_path.read_bytes())])
             return
 
         fhash = self.compute_file_hash(full_path)
@@ -301,7 +328,7 @@ class EngineController:
         pending_tasks: List[Tuple[str, str, str, str, int, int]] = []
         
         for fpath in all_files:
-            rel_path = str(fpath.relative_to(root_path))
+            rel_path = self.rel_key(fpath, root_path)
             fhash = self.compute_file_hash(fpath)
             if completed_hashes.get(rel_path) == fhash:
                 continue

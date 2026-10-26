@@ -88,14 +88,19 @@ class ChangeResult:
         if t.get("inconclusive"):
             return f"**Tests inconclusive:** {t.get('note')}"
         if not t.get("ran"):
-            return f"**Tests not run:** {t.get('note') or 'sandbox not used'}."
+            return (f"**Tests not run:** {t.get('note') or 'sandbox not used'}."
+                    + (f" (reason: `{t['not_run']}`)" if t.get("not_run") else ""))
         if t.get("mode") == "smoke":
             line = f"Import check: {t['passed']} module(s) import cleanly in the sandbox (the repo has no tests)."
         else:
             line = (f"Tests: **{t['passed']} passed**, {t['failed'] - t['preexisting']} new failure(s)"
                     f" ({t['selected']} test file(s), {t['strategy']}).")
         if t.get("preexisting"):
-            line += f" {t['preexisting']} failure(s) already existed before the change and were ignored."
+            line += (f" {t['preexisting']} failure(s) already existed "
+                     f"{'on your disk' if t.get('baseline') == 'disk' else 'before the change'} and were ignored.")
+        if t.get("on_unapplied_n"):
+            line += (f" **Verified on top of {t['on_unapplied_n']} file(s) from earlier proposals that are not applied to your disk yet "
+                     f"({', '.join(t.get('on_unapplied', [])[:3])}): apply them together.**")
         pr = t.get("proof") or {}
         if pr.get("files"):
             if not pr.get("checked"):
@@ -873,12 +878,13 @@ class RepoChangeService:
                 problems.append("The edits changed nothing.")
 
         # L0 checks on everything changed so far; ignore failures the base file already had
-        results = static_check.check_files(working)
+        known_paths = list(dict.fromkeys(list(state["known"]) + list(working)))
+        results = static_check.check_files(working, known_paths=known_paths)
         base_results = []
         for p in working:
             f = await self.store.get_file(state["repo_id"], p, state["base_rev"])
             if f:
-                base_results += static_check.check_files({p: f.data})
+                base_results += static_check.check_files({p: f.data}, known_paths=known_paths)
         fresh = static_check.new_failures(base_results, results)
         for r in fresh:
             snip = self._snippet(working[r.path], r.line)

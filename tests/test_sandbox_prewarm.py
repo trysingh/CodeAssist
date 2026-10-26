@@ -251,8 +251,8 @@ def test_prewarm_builds_once_and_the_tag_is_the_one_verify_uses():
 def test_requirements_for_matches_verify_for_every_layout_and_after_a_revision():
     layouts = [
         [("requirements.txt", b"a==1\n")],
-        [("requirements.txt", b"a==1\n"), ("requirements-test.txt", b"pytest==8\n")],           # test file wins
-        [("requirements.txt", b"a==1\n"), ("requirements-dev.txt", b"b==2\n")],                 # dev beats plain
+        [("requirements.txt", b"a==1\n"), ("requirements-test.txt", b"pytest==8\n")],           # both files are merged
+        [("requirements.txt", b"a==1\n"), ("requirements-dev.txt", b"b==2\n")],                 # both files are merged
         [("sub/requirements.txt", b"nested==1\n")],                                             # only the repo root counts
         [],
     ]

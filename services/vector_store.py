@@ -89,7 +89,9 @@ class VectorStoreService:
         try:
             vectorstore = self._get_vectorstore(repo_id)
             # Fetch existing chunk IDs for this file path using Chroma metadata filter
-            existing = vectorstore.get(where={"file_path": file_path})
+            # Match both separator styles: vectors written before the POSIX-key change carry "a\\b.py" on Windows
+            posix = file_path.replace("\\", "/")
+            existing = vectorstore.get(where={"file_path": {"$in": list({posix, posix.replace("/", "\\"), file_path})}})
             if existing and existing.get("ids"):
                 vectorstore.delete(ids=existing["ids"])
         except Exception as exc:

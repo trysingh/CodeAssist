@@ -1,7 +1,7 @@
 """Fast in-process checks on edited files (verification level L0).
 
 No sandbox needed: parse-level problems are caught before any test run.
-Missing optional libraries (pyflakes, yaml, jinja2, tomllib) just mean that
+Missing optional libraries (pyflakes, yaml, jinja2, tomllib, tree-sitter) just mean that
 check is reported as skipped, never as passed.
 """
 from __future__ import annotations
@@ -27,6 +27,14 @@ try:
     import tomllib as _tomllib
 except Exception:  # pragma: no cover
     _tomllib = None
+try:
+    from jinja2 import nodes as _jnodes
+except Exception:  # pragma: no cover
+    _jnodes = None
+try:
+    from tree_sitter_language_pack import get_parser as _ts_parser     # already needed by the chunker
+except Exception:  # pragma: no cover
+    _ts_parser = None
 
 # pyflakes message classes that mean "this will crash", not style
 _FATAL_PYFLAKES = {"UndefinedName", "UndefinedLocal", "UndefinedExport"}
@@ -115,14 +123,82 @@ def _jinja(path: str, text: str) -> List[CheckResult]:
         return [CheckResult(path, "jinja", False, e.message, e.lineno)]
 
 
+_JS_MAX_BYTES = 400_000          # bundles / minified vendor files are not worth a parse
+
+
+def _first_syntax_error(root):
+    """The first ERROR / missing node, depth first (None if the tree cannot be walked)."""
+    stack = [root]
+    while stack:
+        n = stack.pop()
+        if n.type == "ERROR" or getattr(n, "is_missing", False):
+            return n
+        if n.has_error:
+            stack.extend(reversed(n.children))
+    return None
+
+
+def _js(path: str, text: str) -> List[CheckResult]:
+    """Syntax only (nothing is executed): modern JS / JSX included, via the tree-sitter grammar the chunker already uses."""
+    if _ts_parser is None:
+        return [CheckResult(path, "js-syntax", True, "tree-sitter not installed", skipped=True)]
+    if len(text) > _JS_MAX_BYTES:
+        return [CheckResult(path, "js-syntax", True, "file too large to check", skipped=True)]
+    try:
+        root = _ts_parser("javascript").parse(text.encode("utf-8")).root_node
+        if not root.has_error:
+            return [CheckResult(path, "js-syntax", True)]
+        node = _first_syntax_error(root)
+        row = node.start_point[0] if node is not None else 0
+        lines = text.splitlines()
+        near = (lines[row].strip() if row < len(lines) else "")[:80]
+        what = "missing token" if node is not None and getattr(node, "is_missing", False) else "unexpected syntax"
+        return [CheckResult(path, "js-syntax", False, f"{what} near: {near}", row + 1)]
+    except Exception as e:      # grammar not available offline, binding differences ...
+        return [CheckResult(path, "js-syntax", True, f"parser unavailable ({type(e).__name__})", skipped=True)]
+
+
+def _template_exists(name: str, from_path: str, known: set) -> bool:
+    name = name.lstrip("/").replace("\\", "/")
+    here = from_path.rsplit("/", 1)[0] + "/" if "/" in from_path else ""
+    if name in known or ("templates/" + name) in known or (here + name) in known:
+        return True
+    return any(k.endswith("/" + name) for k in known)
+
+
+def jinja_references(path: str, text: str, known_paths) -> List[CheckResult]:
+    """{% extends / include / import / from %} targets that are not in the repo: TemplateNotFound at the first request.
+    Dynamic names ({% extends layout %}) and `include ... ignore missing` are not judged."""
+    if _jinja2 is None or _jnodes is None or "{%" not in text:
+        return []
+    try:
+        ast_ = _jinja2.Environment().parse(text)
+        wanted = []
+        for node in ast_.find_all((_jnodes.Extends, _jnodes.Include, _jnodes.Import, _jnodes.FromImport)):
+            if isinstance(node, _jnodes.Include) and getattr(node, "ignore_missing", False):
+                continue
+            if isinstance(node.template, _jnodes.Const) and isinstance(node.template.value, str):
+                wanted.append(node.template.value)
+    except Exception:
+        return []
+    known = set(known_paths or ())
+    names = list(dict.fromkeys(wanted))
+    out = [CheckResult(path, "jinja-ref", False, f"template '{n}' (extends/include/import) is not in the repo")
+           for n in names if not _template_exists(n, path, known)]
+    return out or ([CheckResult(path, "jinja-ref", True)] if names else [])
+
+
 _BY_SUFFIX = {
     ".py": _py, ".json": _json, ".jsonl": _json,
     ".yaml": _yaml_check, ".yml": _yaml_check, ".toml": _toml,
     ".html": _jinja, ".htm": _jinja, ".jinja": _jinja, ".j2": _jinja,
+    ".js": _js, ".mjs": _js, ".cjs": _js, ".jsx": _js,
 }
+_TEMPLATE_SUFFIXES = (".html", ".htm", ".jinja", ".j2")
 
 
-def check_files(files: Dict[str, bytes]) -> List[CheckResult]:
+def check_files(files: Dict[str, bytes], known_paths=None) -> List[CheckResult]:
+    """`known_paths` = every file path of the repo view (+ the edited files): enables the template-reference check."""
     results: List[CheckResult] = []
     for path in sorted(files):
         suffix = "." + path.rsplit(".", 1)[-1].lower() if "." in path.rsplit("/", 1)[-1] else ""
@@ -136,6 +212,8 @@ def check_files(files: Dict[str, bytes]) -> List[CheckResult]:
             results.append(CheckResult(path, "encoding", False, "not valid UTF-8"))
             continue
         results.extend(fn(path, text))
+        if known_paths is not None and suffix in _TEMPLATE_SUFFIXES:
+            results.extend(jinja_references(path, text, known_paths))
     return results
 
 
