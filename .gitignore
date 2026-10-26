@@ -1,0 +1,17 @@
+# Environment variables and secrets
+.env
+
+# Database files
+*.db
+.db
+
+# Python cache
+*.pyc
+__pycache__/
+
+# Specific storage folders
+.engine_storage/
+
+# OS generated files (Recommended)
+.DS_Store
+Thumbs.db
