@@ -42,6 +42,7 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from services.boot_check import BOOT_PY, find_entries
 from services.notifier import notifier
 from services.requirements_merge import collect, include_targets, merge_requirements, requirements_from
 
@@ -146,6 +147,7 @@ class SandboxVerdict:
     not_run: str = ""                               # why nothing was verified (reason code, see NOT_RUN); "" = something ran
     on_unapplied: List[str] = field(default_factory=list)   # files this run saw that differ from disk (earlier proposals not applied yet)
     baseline: str = ""                              # what "already failing" was measured against: disk | base
+    boot: dict = field(default_factory=dict)        # app boot check: ran, ok, entries, why (services/boot_check.py)
 
     @property
     def ran(self) -> bool:
@@ -165,7 +167,8 @@ class SandboxVerdict:
                 "new_failure_details": [_case_dict(c) for c in self.new_failures[:8]],
                 "preexisting_details": [_case_dict(c) for c in self.preexisting_cases[:8]],
                 "hints": self.hints[:3], "proof": self.proof, "not_run": self.not_run,
-                "on_unapplied_n": len(self.on_unapplied), "on_unapplied": self.on_unapplied[:8], "baseline": self.baseline}
+                "on_unapplied_n": len(self.on_unapplied), "on_unapplied": self.on_unapplied[:8], "baseline": self.baseline,
+                "boot": self.boot}
 
 
 # Why a verification did not happen. Stable codes so a UI / the telemetry can count which one dominates.
@@ -398,6 +401,21 @@ def parse_run(raw: RawRun, mode: str, backend: str, timeout_s: Optional[int] = N
         rep.timed_out = True
         rep.failures.append(CaseResult("sandbox::timeout", "timeout",
                                        f"run exceeded {timeout_s or settings.sandbox_test_timeout_s}s", _trim(rep.tail, 800)))
+        return rep
+    if mode == "boot":
+        for line in console.splitlines():
+            p = line.split("|", 3)
+            if len(p) >= 3 and p[0] == "BOOT":
+                msg = p[3] if len(p) > 3 else ""
+                if p[2] == "OK":
+                    rep.passed += 1
+                elif p[2] == "SKIP":
+                    rep.skipped += 1
+                elif p[2] == "ERR":
+                    rep.failed += 1
+                    rep.failures.append(CaseResult(f"boot::{p[1]}", "error", _trim(msg, 300), msg))
+        if rc not in (0, None) and not rep.failures:
+            rep.failures.append(CaseResult("boot::crash", "error", f"exit {rc}", _trim(rep.tail, 800)))
         return rep
     if mode == "smoke":
         for line in console.splitlines():
@@ -940,7 +958,10 @@ class SandboxService:
                        smoke: List[str], requirements: str, repo_id: str = "", label: str = "",
                        timeout: Optional[int] = None) -> RunReport:
         extra: Dict[str, bytes] = {}
-        if mode == "smoke":
+        if mode == "boot":                       # `smoke` carries the app entries here
+            extra = {".sbx_boot.py": BOOT_PY.encode(), ".sbx_boot.json": json.dumps({"entries": smoke}).encode()}
+            argv = ["python", ".sbx_boot.py"]
+        elif mode == "smoke":
             extra = {".sbx_smoke.py": _SMOKE_PY.encode(), ".sbx_smoke.json": json.dumps(smoke).encode()}
             argv = ["python", ".sbx_smoke.py"]
         else:
@@ -1020,6 +1041,75 @@ class SandboxService:
 
     async def verify(self, repo_id: str, base_rev: int, working: Dict[str, bytes],
                      new_tests: Sequence[str] = ()) -> SandboxVerdict:
+        """Tests (or import smoke), then the app boot check on top."""
+        v = await self._verify_core(repo_id, base_rev, working, new_tests)
+        if (not settings.sandbox_boot_check or not self.enabled
+                or v.not_run in ("disabled", "docker_down", "image_build", "workspace_too_large")
+                or (v.report.ran and v.new_failures)):          # tests already fail: the retry loop re-verifies anyway
+            return v
+        try:
+            return await self._boot_into(v, repo_id, base_rev, working)
+        except Exception as e:  # noqa: BLE001 - the boot check must never take the pipeline down
+            v.boot = {"ran": False, "why": f"boot check error: {type(e).__name__}: {e}"}
+            return v
+
+    async def _boot_into(self, v: SandboxVerdict, repo_id: str, base_rev: int, working: Dict[str, bytes]) -> SandboxVerdict:
+        """Boot the app on the proposal. Failures that also happen on the reference tree are not the change's fault."""
+        base_tree = await self.store.snapshot_bytes(repo_id, base_rev)
+        tree = {**base_tree, **working}
+        entries = find_entries(tree)
+        if not entries:
+            v.boot = {"ran": False, "entries": [], "why": "no FastAPI app in the repo"}
+            return v
+        requirements = self._requirements(tree)
+        if self.runner.name == "docker":
+            tag = self.runner.image_tag(requirements)
+            if tag not in self._ready:
+                err = await self.runner.prepare(requirements)
+                if err:
+                    v.boot = {"ran": False, "entries": entries, "why": err}
+                    return v
+                self._ready.add(tag)
+        cap = settings.sandbox_boot_timeout_s
+        self._emit(f"Booting the app in {self.runner.name}: {', '.join(entries)}")
+        rep = await self._execute(tree, "boot", [], entries, requirements, repo_id=repo_id, label="boot", timeout=cap)
+        rep.strategy = "boot"
+        info = {"ran": False, "entries": entries, "log": rep.log_path}
+        if not rep.ran or rep.timed_out:
+            info["why"] = rep.note or f"the boot check hit the {cap}s cap"
+            v.boot = info
+            return v
+        old: List[CaseResult] = []
+        fresh = list(rep.failures)
+        if fresh:
+            use_base = (settings.sandbox_baseline or "").strip().lower() == "base"
+            ref_tree = base_tree if (use_base or base_rev == 0) else await self.store.snapshot_bytes(repo_id, 0)
+            had = set(find_entries(ref_tree))
+            ref_entries = [e for e in entries if e in had]
+            base_ids: Set[str] = set()
+            if ref_entries:
+                b = await self._execute(ref_tree, "boot", [], ref_entries, requirements, repo_id=repo_id, label="boot-base", timeout=cap)
+                if b.ran and not b.timed_out:
+                    base_ids = {c.id for c in b.failures}
+            old = [c for c in fresh if c.id in base_ids]
+            fresh = [c for c in fresh if c.id not in base_ids]
+        if rep.passed == 0 and not fresh:      # nothing succeeded, even before the change: that proves nothing
+            info["why"] = "the app does not boot in the sandbox even without the change: " + (old[0].message if old else "no step succeeded")
+            v.boot = info
+            return v
+        info.update(ran=True, ok=not fresh, steps=rep.passed, skipped=rep.skipped, preexisting=len(old),
+                    new_failures=[c.id for c in fresh][:8])
+        v.boot = info
+        if fresh and v.report.ran:
+            v.new_failures = list(v.new_failures) + fresh      # the retry loop sees the real traceback
+        elif fresh or (not v.report.ran and v.not_run == "no_target"):
+            # no test judged this change (e.g. only a template changed): the boot run IS the verdict
+            return SandboxVerdict(rep, new_failures=fresh, preexisting=len(old), preexisting_cases=old, hints=v.hints,
+                                  on_unapplied=v.on_unapplied, baseline=v.baseline, boot=info)
+        return v
+
+    async def _verify_core(self, repo_id: str, base_rev: int, working: Dict[str, bytes],
+                           new_tests: Sequence[str] = ()) -> SandboxVerdict:
         """Run the proposal. `working` = {path: new bytes} on top of the repo at `base_rev`.
         `new_tests` = generated test files inside `working`: they always run, and (when everything passes) are re-run
         against the OLD code to prove they fail without the change."""

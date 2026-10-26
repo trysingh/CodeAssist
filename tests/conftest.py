@@ -12,5 +12,6 @@ os.environ["ENGINE_CHANGE_REVIEW"] = "false"            # the reviewer is opt-in
 os.environ["ENGINE_CHANGE_TASKS"] = "false"             # the task loop is opt-in for tests, like the other stages
 os.environ["ENGINE_CHANGE_CONTRACT"] = "false"          # scripted LLM tests expect no contract-designer call; those tests opt in
 os.environ["ENGINE_CHANGE_AUTHOR_TESTS"] = "false"   # scripted LLM tests expect no extra test-author model call; those tests opt in
+os.environ["ENGINE_CHANGE_GATE"] = "off"                 # gate tests opt in; the scripted pipeline tests run with the sandbox disabled
 os.environ["ENGINE_SANDBOX_ENABLED"] = "false"      # Phase 1 tests do not touch Docker; Phase 2 tests opt in explicitly
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))

@@ -90,7 +90,10 @@ class ChangeResult:
         if not t.get("ran"):
             return (f"**Tests not run:** {t.get('note') or 'sandbox not used'}."
                     + (f" (reason: `{t['not_run']}`)" if t.get("not_run") else ""))
-        if t.get("mode") == "smoke":
+        if t.get("mode") == "boot":
+            line = (f"Boot check: the app starts and {t['passed']} step(s) (import, openapi, startup, GET routes) ran without a server error "
+                    f"(no test covers this change).")
+        elif t.get("mode") == "smoke":
             line = f"Import check: {t['passed']} module(s) import cleanly in the sandbox (the repo has no tests)."
         else:
             line = (f"Tests: **{t['passed']} passed**, {t['failed'] - t['preexisting']} new failure(s)"
@@ -98,6 +101,11 @@ class ChangeResult:
         if t.get("preexisting"):
             line += (f" {t['preexisting']} failure(s) already existed "
                      f"{'on your disk' if t.get('baseline') == 'disk' else 'before the change'} and were ignored.")
+        b = t.get("boot") or {}
+        if b.get("ran") and t.get("mode") != "boot":
+            line += f" App boot check: {b.get('steps', 0)} step(s) ran without a server error."
+        elif b.get("entries") and not b.get("ran"):
+            line += f" **App boot check did not run: {b.get('why', 'unknown')}.**"
         if t.get("on_unapplied_n"):
             line += (f" **Verified on top of {t['on_unapplied_n']} file(s) from earlier proposals that are not applied to your disk yet "
                      f"({', '.join(t.get('on_unapplied', [])[:3])}): apply them together.**")
@@ -196,6 +204,7 @@ class ChangeState(TypedDict, total=False):
     review_fix: List[dict]            # symbols the reviewer pinned a finding on
     tasks: List[dict]                 # task loop log: id, file, name, kind, status
     tasks_complete: bool              # every task done and nothing left for the single patch
+    gated: List[str]                  # why the release gate held the proposal back (empty = released)
     tests_first: bool                 # gen_tests were written before the code and are read-only for the patcher
     focus: List[str]                  # plan files still without edits: the next patch call shows ONLY these
     noop_files: List[str]             # files the patcher answered NO_CHANGE for (kept across retries)
@@ -470,7 +479,12 @@ class RepoChangeService:
         res.plan = out.get("plan", "")
         res.verification = self._verification(res.tests)
         res.ok = out.get("status") == "ok" and res.revision is not None
-        await self._fill_diff(res, out.get("working", {}), base_rev)
+        if out.get("gated") or (not res.ok and (settings.change_gate or "off").strip().lower() in ("smoke", "strict")):
+            if res.attempts:      # the gate is on: a diff that did not pass verification is not shown, not even as "not saved"
+                res.notes.append("The attempted edits are not shown because they did not pass verification. "
+                                 "ENGINE_CHANGE_GATE=off shows and saves unverified proposals.")
+        else:
+            await self._fill_diff(res, out.get("working", {}), base_rev)
         return res
 
     # ------------------------------------------------------------------ helpers
@@ -963,6 +977,15 @@ class RepoChangeService:
             self._emit(f"call check skipped: {type(e).__name__}", "WARNING")
             return [], []
 
+    async def _gate(self, state: ChangeState) -> dict:
+        """Nothing is reviewed, saved or shown unless the sandbox evidence meets ENGINE_CHANGE_GATE."""
+        why = gates.release_gate(state.get("tests", {}), list(state["working"]), settings.change_gate)
+        if not why:
+            return {}
+        self._emit("Held back by the verification gate: " + why[0], "WARNING")
+        return {"status": "failed", "gated": why, "errors": ["Not shared: " + w for w in why],
+                "trace": ["held back by the verification gate"]}
+
     async def _persist(self, state: ChangeState) -> dict:
         changes = {}
         for p, data in state["working"].items():
@@ -991,7 +1014,7 @@ class RepoChangeService:
                 if t.get("passed", 0) <= 0:
                     return "L0-static"                                            # 0 passed verifies nothing
                 return "L3-fail-to-pass" if (t.get("proof") or {}).get("proves", 0) > 0 else "L2-tests"
-            return "L1-import-smoke"
+            return "L1-boot-smoke" if t.get("mode") == "boot" else "L1-import-smoke"
         return "L0-static"
 
     @staticmethod
@@ -1747,6 +1770,7 @@ class RepoChangeService:
         g.add_node("apply_check", self._apply_check)
         g.add_node("author_tests", self._author_tests)
         g.add_node("sandbox", self._sandbox)
+        g.add_node("gate", self._gate)
         g.add_node("review", self._review)
         g.add_node("fix_tasks", self._fix_tasks)
         g.add_node("persist", self._persist)
@@ -1766,8 +1790,9 @@ class RepoChangeService:
         g.add_edge("author_tests", "sandbox")
         g.add_conditional_edges(
             "sandbox",
-            lambda s: {"ok": "review", "retry": "patch", "retry_tests": "author_tests"}.get(s.get("status"), END),
-            {"review": "review", "patch": "patch", "author_tests": "author_tests", END: END})
+            lambda s: {"ok": "gate", "retry": "patch", "retry_tests": "author_tests"}.get(s.get("status"), END),
+            {"gate": "gate", "patch": "patch", "author_tests": "author_tests", END: END})
+        g.add_conditional_edges("gate", lambda s: "review" if s.get("status") == "ok" else END, {"review": "review", END: END})
         g.add_conditional_edges(
             "review",
             lambda s: {"ok": "persist", "retry": "patch", "fix": "fix_tasks"}.get(s.get("status"), END),

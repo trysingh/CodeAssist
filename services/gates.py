@@ -44,3 +44,31 @@ def lost_attributes(old: bytes, new: bytes, qualname: str) -> List[str]:
     st_o, _ = _self_attrs(old, cls)
     st_n, ld_n = _self_attrs(new, cls)
     return [f"self.{a} used to be set and is still read, but nothing sets it now: keep it" for a in sorted(st_o - st_n) if a in ld_n]
+
+
+_INERT = (".md", ".rst", ".txt", ".css", ".svg")
+
+
+def _is_test(p: str) -> bool:
+    name = p.rsplit("/", 1)[-1]
+    return name.startswith("test_") or name.endswith("_test.py") or "tests/" in p
+
+
+def release_gate(tests: dict, files: List[str], mode: str) -> List[str]:
+    """Why a verified-looking proposal may not be shown yet. [] = release.
+    mode: off | smoke (sandbox passed + app boots) | strict (smoke + a test written for the change proves it, python changes only)."""
+    if (mode or "off").strip().lower() not in ("smoke", "strict") or all(p.lower().endswith(_INERT) for p in files):
+        return []
+    why: List[str] = []
+    if not (tests.get("ran") and tests.get("ok")) or tests.get("inconclusive"):
+        why.append("the sandbox did not verify this change: " + (tests.get("note") or "tests did not run")
+                   + (f" (reason: {tests['not_run']})" if tests.get("not_run") else ""))
+    boot = tests.get("boot") or {}
+    if boot.get("entries") and not (boot.get("ran") and boot.get("ok")):
+        why.append("the app was not shown to boot: " + (boot.get("why") or ", ".join(boot.get("new_failures", [])[:2]) or "boot check failed"))
+    if mode.strip().lower() == "strict":
+        if any(p.endswith(".py") and not _is_test(p) for p in files) and not (tests.get("proof") or {}).get("proves"):
+            why.append("no test written for this change fails on the old code and passes on the new")
+        if tests.get("generated_dropped"):
+            why.append("tests written for the change kept failing and were dropped")
+    return why

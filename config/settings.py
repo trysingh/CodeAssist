@@ -88,6 +88,10 @@ class EngineSettings(BaseSettings):
     change_task_num_ctx: int = Field(default=0)        # 0 = change_num_ctx. A smaller value (e.g. 8192) makes task calls cheaper, but Ollama may reload the model whenever num_ctx changes between calls
     change_review: bool = Field(default=True)          # a fresh-context reviewer checks coverage per requirement and unrequested edits (one round)
     change_review_max_chars: int = Field(default=24000)  # diff budget for the reviewer
+    change_gate: str = Field(default="strict")         # who gets to SEE a proposal. strict = sandbox ran and passed + the app boots + (python changes) a test written for the change fails on the old code and passes on the new.
+                                                       # smoke = sandbox passed + the app boots. off = every proposal is saved and shown, the verification level is only a label
+    sandbox_boot_check: bool = Field(default=True)     # boot the app in the sandbox and GET every plain route (services/boot_check.py)
+    sandbox_boot_timeout_s: int = Field(default=60)
     designer_model: str = Field(default="")            # per-role models; empty = patcher model. An explicit role model also ignores the user's per-request pick
     implementer_model: str = Field(default="")
     reviewer_model: str = Field(default="")
