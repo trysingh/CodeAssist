@@ -88,6 +88,14 @@ class EngineSettings(BaseSettings):
     change_task_num_ctx: int = Field(default=0)        # 0 = change_num_ctx. A smaller value (e.g. 8192) makes task calls cheaper, but Ollama may reload the model whenever num_ctx changes between calls
     change_review: bool = Field(default=True)          # a fresh-context reviewer checks coverage per requirement and unrequested edits (one round)
     change_review_max_chars: int = Field(default=24000)  # diff budget for the reviewer
+    # Reasoning / repair controls (see services/repo_change.py: _apply_check, _diagnose, _gap_decide)
+    change_partial_apply: bool = Field(default=True)   # keep the edit blocks that matched when others in the same file did not; the retry re-sends only the failed ones
+    change_repair_attempts: int = Field(default=3)     # edit-format / apply / static / plan-gap retries that do NOT use up change_max_attempts (a pool for the whole run; 0 = old rule)
+    change_diagnose: bool = Field(default=True)        # before a retry caused by failing tests or a review finding (or a repeated edit failure) a separate step writes root cause + minimal fix; the patcher follows it
+    change_gap_decide: bool = Field(default=True)      # a plan file the patcher skipped twice gets one targeted CHANGE / NO_CHANGE check (NO_CHANGE needs a quoted line that exists in the file)
+    change_escalation_model: str = Field(default="")   # model for the LAST counted attempt only (empty = same as the patcher); e.g. a larger cloud model
+    diagnoser_model: str = Field(default="")           # model for the diagnosis / gap check; empty = patcher model
+    change_logs_keep: int = Field(default=30)          # per-run attempt logs (raw model replies, problems, diagnosis) kept under <storage_dir>/change_logs/<repo>; 0 = no logs
     change_gate: str = Field(default="strict")         # who gets to SEE a proposal. strict = sandbox ran and passed + the app boots + (python changes) a test written for the change fails on the old code and passes on the new.
                                                        # smoke = sandbox passed + the app boots. off = every proposal is saved and shown, the verification level is only a label
     sandbox_boot_check: bool = Field(default=True)     # boot the app in the sandbox and GET every plain route (services/boot_check.py)

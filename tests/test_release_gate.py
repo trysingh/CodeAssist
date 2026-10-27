@@ -5,7 +5,7 @@ import pytest
 
 from config.settings import settings
 from services import sandbox_service as sbx
-from services.boot_check import find_entries
+from services.boot_check import BOOT_PY, find_entries
 from services.gates import release_gate
 from services.repo_change import RepoChangeService
 from services.repo_store import RepoStore
@@ -34,6 +34,12 @@ def test_find_entries_finds_app_and_factory_and_skips_tests():
     t = {"main.py": MAIN, "svc/api.py": b"from fastapi import FastAPI\ndef create_app():\n    return FastAPI()\n",
          "tests/test_x.py": b"from fastapi import FastAPI\napp = FastAPI()\n", "notes.py": b"x = 1\n"}
     assert find_entries(t) == ["main:app", "svc.api:create_app()"]
+
+
+def test_boot_script_runs_without_unix_signals():
+    # LocalRunner runs it on the host, which may be Windows: no SIGALRM / signal.alarm there.
+    compile(BOOT_PY, "<boot>", "exec")
+    assert not any(w in BOOT_PY for w in ("SIGALRM", "signal.alarm", "import signal", ", signal,"))
 
 
 GREEN = {"ran": True, "ok": True, "mode": "pytest", "passed": 3, "proof": {"proves": 1},

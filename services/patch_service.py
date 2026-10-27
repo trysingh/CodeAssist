@@ -13,7 +13,9 @@ Apply rules (why a bad block fails loudly instead of corrupting a file):
   * the SEARCH text must match whole lines and match EXACTLY ONE place;
   * matching is tried strictest-first: exact -> trailing-space-insensitive ->
     indentation-insensitive (replacement is re-indented to fit);
-  * a file with any failed block is not applied at all (no half-edited files);
+  * a file with any failed block is not applied at all (no half-edited files), unless apply_edits(partial=True): then
+    the blocks that DID match are kept and the failed ones are reported by index (ApplyResult.partial), so a retry only
+    has to re-send what failed instead of redoing (or silently losing) the whole file;
   * original line endings (CRLF/LF) are preserved.
 """
 from __future__ import annotations
@@ -57,6 +59,7 @@ class ApplyResult:
     outcomes: List[EditOutcome] = field(default_factory=list)
     errors: List[str] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
+    partial: Dict[str, Dict[str, List[int]]] = field(default_factory=dict)     # path -> {"applied": [idx], "failed": [idx]}
 
     @property
     def ok(self) -> bool:
@@ -226,8 +229,10 @@ def _detect_newline(text: str) -> Tuple[str, bool]:
     return ("\r\n" if crlf > lf_only else "\n"), (crlf > 0 and lf_only > 0)
 
 
-def apply_edits(edits: List[Edit], contents: Dict[str, Optional[bytes]]) -> ApplyResult:
-    """Apply resolved edits. `contents[path]` is the current bytes, or None for a new file."""
+def apply_edits(edits: List[Edit], contents: Dict[str, Optional[bytes]], partial: bool = False) -> ApplyResult:
+    """Apply resolved edits. `contents[path]` is the current bytes, or None for a new file.
+    partial=False (default): a file with any failed block is left untouched. partial=True: the blocks that matched are
+    applied, the failed ones stay in `errors` and are listed per file in `partial` (a new file is never partial)."""
     res = ApplyResult()
     order: List[str] = []
     grouped: Dict[str, List[Edit]] = {}
@@ -325,7 +330,10 @@ def apply_edits(edits: List[Edit], contents: Dict[str, Optional[bytes]]) -> Appl
 
         res.outcomes.extend(file_outcomes)
         if failed:
-            continue                                          # never half-apply a file
+            good = [o.index for o in file_outcomes if o.ok]
+            if not (partial and good and not creating):
+                continue                                      # never half-apply a file (default)
+            res.partial[path] = {"applied": good, "failed": [o.index for o in file_outcomes if not o.ok]}
         new_text = "\n".join(lines)
         if nl == "\r\n":
             new_text = new_text.replace("\n", "\r\n")

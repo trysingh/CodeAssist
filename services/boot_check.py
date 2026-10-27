@@ -49,7 +49,7 @@ def find_entries(tree: Dict[str, bytes], limit: int = 3) -> List[str]:
 
 
 # Runs INSIDE the sandbox container from the workspace root. Output lines: BOOT|<step>|OK|ERR|SKIP|<message>
-BOOT_PY = r'''import importlib, json, os, signal, sys, traceback
+BOOT_PY = r'''import importlib, json, os, sys, threading, traceback
 
 def out(step, state, msg=""):
     print("BOOT|%s|%s|%s" % (step, state, " ".join(str(msg).split())[:400]), flush=True)
@@ -59,7 +59,11 @@ def where(e):
     if not tb:
         return "%s: %s" % (type(e).__name__, e)
     f = tb[-1]
-    return "%s: %s (%s:%d in %s)" % (type(e).__name__, e, os.path.relpath(f.filename), f.lineno, f.name)
+    try:
+        rel = os.path.relpath(f.filename)
+    except ValueError:      # Windows: file on another drive than the cwd
+        rel = f.filename
+    return "%s: %s (%s:%d in %s)" % (type(e).__name__, e, rel, f.lineno, f.name)
 
 def walk(routes, prefix=""):
     # newer FastAPI wraps include_router() lazily (original_router + include_context); older flattens. Handle both.
@@ -79,11 +83,26 @@ def get_paths(app):
         pass
     return [p for p in found if "{" not in p]
 
-def _alarm(*_):
-    raise TimeoutError("no answer in 8s")
+def call(fn, seconds):
+    # Unix alarm signals do not exist on Windows (LocalRunner runs this on the host): time-box with a thread instead.
+    box = {}
+
+    def run():
+        try:
+            box["ok"] = fn()
+        except BaseException as e:
+            box["err"] = e
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    t.join(seconds)
+    if t.is_alive():
+        raise TimeoutError("no answer in %ds" % seconds)
+    if "err" in box:
+        raise box["err"]
+    return box["ok"]
 
 sys.path.insert(0, os.getcwd())
-signal.signal(signal.SIGALRM, _alarm)
 for spec in json.load(open(".sbx_boot.json"))["entries"]:
     mod, _, attr = spec.partition(":")
     try:
@@ -114,18 +133,14 @@ for spec in json.load(open(".sbx_boot.json"))["entries"]:
     for p in paths:
         step = "%s#GET %s" % (spec, p)
         try:
-            signal.alarm(8)
-            r = client.get(p, follow_redirects=True)
-            signal.alarm(0)
+            r = call(lambda: client.get(p, follow_redirects=True), 8)
             if r.status_code >= 500:
                 out(step, "ERR", "HTTP %d %s" % (r.status_code, r.text[:200]))
             else:
                 out(step, "OK", r.status_code)
         except TimeoutError as e:
-            signal.alarm(0)
             out(step, "SKIP", str(e))
         except BaseException as e:
-            signal.alarm(0)
             out(step, "ERR", where(e))
 sys.stdout.flush()
 os._exit(0)

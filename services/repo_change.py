@@ -24,7 +24,9 @@ import hashlib
 import operator
 import ast
 import re
+import time
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Dict, List, Optional, Tuple, TypedDict
 
 from langgraph.graph import END, START, StateGraph
@@ -67,6 +69,7 @@ class ChangeResult:
     tests: dict = field(default_factory=dict)
     verification: str = "L0-static"
     plan: str = ""
+    repairs: int = 0                                      # patch calls that were free edit repairs (not counted as attempts)
 
     def _sandbox_block(self) -> str:
         """What the container reported, beyond counts: failing ids with the reason, base-vs-change, likely cause, log file."""
@@ -139,7 +142,8 @@ class ChangeResult:
             if self.errors and self.errors[0].startswith("Nothing to change"):
                 head = "**Nothing to change.** The code already does this, so no revision was created.\n"
             else:
-                head = (f"**I could not produce a safe change** after {self.attempts} attempt(s). "
+                head = (f"**I could not produce a safe change** after {self.attempts} attempt(s)"
+                        + (f" ({self.repairs} of them were cheap edit repairs)" if self.repairs else "") + ". "
                         f"Nothing was saved and nothing was written to your repo.\n")
 
         parts = [head.rstrip()]
@@ -208,6 +212,14 @@ class ChangeState(TypedDict, total=False):
     tests_first: bool                 # gen_tests were written before the code and are read-only for the patcher
     focus: List[str]                  # plan files still without edits: the next patch call shows ONLY these
     noop_files: List[str]             # files the patcher answered NO_CHANGE for (kept across retries)
+    free: int                         # edit repairs granted for free: they do not count against change_max_attempts
+    apply_sig: str                    # signature of the last edit-stage problems (the same problem twice = stuck)
+    stuck: bool                       # the last retry reason repeated unchanged: ask for a diagnosis
+    retry_kind: str                   # edit | tests | review: why the next patch call happens ("" = first call)
+    gap_seen: Dict[str, int]          # plan file -> rounds it was still without edits
+    failure_detail: str               # longer failure output for the diagnosis step
+    log_path: str                     # per-run attempt log (raw replies, problems, diagnosis)
+    history: Annotated[List[str], operator.add]     # one line per failed attempt
     trace: Annotated[List[str], operator.add]
 
 
@@ -421,6 +433,49 @@ Reply ONLY with JSON:
   "unrequested": [{{"file": "path", "symbol": "name or empty", "why": "..."}}]}}
 """
 
+_DIAGNOSE_PROMPT = """You are a debugging analyst. Do NOT write code and do NOT write edit blocks. A code change was attempted and failed a check.
+Find out why, so that the next attempt can be a small, correct edit.
+
+REQUEST:
+{request}
+{plan}
+WHAT HAS BEEN CHANGED SO FAR (diff against the original):
+{diff}
+
+FAILURE (output of the check):
+{failure}
+
+EARLIER FAILURES (already tried, they did not work):
+{earlier}
+
+Reply in exactly this form, brief and specific. Quote the line of the output that proves each claim.
+ROOT CAUSE: <one or two sentences: the exact file::symbol that is wrong and what is wrong in it>
+FAULT IN: code | test | environment - <one line why>
+FIX: <numbered minimal edits, each as `file::symbol - what to change`>
+DO NOT: <what the earlier attempt(s) did that must not be repeated>
+"""
+
+_GAP_PROMPT = """You decide whether ONE file needs an edit for a request. Do NOT write code.
+
+REQUEST:
+{request}
+
+WHAT THE PLAN SAYS FOR {path}:
+{what}
+
+ALREADY CHANGED IN OTHER FILES (read-only context):
+{done}
+
+CURRENT CONTENT OF {path}:
+{text}
+
+Reply in exactly this form:
+VERDICT: CHANGE or NO_CHANGE
+EVIDENCE: for NO_CHANGE, ONE line copied verbatim from the file above that already does what the request needs (else: none)
+WHY: one sentence
+INSTRUCTION: for CHANGE, the exact edit in one or two sentences: which function or element, what to add, with the names the other files introduced (else: none)
+"""
+
 # a test that breaks the contract: wrong name or wrong arguments (not a missing implementation)
 _CONTRACT_VIOLATION = re.compile(r"ImportError|cannot import name|unexpected keyword argument|positional argument|missing \d+ required"
                                  r"|does not have the attribute")        # the last one: mock.patch of a name that is not there (stubs are)
@@ -460,10 +515,11 @@ class RepoChangeService:
             return res
         init: ChangeState = {"repo_id": repo_id, "request": request, "context": context or "", "plan": plan or "", "base_rev": base_rev,
                              "working": {}, "attempt": 0, "feedback": "", "status": "running",
-                             "errors": [], "notes": [], "check_lines": [], "trace": []}
+                             "errors": [], "notes": [], "check_lines": [], "trace": [], "history": [], "free": 0,
+                             "log_path": self._open_log(repo_id, request, base_rev)}
         try:
             out = await self.graph.ainvoke(
-                init, config={"recursion_limit": 24 + 5 * settings.change_max_attempts})
+                init, config={"recursion_limit": 24 + 5 * settings.change_max_attempts + 3 * settings.change_repair_attempts})
         except Exception as e:  # noqa: BLE001 — surface, never crash the chat
             res.errors.append(f"change pipeline error: {type(e).__name__}: {e}")
             return res
@@ -477,8 +533,11 @@ class RepoChangeService:
         res.revision = out.get("revision")
         res.tests = out.get("tests", {})
         res.plan = out.get("plan", "")
+        res.repairs = out.get("free", 0)
         res.verification = self._verification(res.tests)
         res.ok = out.get("status") == "ok" and res.revision is not None
+        if not res.ok and out.get("log_path"):
+            res.notes.append(f"attempt log (raw model replies, problems, diagnosis): {out['log_path']}")
         if out.get("gated") or (not res.ok and (settings.change_gate or "off").strip().lower() in ("smoke", "strict")):
             if res.attempts:      # the gate is on: a diff that did not pass verification is not shown, not even as "not saved"
                 res.notes.append("The attempted edits are not shown because they did not pass verification. "
@@ -591,6 +650,115 @@ class RepoChangeService:
     @staticmethod
     def _brief(items: List[str], n: int = 2, width: int = 150) -> str:
         return " | ".join(i.splitlines()[0][:width] for i in items[:n] if i.strip())
+
+    # ------------------------------------------------------------------ budget, log, diagnosis, gap check
+    @staticmethod
+    def _spent(state: ChangeState) -> int:
+        """Attempts that count against change_max_attempts: every patch call except the free edit repairs."""
+        return state.get("attempt", 0) - state.get("free", 0)
+
+    def _open_log(self, repo_id: str, request: str, base_rev: int) -> str:
+        keep = settings.change_logs_keep
+        if keep <= 0:
+            return ""
+        try:
+            d = Path(settings.storage_dir) / "change_logs" / re.sub(r"[^\w.-]", "_", repo_id)
+            d.mkdir(parents=True, exist_ok=True)
+            path = d / f"{time.strftime('%Y%m%d-%H%M%S')}-{int(time.time() * 1000) % 1000:03d}.log"
+            path.write_text(
+                f"REQUEST (base revision {base_rev}):\n{request}\n\nSETTINGS: max_attempts={settings.change_max_attempts} "
+                f"repair_attempts={settings.change_repair_attempts} partial_apply={settings.change_partial_apply} "
+                f"diagnose={settings.change_diagnose} gap_decide={settings.change_gap_decide} "
+                f"patcher={reasoning_model(settings.patcher_model)} escalation={settings.change_escalation_model or '-'}\n",
+                encoding="utf-8")
+            for old in sorted(d.glob("*.log"))[:-keep]:
+                old.unlink(missing_ok=True)
+            return str(path)
+        except Exception:  # noqa: BLE001 - a log must never break a change
+            return ""
+
+    @staticmethod
+    def _log(state: ChangeState, title: str, body: str = "") -> None:
+        path = state.get("log_path")
+        if not path:
+            return
+        try:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(f"\n===== {time.strftime('%H:%M:%S')} {title} =====\n{body}\n")
+        except Exception:  # noqa: BLE001
+            pass
+
+    async def _diagnose(self, state: ChangeState) -> str:
+        """A separate analysis step before a retry: read the failure, name the root cause and the minimal edit, say what NOT to
+        repeat. Fail-open: any problem returns '' and the retry runs without it."""
+        try:
+            failure = (state.get("failure_detail") or state.get("feedback") or "")[:9000]
+            if not failure.strip():
+                return ""
+            diff = await self._done_diff(state, skip=[], limit=9000)
+            earlier = state.get("history", [])[:-1][-4:]
+            plan = f"\nPLAN:\n{state['plan']}\n" if state.get("plan") else ""
+            prompt = _DIAGNOSE_PROMPT.format(request=state["request"], plan=plan, diff=diff or "(nothing changed yet)",
+                                             failure=failure, earlier="\n".join(f"- {h}" for h in earlier) or "(none)")
+            model = self._role_model("diagnoser")
+            self._emit(f"Attempt {state['attempt']} failed: diagnosing with {model} before the next try")
+            raw = (await self.llm_text(model, prompt, phase="DIAGNOSE", repo_id=state["repo_id"], num_predict=1200)).strip()
+            self._log(state, f"DIAGNOSE after attempt {state['attempt']} ({model})", raw[:4000])
+            return raw[:2500] if "ROOT CAUSE" in raw.upper() else ""
+        except Exception as e:  # noqa: BLE001
+            self._emit(f"diagnosis skipped: {type(e).__name__}", "WARNING")
+            return ""
+
+    async def _gap_decide(self, state: ChangeState, working: Dict[str, bytes], path: str) -> Tuple[str, str]:
+        """The patcher skipped a plan file in two rounds. One targeted look at that file alone: CHANGE (with the exact edit) or
+        NO_CHANGE. NO_CHANGE is only accepted when the line it quotes really exists in the file. -> (change | no_change, text)"""
+        raw, text = "", ""
+        try:
+            data = await self._current({**state, "working": working}, path)
+            text = (data or b"").decode("utf-8", errors="replace").replace("\r\n", "\n")
+            what = self._plan_lines(state.get("plan", ""), [path])
+            done = await self._done_diff({**state, "working": working}, skip=[path], limit=5000)
+            prompt = _GAP_PROMPT.format(request=state["request"], path=path, what="\n".join(what) or "(the plan names the file only)",
+                                        done=done or "(nothing yet)", text=text[: max(4000, settings.change_context_chars // 2)])
+            model = self._role_model("diagnoser")
+            raw = (await self.llm_text(model, prompt, phase="GAP", repo_id=state["repo_id"], num_predict=700)).strip()
+            self._log(state, f"GAP CHECK {path} ({model})", raw[:3000])
+        except Exception as e:  # noqa: BLE001
+            self._emit(f"gap check skipped: {type(e).__name__}", "WARNING")
+            return "change", ""
+
+        def field(key: str) -> str:
+            m = re.search(rf"^[\s*\-]*{key}\**:[ \t]*(.*)$", raw, re.M | re.I)
+            return m.group(1).strip() if m else ""
+
+        verdict, evidence = field("VERDICT").upper().strip("*` "), field("EVIDENCE").strip("`'\" ")
+        why, instr = field("WHY"), field("INSTRUCTION")
+        instr = "" if instr.lower() in ("none", "n/a") else instr
+        if verdict.startswith("NO_CHANGE") and evidence and evidence.lower() != "none":
+            norm = lambda s: re.sub(r"\s+", " ", s).strip()      # noqa: E731
+            if norm(evidence) in norm(text):
+                return "no_change", why or f"already present: {evidence[:80]}"
+            return "change", "the line quoted as proof is not in the file, so implement the request there" + (f": {instr}" if instr else "")
+        return "change", instr or why
+
+    def _retry_or_fail(self, state: ChangeState, problems: List[str], out: dict, gap_only: bool = False) -> dict:
+        """End of _apply_check for a patch that is not usable yet. A repair (bad edit block, static error, plan gap) is free while
+        the pool lasts, unless the same problem came back unchanged: that one counts as an attempt and asks for a diagnosis."""
+        sig = hashlib.sha256("|".join(sorted(p.splitlines()[0][:120] for p in problems)).encode()).hexdigest()[:12]
+        stuck = bool(problems) and sig == state.get("apply_sig")
+        free = state.get("free", 0)
+        can_free = free < settings.change_repair_attempts and not stuck
+        if self._spent(state) >= settings.change_max_attempts and not can_free:
+            return {**out, "status": "failed", "errors": problems or ["no usable edits produced"]}
+        self._emit(f"Attempt {state['attempt']} needs a fix: {len(problems)} problem(s) - {self._brief(problems)}"
+                   + (f" (free repair {free + 1}/{settings.change_repair_attempts})" if can_free else ""), "WARNING")
+        self._log(state, f"APPLY_CHECK attempt {state['attempt']}: {len(problems)} problem(s)"
+                  + (" [free repair]" if can_free else "") + (" [same problem again]" if stuck else ""), "\n".join(problems)[:6000])
+        return {**out, "status": "retry", "errors": problems, "feedback": "\n".join(f"- {p}" for p in problems)[:4000],
+                "free": free + (1 if can_free else 0), "apply_sig": sig, "stuck": stuck and not gap_only, "retry_kind": "edit",
+                "failure_detail": "",
+                "history": [f"attempt {state['attempt']} (edit blocks): {self._brief(problems, 1, 200)}"],
+                "trace": [f"attempt {state['attempt']}: {len(problems)} problem(s), retrying" + (" (free repair)" if can_free else "")]}
 
     # ------------------------------------------------------------------ nodes
     async def _outline(self, state: ChangeState, limit: int = 12000) -> str:
@@ -795,9 +963,21 @@ class RepoChangeService:
 
         fb = ""
         if state["feedback"]:
-            fb = ("\nPREVIOUS ATTEMPT RESULT:\n" + state["feedback"] +
-                  "\nEdits that already applied are included in the file contents shown below. "
+            applied = (("Edit blocks that applied cleanly are ALREADY in the file contents shown below: never re-send them. Where the "
+                        "result above lists FAILED block(s), re-send ONLY those, with SEARCH text copied verbatim from the CURRENT "
+                        "contents shown. ") if settings.change_partial_apply else
+                       ("Files whose edit blocks all applied are included in the contents shown below. A file with ANY failed block "
+                        "was left UNCHANGED (none of its blocks were applied): for such a file re-send ALL its blocks, corrected. "))
+            fb = ("\nPREVIOUS ATTEMPT RESULT:\n" + state["feedback"] + "\n" + applied +
                   "Emit edit blocks ONLY to fix the problems above, against the CURRENT contents shown.\n")
+            if settings.change_diagnose:
+                if state.get("retry_kind") in ("tests", "review") or state.get("stuck"):
+                    diag = await self._diagnose(state)
+                    if diag:
+                        fb += "\nDIAGNOSIS OF THAT FAILURE (written by a separate analysis step; follow its FIX and its DO NOT):\n" + diag + "\n"
+                earlier = state.get("history", [])[:-1][-4:]
+                if earlier:
+                    fb += "\nEARLIER ATTEMPTS THAT DID NOT WORK (do not repeat them):\n" + "\n".join(f"- {h}" for h in earlier) + "\n"
         plan = f"\nPLAN (follow it, keep edits within it):\n{state['plan']}\n" if state.get("plan") else ""
         if state.get("contract"):
             plan += ("\nCONTRACT (signatures are fixed). Each stub `raise NotImplementedError(\"contract: <name>\")` must become a real "
@@ -827,6 +1007,8 @@ class RepoChangeService:
         prompt = _PROMPT.format(request=state["request"], context=self._ctx_block(state), plan=plan,
                                 feedback=fb, files="\n\n".join(blocks))
         model = reasoning_model(settings.patcher_model)
+        if settings.change_escalation_model and attempt - state.get("free", 0) >= settings.change_max_attempts:
+            model = settings.change_escalation_model          # the last counted attempt gets the strongest model
         self._emit(f"Attempt {attempt}: asking {model} for edits"
                    + (f" (focused on {', '.join(focus_all)})" if focus_all else ""))
         try:
@@ -835,7 +1017,10 @@ class RepoChangeService:
         except Exception as e:  # noqa: BLE001
             return {"attempt": attempt, "status": "failed", "notes": notes,
                     "errors": [f"model call failed: {type(e).__name__}: {e}"]}
+        self._log({**state, "attempt": attempt}, f"PATCH attempt {attempt} model={model} prompt~{len(prompt) // 4} tokens, "
+                  f"{len(blocks)} file(s) shown" + (f", focus {', '.join(focus_all)}" if focus_all else ""), raw[:20000])
         return {"attempt": attempt, "raw": raw, "status": "running", "notes": notes, "tasks_complete": False,
+                "retry_kind": "", "stuck": False,
                 "trace": [f"attempt {attempt}: model returned {len(raw)} chars, "
                           f"{len(blocks)} file(s) shown"
                           + (f", {len(dropped)} skipped" if dropped else "")]}
@@ -884,12 +1069,20 @@ class RepoChangeService:
             for e in edits:
                 if e.path not in contents:
                     contents[e.path] = await self._current({**state, "working": working}, e.path)
-            res = apply_edits(edits, contents)
+            res = apply_edits(edits, contents, partial=settings.change_partial_apply)
             working.update(res.new_files)
             problems += res.errors
+            for pth, pr in res.partial.items():
+                problems.append(f"{pth}: edit block(s) {', '.join(map(str, pr['applied']))} applied and are now part of the file shown "
+                                f"below; block(s) {', '.join(map(str, pr['failed']))} FAILED. Re-send ONLY the failed block(s).")
             notes += [w for w in res.warnings if w not in notes]
             if not res.new_files and not res.errors and not rerrs and not locked:
                 problems.append("The edits changed nothing.")
+
+        if settings.change_partial_apply and problems:
+            # Edit blocks that did not apply are repaired first and alone: the static, call and plan checks below would judge a
+            # half-edited file and bury the one actionable message under follow-on errors.
+            return self._retry_or_fail(state, problems, {"working": working, "notes": notes, "noop_files": noop_all, "focus": []})
 
         # L0 checks on everything changed so far; ignore failures the base file already had
         known_paths = list(dict.fromkeys(list(state["known"]) + list(working)))
@@ -913,10 +1106,24 @@ class RepoChangeService:
 
         gap: List[str] = []
         gap_msg = ""
+        gap_seen = dict(state.get("gap_seen") or {})
+        gap_hint: Dict[str, str] = {}
         if working and not problems:    # edits are clean; are they also COMPLETE against the plan?
             planned, planned_new = self._plan_files(state.get("plan", ""), state["known"])
             gap = [p for p in planned + planned_new if p not in working and p not in noop_all]
-            if gap and state["attempt"] < settings.change_max_attempts:
+            if gap and settings.change_gap_decide:
+                for p in list(gap):
+                    if gap_seen.get(p, 0) >= 1 and p in planned:     # skipped in an earlier round too: ask about THIS file once, do not just repeat
+                        verdict, why = await self._gap_decide(state, working, p)
+                        if verdict == "no_change":
+                            noop_all = sorted(set(noop_all) | {p})
+                            notes.append(f"no change needed in {p}: {why} (targeted check, the patcher had skipped it twice)")
+                            gap.remove(p)
+                        elif why:
+                            gap_hint[p] = why
+            for p in gap:
+                gap_seen[p] = gap_seen.get(p, 0) + 1
+            if gap and (self._spent(state) < settings.change_max_attempts or state.get("free", 0) < settings.change_repair_attempts):
                 have, fresh = [p for p in gap if p in planned], [p for p in gap if p not in planned]
                 gap_msg = ("The plan lists file(s) that have no edits yet: " + ", ".join(gap) + "\nFor each one do exactly one of:\n"
                            + (f"  a) EXISTING file(s) {', '.join(have)}: output FILE:/SEARCH/REPLACE blocks whose SEARCH quotes lines "
@@ -925,6 +1132,7 @@ class RepoChangeService:
                               if fresh else "")
                            + "  b) if the file already contains what the request needs, output the single line "
                              "`NO_CHANGE: <path> - <what already exists>`.\n"
+                           + "".join(f"WHAT TO CHANGE IN {p}: {h}\n" for p, h in gap_hint.items())
                            + "Do not repeat edits that already applied.")
                 problems.append(gap_msg)
             elif gap:
@@ -945,7 +1153,7 @@ class RepoChangeService:
 
         out = {"working": working, "notes": notes, "checked": checked, "skipped": skipped,
                "check_lines": [r.label() for r in results if not r.ok],
-               "noop_files": noop_all,
+               "noop_files": noop_all, "gap_seen": gap_seen,
                "focus": gap if (gap and problems == [gap_msg]) else []}
         extra_targets = [p for p in extra_targets if p not in state["targets"]]
         if extra_targets:       # the retry must be able to SEE and edit the file that should own the missing method
@@ -953,13 +1161,7 @@ class RepoChangeService:
         
         if not problems and code_changed:
             return {**out, "status": "ok", "errors": []}
-        if state["attempt"] >= settings.change_max_attempts:
-            return {**out, "status": "failed", "errors": problems or ["no usable edits produced"]}
-        self._emit(f"Attempt {state['attempt']} needs a fix: {len(problems)} problem(s) - {self._brief(problems)}",
-                   "WARNING")
-        return {**out, "status": "retry", "errors": problems,
-                "feedback": "\n".join(f"- {p}" for p in problems)[:4000],
-                "trace": [f"attempt {state['attempt']}: {len(problems)} problem(s), retrying"]}
+        return self._retry_or_fail(state, problems, out, gap_only=bool(gap_msg) and problems == [gap_msg])
 
     async def _call_problems(self, state: ChangeState, working: Dict[str, bytes]) -> Tuple[List[str], List[str]]:
         """Fail-open: a checker bug must never block a change."""
@@ -1454,7 +1656,7 @@ class RepoChangeService:
         if not issues:
             return {"review_done": True, "notes": notes, "trace": ["review: nothing to fix"]}
         text = [f"{i['file'] + '::' + i['name'] if i['name'] else i['file'] or '(whole change)'}: {i['problem']}" for i in issues]
-        if state["attempt"] >= settings.change_max_attempts:         # nothing left to spend: tell the human, do not block
+        if self._spent(state) >= settings.change_max_attempts:       # nothing left to spend: tell the human, do not block
             return {"review_done": True, "notes": notes + [f"review (not fixed, no attempts left): {t}" for t in text],
                     "trace": [f"review: {len(issues)} issue(s), annotated"]}
         self._emit(f"Review found {len(issues)} issue(s): " + " | ".join(text)[:300], "WARNING")
@@ -1463,6 +1665,8 @@ class RepoChangeService:
             return {"status": "fix", "review_done": True, "review_fix": pinned, "notes": notes,
                     "trace": [f"review: {len(issues)} issue(s) -> task fixes"]}
         return {"status": "retry", "review_done": True, "notes": notes, "tasks_complete": False,
+                "retry_kind": "review", "stuck": False, "failure_detail": "\n".join(text)[:6000],
+                "history": [f"attempt {state['attempt']} (review): {text[0][:200]}"],
                 "feedback": "A reviewer who saw only the request and the final diff found:\n- " + "\n- ".join(text) +
                             "\nFix exactly these. Change nothing else.",
                 "trace": [f"review: {len(issues)} issue(s) -> single patch"]}
@@ -1732,7 +1936,7 @@ class RepoChangeService:
                         "and fix that one)")
             lines.append(f"test {c.id} fails{hint}: {c.message}\n" + "\n".join("    " + l for l in c.detail.splitlines()[-14:]))
         problems = [f"{len(real)} test(s) newly failing after the change:"] + lines
-        out_of_tries = state["attempt"] >= settings.change_max_attempts or sig == state.get("last_sig")
+        out_of_tries = self._spent(state) >= settings.change_max_attempts or sig == state.get("last_sig")
         if out_of_tries and gen and all(is_gen(c) for c in real):
             # The change passes every existing test; only tests written for it keep failing (the code or the test is wrong, the
             # loop could not tell which). Save the change WITHOUT them and say so loudly, instead of throwing the work away.
@@ -1754,8 +1958,12 @@ class RepoChangeService:
                 targets.append(tp)           # let the patcher read (and, if outdated, edit) the failing test
         self._emit(f"Attempt {state['attempt']}: {len(real)} new test failure(s), retrying - "
                    f"{self._brief([c.id + ': ' + c.message for c in real])}", "WARNING")
+        detail = "\n\n".join(f"{c.id} [{kinds.get(c.id, '')}]: {c.message}\n" + "\n".join(c.detail.splitlines()[-60:])
+                             for c in real[:3])[:9000]
+        self._log(state, f"SANDBOX attempt {state['attempt']}: {len(real)} new failure(s)", detail)
         return {"status": "retry", "tests": tests, "last_sig": sig, "targets": targets, "errors": problems,
-                "feedback": "\n".join(problems)[:4500],
+                "feedback": "\n".join(problems)[:4500], "failure_detail": detail, "retry_kind": "tests", "stuck": False,
+                "history": [f"attempt {state['attempt']} (tests): {self._brief([c.id + ': ' + c.message for c in real], 2, 160)}"],
                 "trace": [f"attempt {state['attempt']}: {len(real)} new test failure(s)"]}
 
     # ------------------------------------------------------------------ wiring

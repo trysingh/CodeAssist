@@ -113,6 +113,7 @@ const GENERAL = '__general__';
 const S = { web: LS.get('web', 'auto'), repoId: null, threadId: null, repos: [], tab: null, sending: false, files: [], unread: 0, collapsed: LS.get('collapsed', null), poll: null, stream: null, streamKey: '', tlimit: LS.get('tlimit', null), abortController: null };
 S.model = LS.get('model', '');          // '' = server default
 const TABS = ['chat', 'repos', 'ingest', 'telemetry'];
+const STATUS_HISTORY_LIMIT = 5;
 const TITLES = { chat: 'Chat', repos: 'Repositories', ingest: 'Ingest repository', telemetry: 'Telemetry & logs' };
 const isMobile = () => window.innerWidth < 1024;
 const GENERAL_SUGGESTIONS = ['What is new in the latest FastAPI release?', 'Compare Chroma and FAISS for a small RAG POC', 'Summarize this page: https://'];
@@ -333,10 +334,21 @@ function setupNotificationStream() {
             const level = String(data.level || 'info').toLowerCase();
             // showToast(data.title, prettyMessage(data), level);
             const st = S.liveStatus && $(S.liveStatus);
-            if (st) {                                  // request in flight: show its latest step in the loader
+            if (st) {
                 const msg = `${data.title} — ${prettyMessage(data)}`;
+                if (!S.statusHistory) S.statusHistory = [];
+                if (S.statusHistory[0] !== msg) {
+                    S.statusHistory.unshift(msg);
+                    if (S.statusHistory.length > STATUS_HISTORY_LIMIT) S.statusHistory.pop();
+                }
                 st.textContent = msg.length > 160 ? msg.slice(0, 157) + '…' : msg;
-                st.title = msg;                        // hover for the full text
+                st.title = msg;
+                const histId = S.liveStatus.replace('_s', '_h');
+                const histEl = $(histId);
+                if (histEl) {
+                    histEl.innerHTML = S.statusHistory.slice(1).map((m, i) => `<div class="text-[10px] opacity-60 py-0.5">${i+1}. ${m}</div>`).join('');
+                    histEl.classList.toggle('hidden', S.statusHistory.length <= 1);
+                }
             }
             if (!(st && level === 'info')) showToast(data.title, prettyMessage(data), level);   // info is already in the loader
             const consoleDiv = $('telemetry-console');
@@ -837,7 +849,10 @@ async function sendChatMessage(e) {
     // col.insertAdjacentHTML('beforeend', `<div id="${id}" class="flex gap-3"><div class="msg-avatar w-7 h-7 rounded-lg bg-blue-600/15 border border-blue-500/25 flex items-center justify-center text-blue-400 shrink-0"><i data-lucide="bot" class="w-4 h-4"></i></div>
     //     <div class="flex items-center gap-2.5 text-sm text-slate-400 pt-0.5"><span class="think flex gap-1"><span></span><span></span><span></span></span>${files.length ? 'Reading attachments' : (S.repoId === GENERAL ? 'Thinking' : 'Retrieving relevant chunks')}${S.web !== 'off' ? ' · may search the web' : ''} <span id="${id}_t" class="font-mono text-xs text-slate-600">0s</span></div></div>`);
     col.insertAdjacentHTML('beforeend', `<div id="${id}" class="flex gap-3"><div class="msg-avatar w-7 h-7 rounded-lg bg-blue-600/15 border border-blue-500/25 flex items-center justify-center text-blue-400 shrink-0"><i data-lucide="bot" class="w-4 h-4"></i></div>
-        <div class="flex items-center gap-2.5 text-sm text-slate-400 pt-0.5"><span class="think flex gap-1"><span></span><span></span><span></span></span><span id="${id}_s" class="min-w-0 break-words">${files.length ? 'Reading attachments' : (S.repoId === GENERAL ? 'Thinking' : 'Retrieving relevant chunks')}${S.web !== 'off' ? ' · may search the web' : ''}</span> <span id="${id}_t" class="font-mono text-xs text-slate-600 shrink-0">0s</span></div></div>`);
+        <div class="flex flex-col gap-1 text-sm text-slate-400 pt-0.5">
+            <div class="flex items-center gap-2.5"><span class="think flex gap-1"><span></span><span></span><span></span></span><span id="${id}_s" class="min-w-0 break-words">${files.length ? 'Reading attachments' : (S.repoId === GENERAL ? 'Thinking' : 'Retrieving relevant chunks')}${S.web !== 'off' ? ' · may search the web' : ''}</span> <span id="${id}_t" class="font-mono text-xs text-slate-600 shrink-0">0s</span></div>
+            <div id="${id}_h" class="hidden pl-5 border-l border-slate-300 dark:border-slate-700"></div>
+        </div></div></div>`);
     icons(); scrollDown(true);
     S.liveStatus = id + '_s';
     const t0 = performance.now();
