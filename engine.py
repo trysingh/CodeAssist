@@ -26,13 +26,16 @@ def main():
 
     # 'serve' command group for Web/FastAPI mode
     serve_parser = subparsers.add_parser("serve", help="Run the FastAPI web server")
-    serve_parser.add_argument("--host", default="127.0.0.1", help="Bind host")
-    serve_parser.add_argument("--port", type=int, default=8000, help="Bind port")
+    serve_parser.add_argument("--host", default="0.0.0.0", help="Bind host")
+    serve_parser.add_argument("--port", type=int, default=1951, help="Bind port")
 
     args = parser.parse_args()
     cli = CLIView()
 
     if args.command == "serve":
+        print(" = " * 30)
+        print(f"       Trying to connect to Ollama at {settings.ollama_base_url}", flush=True)
+        print(" = " * 30)
         uvicorn.run("views.api_view:app", host=settings.host, port=settings.port, reload=False)
         return
 

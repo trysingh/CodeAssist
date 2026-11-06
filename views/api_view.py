@@ -42,6 +42,9 @@ async def startup_event():
     # re-syncs offline changes, and the build can run meanwhile.
     controller.warmer.start()
     await controller.restore_all_watchers()
+    print(" = " * 30)
+    print(f"       Ollama base is looked at from {settings.ollama_base_url}", flush=True)
+    print(" = " * 30)
 
 @app.on_event("shutdown")
 async def shutdown_event():
