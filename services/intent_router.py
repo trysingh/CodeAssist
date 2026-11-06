@@ -2,8 +2,9 @@
 
 Order of authority:
   1. explicit prefix:  /ask ...   /plan ...   /change ...   /fix ...   (always wins, no model call)
-  2. decision model:   settings.router_model via Ollama /v1/systemone (services/decision.py)
-  3. keyword rules:    always available; used if no model is set, it is unreachable, or unsure
+  2. no prefix:        "ask" (settings.router_auto=False, the default). Steps 3-4 only run when router_auto=True
+  3. decision model:   settings.router_model via Ollama /v1/systemone (services/decision.py)
+  4. keyword rules:    always available; used if no model is set, it is unreachable, or unsure
 
 The decision model answers ONE yes/no question and returns P(true). P >= 0.5 means
 "change"; confidence is how far from a coin flip it is, and must reach
@@ -52,8 +53,9 @@ COMMANDS_HELP = """**Commands** (start your message with one):
 - `/web <question>`: answer using a live web search (works with or without a repository)
 - `/help` (or `/commands`): show this list
 
-Without a command, the system decides between ask and change on its own, and
-uses the web only when needed (see the Web chip next to the message box)."""
+Without a command, your message is a read-only `/ask`: the assistant searches and reads the
+code (find, grep, full files) before answering, and checks any fix it suggests in the sandbox.
+It uses the web only when needed (see the Web chip next to the message box)."""
 
 
 def is_help(query: str) -> bool:
@@ -95,6 +97,8 @@ async def route_intent(query: str, *, noul_fn: NoulFn = decide_noul,
         return RouteDecision(intent, query[m.end():].strip(), "prefix", 1.0)
 
     q = query.strip()
+    if not settings.router_auto:           # default: nothing is changed or planned unless the user typed /change, /fix, /plan ...
+        return RouteDecision("ask", q, "default", 1.0)
     model = settings.router_model if model is None else model
     if model:
         p = await noul_fn(model, q, _Q, true=_TRUE, false=_FALSE, phase="ROUTER", repo_id=repo_id)

@@ -66,6 +66,21 @@ class EngineSettings(BaseSettings):
     # Code change agents (Phase 1). Models run on the same Ollama endpoint as the others.
     router_model: str = Field(default="tev1:0.8b")     # DECISION model (/v1/systemone): ask vs change, failure triage. empty = rules only
     router_min_confidence: float = Field(default=0.75)
+    router_auto: bool = Field(default=False)           # False = a message without a /command is ALWAYS /ask. True = the router model + rules may pick change
+    # Ask mode: investigate with find/grep/ls/read tools over the raw store, then check any proposed edits in the sandbox
+    ask_agent: bool = Field(default=True)              # False = old single-shot answer from retrieved chunks
+    ask_max_steps: int = Field(default=10)             # tool calls per question (validation rounds get their own allowance)
+    ask_obs_chars: int = Field(default=90000)          # total tool output the model may read per question
+    ask_read_chars: int = Field(default=30000)         # one read call; longer files come back TRUNCATED with the next start line
+    ask_grep_max: int = Field(default=60)              # matches returned per grep call
+    ask_seed_chars: int = Field(default=8000)          # semantic-search leads shown up front (the model must still read the files)
+    ask_full_read_max_chars: int = Field(default=40000)  # an edited file up to this size must have been READ IN FULL; bigger: the edited lines must have been read
+    ask_validate: bool = Field(default=True)           # proposed edit blocks are applied to a copy, statically checked and run in the sandbox
+    ask_validate_rounds: int = Field(default=2)        # extra model rounds when that check fails
+    ask_validate_timeout_s: int = Field(default=420)   # cap for one sandbox check
+    ask_reasoning: str = Field(default="")             # thinking mode of the ask-mode model calls. "" = leave it to the server/model (default); "off" = no thinking;
+                                                       # "on" = think, reasoning kept apart from the answer; "low"/"medium"/"high" = effort level.
+                                                       # A thinking model (e.g. gemma4) that spends the whole output budget thinking returns an EMPTY answer: set "off" if the log says so
     patcher_model: str = Field(default="")             # edit-block author; empty = llm_model
     change_max_attempts: int = Field(default=3)        # patch -> apply -> check retries
     change_max_files: int = Field(default=6)           # files shown to the patcher

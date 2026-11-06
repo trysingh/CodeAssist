@@ -76,8 +76,23 @@ def chat_base_url() -> str:
     return base.rstrip("/")
  
  
+def reasoning_arg(value: str = ""):
+    """settings.ask_reasoning -> the `reasoning` argument of ChatOllama.
+
+    "" -> None (not sent: the server/model decides), off/false/no/0 -> False, on/true/yes/1 -> True,
+    low/medium/high -> that level (models that take an effort level). Anything else -> None."""
+    v = (value or "").strip().lower()
+    if v in ("off", "false", "no", "0"):
+        return False
+    if v in ("on", "true", "yes", "1"):
+        return True
+    if v in ("low", "medium", "high"):
+        return v
+    return None
+
+
 def _build(model: str, *, json_mode: bool, num_predict: Optional[int], num_ctx: int,
-           repo_id: str, phase: str):
+           repo_id: str, phase: str, reasoning=None):
     from langchain_ollama import ChatOllama
     kw = dict(model=model, base_url=chat_base_url(), temperature=0,
               num_ctx=num_ctx, callbacks=_callbacks(model, repo_id, phase))
@@ -85,6 +100,8 @@ def _build(model: str, *, json_mode: bool, num_predict: Optional[int], num_ctx: 
         kw["num_predict"] = num_predict     # never -1: cloud endpoints reject non-positive values
     if json_mode:
         kw["format"] = "json"
+    if reasoning is not None:               # only sent when asked for: models without a thinking mode can reject the flag
+        kw["reasoning"] = reasoning
     return ChatOllama(**kw)
 
 

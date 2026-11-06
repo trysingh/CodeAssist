@@ -7,6 +7,8 @@ from pathlib import Path
 _tmp = tempfile.mkdtemp(prefix="coderag_test_")
 os.environ["ENGINE_STORAGE_DIR"] = _tmp
 os.environ["ENGINE_ROUTER_MODEL"] = ""
+os.environ["ENGINE_ROUTER_AUTO"] = "true"                   # legacy router tests exercise the auto router; test_ask_agent.py covers the new default
+os.environ["ENGINE_ASK_AGENT"] = "false"                   # legacy chat tests expect the single-shot answer; test_ask_agent.py opts in
 os.environ["ENGINE_CHANGE_PLAN_FIRST"] = "false"       # scripted LLM tests expect one model call per patch; plan tests opt in
 os.environ["ENGINE_CHANGE_REVIEW"] = "false"            # the reviewer is opt-in for tests, like the other stages
 os.environ["ENGINE_CHANGE_TASKS"] = "false"             # the task loop is opt-in for tests, like the other stages

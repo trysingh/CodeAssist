@@ -19,6 +19,7 @@ from services.attachment_intent import derive_request
 from services.notifier import notifier, repo_scope
 from services.repo_store import RepoStore
 from services.repo_change import RepoChangeService, ChangeResult
+from services.code_agent import CodeAgent
 from services.sandbox_warmer import SandboxWarmer, is_requirements_path, request_prewarm
 from services.intent_router import COMMANDS_HELP, route_intent
 from services.web_search_service import split_web_prefix
@@ -38,6 +39,8 @@ class EngineController:
         self.rag_manager = RAGWorkflowManager(self.db, self.vector_service, self.attachments)
         self.repo_store = RepoStore()
         self.change_service = RepoChangeService(self.db, self.vector_service, self.repo_store)
+        # /ask investigates with find/grep/read tools and checks proposed edits in the SAME sandbox (and pre-warmed image) /change uses
+        self.rag_manager.code_agent = CodeAgent(self.repo_store, self.change_service.sandbox)
         # Builds sandbox dependency images in the background. Inert until warmer.start() is called from the
         # running application (views/api_view.py); the file watcher's short-lived controllers never start one.
         self.warmer = SandboxWarmer(self.change_service.sandbox, self._warm_repo_ids)

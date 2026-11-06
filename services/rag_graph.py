@@ -1,5 +1,5 @@
 from typing import Annotated, TypedDict, List
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langchain_ollama import ChatOllama
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
@@ -13,7 +13,8 @@ from services.attachment_service import AttachmentService
 from services.web_search_service import WebSearchService, decide_web, now_str
 import asyncio
 from models.schemas import GENERAL_REPO_ID
-from services.model_calls import reasoning_model
+from services.model_calls import reasoning_arg, reasoning_model
+from services.code_agent import EmptyModelReply, clean_reply, describe_meta, leads_from_context, reply_meta
 import re
 MAX_FILE_CHARS = settings.change_context_chars
 
@@ -45,6 +46,7 @@ class RAGWorkflowManager:
         self.vector_service = vector_service
         self.attachments = attachment_service or AttachmentService(vector_service)
         self.web = web_service or WebSearchService()
+        self.code_agent = None      # services/code_agent.CodeAgent, set by the controller; None = single-shot answer from retrieved chunks
 
     async def _attachment_context_node(self, state: AgentState) -> dict:
         thread_id = state.get("thread_id")
@@ -205,6 +207,21 @@ class RAGWorkflowManager:
 
     async def _generate_answer_node(self, state: AgentState) -> dict:
         repo_id = state.get("repo_id", "unknown_repo")
+        note = ""       # appended to the single-shot answer when the agent could not produce one
+        if self.code_agent and settings.ask_agent and repo_id != GENERAL_REPO_ID:
+            # Investigate with find/grep/read tools (and sandbox-check any proposed edit). The retrieved chunks are only leads here.
+            try:
+                leads = leads_from_context(state.get("context_str", ""), settings.ask_seed_chars)
+                text = await self.code_agent.answer(repo_id, self._system_prompt({**state, "context_str": leads}), state["messages"])
+                return {"messages": [AIMessage(content=text)]}
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001 - fall back to the old single-shot answer, never fail the chat
+                notifier.notify("Ask agent", f"fell back to a single-shot answer: {type(e).__name__}: {e}", level="WARNING")
+                if isinstance(e, EmptyModelReply):
+                    note = ("\n\n---\n_The investigation agent got no usable reply from the model, so this answer comes from the retrieved "
+                            f"chunks only and nothing was searched ({e})._")
+
         
         # Define emitter to broadcast live telemetry traces through Server-Sent Events (SSE)
         def emit_to_ui(data: dict):
@@ -222,18 +239,28 @@ class RAGWorkflowManager:
             # emitter=emit_to_ui
         )
         
+        think = reasoning_arg(settings.ask_reasoning)
         llm = ChatOllama(
             model=model,
             base_url=settings.ollama_base_url,
             temperature=0.1,
             num_ctx=settings.change_num_ctx,
-            callbacks=[callback]
+            callbacks=[callback],
+            **({"reasoning": think} if think is not None else {})
         )
         
         system_prompt = self._system_prompt(state)
         messages_for_llm = [SystemMessage(content=system_prompt)] + state["messages"]
         response = await llm.ainvoke(messages_for_llm)
-        return {"messages": [response]}
+        raw = response.content if isinstance(response.content, str) else str(response.content)
+        text = clean_reply(raw)
+        if not text:        # never store or show a blank answer: an empty assistant turn also confuses the next turn of the thread
+            text = ("The model returned an empty reply, so there is nothing to show "
+                    f"({describe_meta(reply_meta(response))}). Ask again, pick another model in the selector, or, if this is a thinking "
+                    "model, set ENGINE_ASK_REASONING=off in .env.")
+        if text == raw.strip() and not note:
+            return {"messages": [response]}
+        return {"messages": [AIMessage(content=text + note)]}
 
     def build_graph(self):
         builder = StateGraph(AgentState)
