@@ -47,14 +47,27 @@ Rules:
 3. Feature: grep for the closest existing implementation, read it, follow its conventions, grep what the new code must call.
 4. Cite as `path:line`. Say plainly what you could not verify.
 5. When you have enough evidence, answer in markdown with NO ACTION line.
-6. If you propose code, write it ONLY as edit blocks whose SEARCH text is copied exactly from `read` output (without the `12| ` line-number prefix):
-FILE: path/to/file.py
+6. When you propose code, write each change as an edit block in this exact layout:
+   - Line 1: `FILE: <exact path from the repo>` as plain text, not inside a fence.
+   - Line 2: an opening markdown fence with the language, e.g. ```python
+   - `<<<<<<< SEARCH` starts the block. Below it, paste the lines that exist TODAY, copied exactly from `read` output without the `12| ` prefix, keeping indentation.
+   - `=======` separates the old lines from the new lines.
+   - `>>>>>>> REPLACE` ends the block. Below it, write the new lines that replace the SEARCH text.
+   - The closing fence ``` comes last, after `>>>>>>> REPLACE`.
+   - A new file: leave the SEARCH part empty (`<<<<<<< SEARCH` directly followed by `=======`).
+   - One FILE line and one fenced block per change. Several blocks per answer are fine.
+   Never write the markers without the fence. Example:
+
+FILE: services/auth.py
+```python
 <<<<<<< SEARCH
-exact existing lines
+    if token is None:
+        return None
 =======
-replacement lines
+    if not token:
+        return None
 >>>>>>> REPLACE
-   A new file = empty SEARCH. For a bug fix also add ONE small pytest that fails before the fix, as a new file under tests/.
+```
    Your edit blocks are applied to a copy of the repo and run in a sandbox before the user sees the answer: fix what it reports.
 """
 
@@ -527,6 +540,10 @@ class CodeAgent:
         return Check(problems=body, report="\n\n---\n**The proposed edit(s) did NOT pass the check. Treat the code above as unverified:**\n" + body)
 
     async def _check(self, repo_id: str, answer: str, tools: RepoTools, snapshot: Dict[str, bytes]) -> Optional[Check]:
+        if "<<<<<<< SEARCH" in answer and "```" not in answer:
+            return self._failed(
+                ["the edit blocks are not inside a markdown code fence. Wrap each FILE line's block in ```python ... ``` as described in rule 6."] 
+            )
         edits, perr = parse_edits(answer)
         if not edits and not (perr and "<<<<<<< SEARCH" in answer):
             return None

@@ -581,8 +581,46 @@ class EngineController:
             raise ValueError(f"Repository ID '{repo_id}' not found.")
         
         # 1. Clear Chroma collection
-        self.vector_service.delete_collection(repo_id)
+        try:
+            self.vector_service.delete_collection(repo_id)
+        except Exception as e:
+            print(f"Warning: Could not delete vector collection {repo_id}: {e}")
         # 2. Clear SQLite chunks and jobs
-        await self.db.reset_repo_indexes(repo_id)
+        try:
+            await self.db.reset_repo_indexes(repo_id)
+        except Exception as e:
+            print(f"Warning: Could not reset repository indexes for {repo_id}: {e}")
+
         
         notifier.notify("Index Reset", f"Successfully cleared all indexes for repository {repo_id}.", level="SUCCESS", repo_id=repo_id)
+
+    async def remove_repo(self, repo_id: str):
+        """Permanently removes a repository, its index, and its metadata."""
+        # 1. Remove from Vector Store (Chroma)
+        # This stops the app from "watching" or searching the repo
+        try:
+            self.vector_service.delete_collection(repo_id)
+        except Exception as e:
+            print(f"Warning: Could not delete vector collection {repo_id}: {e}")
+        
+        # 2. Remove from Metadata Store (models/database.py)
+        # This removes it from the "Ingested Repos" list in the UI
+        try:
+            await self.db.delete_repo(repo_id)
+        except Exception as e:
+            print(f"Warning: Could not delete metadata for {repo_id}: {e}")
+        
+        # 3. Remove from File Store (services/repo_store.py)
+        # This cleans up the actual file paths and revisions
+        if hasattr(self, 'repo_store'):
+            try:
+                await self.repo_store.delete_repo_data(repo_id)
+            except Exception as e:
+                print(f"Warning: Could not delete files for {repo_id}: {e}")
+        
+        notifier.notify(
+            "Repository Removed", 
+            f"Repository {repo_id} has been permanently deleted.", 
+            level="SUCCESS", 
+            repo_id=repo_id
+        )

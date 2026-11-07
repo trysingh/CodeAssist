@@ -372,6 +372,7 @@ class RawRun:
     exit_code: Optional[int] = None
     timed_out: bool = False
     error: str = ""           # infrastructure error (docker missing, tar failure ...)
+    used_docker: bool = False
 
 
 _EXIT = re.compile(r"::SBX-EXIT:: (-?\d+)")
@@ -578,9 +579,11 @@ class DockerRunner:
         if ttl > 0 and self._avail is not None:
             ts, ok, info = self._avail
             if time.monotonic() - ts < (ttl if ok else min(ttl, self._NEG_TTL_S)):
+                notifier.notify("Sandbox Service", info)
                 return ok, info
         ok, info = await self._probe()
         self._avail = (time.monotonic(), ok, info)
+        notifier.notify("Sandbox Service", info)
         return ok, info
 
     def invalidate_availability(self) -> None:
@@ -714,12 +717,20 @@ class DockerRunner:
             rc, out, timed = await asyncio.to_thread(
                 _exec, self.docker_args(tag, name, timeout, argv), tar, timeout + 30)
         except FileNotFoundError:
-            return RawRun(error="Docker CLI not found on PATH")
+            return RawRun(error="Docker CLI not found on PATH", used_docker=False)
         if rc == 125:                          # docker itself failed (daemon gone ...): do not trust a cached "Docker is up"
             self.invalidate_availability()
         if timed:
             await asyncio.to_thread(_exec, ["docker", "rm", "-f", name], None, 30)   # CLI killed, container may live
-        return RawRun(stdout=out.decode("utf-8", errors="replace"), exit_code=rc, timed_out=timed)
+        return RawRun(
+                stdout=out.decode(
+                    "utf-8", 
+                    errors="replace"
+                ), 
+                exit_code=rc, 
+                timed_out=timed, 
+                used_docker=True
+            )
 
 
 # Host variables a Python subprocess needs to start cleanly. Everything else is dropped on purpose.
@@ -899,6 +910,8 @@ class SandboxService:
             self._emit(f"Sandbox image for repo {repo_id} could not be built: {err[:300]}. "
                        f"Tests will be skipped for this repo until it builds.", "WARNING")
             return out
+        else:
+            self._emit(f"Sandbox image for repo {repo_id} is ready (built in background)", "SUCCESS")
         self._ready.add(tag)
         secs = round(time.monotonic() - t0, 1)
         out.update(status="ready", seconds=secs, note="image present")

@@ -459,6 +459,7 @@ function renderRepos() {
                 <div class="repo-actions flex justify-end gap-2">
                     <button data-chat-repo="${esc(r.repo_id)}" class="bg-blue-600/20 hover:bg-blue-600/30 text-blue-600 dark:text-blue-400 border border-blue-500/30 px-3 py-1.5 rounded-lg text-xs whitespace-nowrap">Open chat</button>
                     <button data-reset-repo="${esc(r.repo_id)}" class="bg-red-500/10 hover:bg-red-500/20 text-red-600 dark:text-red-400 border border-red-500/30 px-3 py-1.5 rounded-lg text-xs whitespace-nowrap transition-colors">Reset index</button>
+                    <button data-remove-repo="${esc(r.repo_id)}" class="bg-red-500/10 hover:bg-red-500/20 text-red-600 dark:text-red-400 border border-red-500/30 px-3 py-1.5 rounded-lg text-xs whitespace-nowrap transition-colors">Remove</button>
                 </div>
             </td>
         </tr>`;
@@ -491,13 +492,28 @@ document.addEventListener('click', async e => {
         await resetRepoIndex(rb.dataset.resetRepo);
     }
 
+    const rm = e.target.closest('[data-remove-repo]');
+    if (rm) {
+        await removeRepo(rm.dataset.removeRepo);
+    }
+
 });
 
 async function loadRepositories() {
     try {
         const res = await fetch('/api/v1/repos');
         if (!res.ok) throw new Error(`Server returned ${res.status}`);
-        S.repos = await res.json();
+        const data = await res.json();
+        S.repos = data; //await res.json();
+
+        if (data.used_docker !== undefined) {
+            if (data.used_docker) {
+                showToast("Sandbox", "Verification performed in Docker Sandbox ✅", "success");
+            } else {
+                showToast("Sandbox", "Docker unavailable: Verification skipped (Static Analysis only) ⚠️", "warning");
+            }
+        }
+
         $('nav-repo-count').textContent = S.repos.length;
         $('nav-repo-count').title = `${S.repos.length} repositories ingested`;
         renderRepos();
@@ -516,6 +532,19 @@ async function loadRepositories() {
     } catch (err) {
         console.error("Failed to load repositories:", err);
         showToast("Couldn't load repositories", err.message, "error");
+    }
+}
+
+async function removeRepo(repoId) {
+    if (!confirm(`Are you sure you want to permanently remove ${repoId}? This will delete all associated data and stop watching the repository.`)) return;
+
+    try {
+        const res = await fetch(`/api/v1/repos/${encodeURIComponent(repoId)}`, { method: 'DELETE' });
+        if (!res.ok) throw new Error(`Server returned ${res.status}`);
+        showToast("Repo removed", `Repository ${repoId} has been removed successfully.`, "success");
+        await loadRepositories();
+    } catch (e) {
+        showToast("Error", e.message, "error");
     }
 }
 
@@ -937,7 +966,9 @@ document.addEventListener('click', async e => {
         const post = async (force) => {
             const headers = phrase ? { 'X-Confirm-Phrase': phrase } : {};
             const r = await fetch(a.getAttribute('href') + (force ? '?force=true' : ''), { method: 'POST', headers });
-            return { ok: r.ok, status: r.status, body: await r.json().catch(() => ({})) };
+            // const body = await r.json();
+            const body = await r.json().catch(() => ({})); 
+            return { ok: r.ok, status: r.status, body: body };
         };
         // try {
         a.textContent = 'Applying...';
@@ -959,6 +990,15 @@ document.addEventListener('click', async e => {
         if (res.ok) {
             a.textContent = `Applied ${res.body.count || 0} files`;
             showToast('Success', `Successfully applied changes to the repository.`, 'success');
+
+            if (res.body && res.body.used_docker !== undefined) {
+                if (res.body.used_docker) {
+                    showToast("Sandbox", "Verification performed in Docker Sandbox ✅", "success");
+                } else {
+                    showToast("Sandbox", "Docker unavailable: Verification skipped (Static Analysis only) ⚠️", "warning");
+                }
+            }
+            
         } else {
             const errorMsg = res.body.detail || res.body.note || `Error code: ${res.status}`;
             a.textContent = 'Apply failed';

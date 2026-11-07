@@ -260,7 +260,6 @@ async def notification_stream(repo_id: Optional[str] = None, limit: Optional[int
     `limit` defaults to settings.telemetry_history_default and is capped by settings.telemetry_history_max."""
     return EventSourceResponse(notifier.subscribe(repo_id=repo_id, limit=limit))
 
-
 @app.post("/api/v1/repos/{repo_id}/reset-index")
 async def api_reset_repo_index(repo_id: str):
     """
@@ -284,6 +283,7 @@ async def api_reset_repo_index(repo_id: str):
         # Log the error and return a 500
         notifier.notify("Repository Index Reset", f"Indexes reset NOT successfull: {e}", level="ERROR", repo_id=repo_id)
         raise HTTPException(status_code=500, detail="Internal server error during index reset")
+
 @app.post("/api/v1/chat/stop")
 async def stop_chat_endpoint(thread_id: str, repo_id: Optional[str] = None):
     """Terminate an ongoing chat session for a specific thread. Validates ownership if repo_id given."""
@@ -309,3 +309,17 @@ async def stop_chat_endpoint(thread_id: str, repo_id: Optional[str] = None):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    
+@app.delete("/api/v1/repos/{repo_id}")
+async def api_remove_repo(repo_id: str):
+    """
+    Permanently removes a repository and its associated index.
+    """
+    try:
+        await controller.remove_repo(repo_id)
+        return {"status": "success", "message": f"Repository {repo_id} removed"}
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+

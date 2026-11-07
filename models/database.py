@@ -392,6 +392,11 @@ class DatabaseManager:
             await db.execute("DELETE FROM file_jobs WHERE repo_id = ?", (repo_id,))
             await db.commit()
 
+    async def delete_repo(self, repo_id: str):
+        """Removes a repository from the database."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("DELETE FROM repositories WHERE repo_id = ?", (repo_id,))
+            await db.commit()
     
     # ------------------------------------------------------------------ telemetry & logs
     async def save_telemetry_events(self, events: List[Dict[str, Any]]) -> None:

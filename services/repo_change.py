@@ -69,6 +69,7 @@ class ChangeResult:
     tests: dict = field(default_factory=dict)
     verification: str = "L0-static"
     plan: str = ""
+    used_docker: bool = False
     repairs: int = 0                                      # patch calls that were free edit repairs (not counted as attempts)
 
     def _sandbox_block(self) -> str:
@@ -533,6 +534,7 @@ class RepoChangeService:
         res.revision = out.get("revision")
         res.tests = out.get("tests", {})
         res.plan = out.get("plan", "")
+        res.used_docker = out.get("used_docker", False)
         res.repairs = out.get("free", 0)
         res.verification = self._verification(res.tests)
         res.ok = out.get("status") == "ok" and res.revision is not None

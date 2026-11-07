@@ -456,6 +456,15 @@ class RepoStore:
                              (json.dumps(report, default=str), repo_id, rev))
             await db.commit()
 
+    async def delete_repo_data(self, repo_id: str) -> None:
+        """Wipes all files and revisions for a specific repository."""
+        await self._ensure()
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("DELETE FROM repo_files WHERE repo_id = ?", (repo_id,))
+            await db.execute("DELETE FROM repo_revisions WHERE repo_id = ?", (repo_id,))
+            await db.commit()
+
+
     # ------------------------------------------------------------------ extract
     async def materialize(self, repo_id: str, rev: Optional[int], dest: Path,
                           paths: Optional[Iterable[str]] = None) -> int:
