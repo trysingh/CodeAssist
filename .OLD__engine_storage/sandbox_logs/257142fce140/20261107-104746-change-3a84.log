@@ -1,3 +1,0 @@
-docker: Error response from daemon: range of CPUs is from 0.01 to 1.00, as there are only 1 CPUs available
-
-Run 'docker run --help' for more information

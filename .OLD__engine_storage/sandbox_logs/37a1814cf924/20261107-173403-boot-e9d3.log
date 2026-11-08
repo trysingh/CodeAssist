@@ -1,5 +1,0 @@
-BOOT|app:app#import|OK|
-BOOT|app:app#openapi|OK|
-BOOT|app:app#client|SKIP|TestClient unavailable (needs httpx): The starlette.testclient module requires the httpx2 package to be installed. You can install this with: $ pip install httpx2
-
-::SBX-EXIT:: 0

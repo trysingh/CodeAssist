@@ -1,7 +1,0 @@
-.........                                                                [100%]
-9 passed in 0.17s
-
-::SBX-EXIT:: 0
-::SBX-JUNIT-BEGIN::
-<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="0" failures="0" skipped="0" tests="9" time="0.167" timestamp="2026-10-26T11:47:30.139574+00:00" hostname="bc7136ecfa28"><testcase classname="tests.test_change_r1_bundling_engine" name="test_generate_bundle_filename_basic" time="0.002" /><testcase classname="tests.test_change_r1_bundling_engine" name="test_generate_bundle_filename_sanitization" time="0.001" /><testcase classname="tests.test_change_r1_bundling_engine" name="test_generate_bundle_filename_uniqueness" time="0.001" /><testcase classname="tests.test_change_r1_bundling_engine" name="test_generate_bundle_filename_deep_path" time="0.001" /><testcase classname="tests.test_change_r1_bundling_engine" name="test_generate_bundle_filename_edge_case_empty_name" time="0.001" /><testcase classname="tests.test_change_r1_unit_generate_bundle_filename" name="test_generate_bundle_filename_basic" time="0.002" /><testcase classname="tests.test_change_r1_unit_generate_bundle_filename" name="test_generate_bundle_filename_sanitization" time="0.001" /><testcase classname="tests.test_change_r1_unit_generate_bundle_filename" name="test_generate_bundle_filename_suffix_uniqueness" time="0.002" /><testcase classname="tests.test_change_r1_unit_generate_bundle_filename" name="test_generate_bundle_filename_edge_case_empty_name" time="0.001" /></testsuite></testsuites>
-::SBX-JUNIT-END::
