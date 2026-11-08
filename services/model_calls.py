@@ -137,5 +137,11 @@ async def ask_json(model: str, prompt: str, *, phase: str = "DECIDE", repo_id: s
                      repo_id=repo_id, phase=phase)
         resp = await llm.ainvoke(prompt)
         return parse_json_loose(resp.content if isinstance(resp.content, str) else str(resp.content))
-    except Exception:
+    except Exception as exc:
+        try:    # the success path is logged by the telemetry callback; a failed call never reaches it
+            from services.action_log import log_action
+            log_action("LLM", phase, "llm_call", "fail", f"{type(exc).__name__}: {exc}"[:200], model=model,
+                       repo_id=repo_id or None)
+        except Exception:
+            pass
         return None

@@ -1,4 +1,5 @@
 from datetime import datetime, timezone 
+import json
 import aiosqlite
 from typing import List, Dict, Optional, Any
 from config.settings import settings
@@ -129,6 +130,40 @@ class DatabaseManager:
             """)
             await db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_telemetry_scope_repo ON telemetry_events(scope, repo_id, id)")
+
+            # v2 additive migrations (see docs/DESIGN_v2.md): repo search/vector state, structured telemetry, jobs table
+            async with db.execute("PRAGMA table_info(repositories)") as cursor:
+                repo_cols = [row[1] for row in await cursor.fetchall()]
+            if "vector_status" not in repo_cols:
+                await db.execute("ALTER TABLE repositories ADD COLUMN vector_status TEXT DEFAULT 'none'")
+            if "ingest_mode" not in repo_cols:
+                await db.execute("ALTER TABLE repositories ADD COLUMN ingest_mode TEXT DEFAULT 'agentic'")
+            async with db.execute("PRAGMA table_info(telemetry_events)") as cursor:
+                tel_cols = [row[1] for row in await cursor.fetchall()]
+            if "kind" not in tel_cols:
+                await db.execute("ALTER TABLE telemetry_events ADD COLUMN kind TEXT DEFAULT 'log'")
+            if "request_id" not in tel_cols:
+                await db.execute("ALTER TABLE telemetry_events ADD COLUMN request_id TEXT")
+            if "thread_id" not in tel_cols:
+                await db.execute("ALTER TABLE telemetry_events ADD COLUMN thread_id TEXT")
+            if "data" not in tel_cols:
+                await db.execute("ALTER TABLE telemetry_events ADD COLUMN data TEXT")
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_telemetry_request ON telemetry_events(request_id)")
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS jobs (
+                    job_id TEXT PRIMARY KEY,
+                    repo_id TEXT NOT NULL,
+                    kind TEXT NOT NULL DEFAULT 'vectorize',
+                    state TEXT NOT NULL,
+                    reason TEXT,
+                    progress INTEGER DEFAULT 0,
+                    total INTEGER DEFAULT 0,
+                    error TEXT,
+                    created_at TEXT,
+                    updated_at TEXT
+                )
+            """)
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_jobs_repo_kind ON jobs(repo_id, kind, created_at)")
 
             # One-time migration (PRAGMA user_version 0 -> 1): older rows may hold Windows "a\\b.py" paths. Rewrite them to
             # POSIX "a/b.py" so every lookup uses a single key. If a POSIX twin already exists it wins (worst case: one re-index).
@@ -404,12 +439,37 @@ class DatabaseManager:
         if not events:
             return
         rows = [(e["uid"], e["ts"], e["scope"], e.get("repo_id"), e.get("level") or "INFO",
-                 e["title"], e["message"]) for e in events]
+                 e["title"], e["message"], e.get("kind") or "log", e.get("request_id"), e.get("thread_id"),
+                 self._dump_data(e.get("data"))) for e in events]
         async with aiosqlite.connect(self.db_path) as db:
             await db.executemany(
-                "INSERT OR IGNORE INTO telemetry_events (uid, ts, scope, repo_id, level, title, message) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)", rows)
+                "INSERT OR IGNORE INTO telemetry_events "
+                "(uid, ts, scope, repo_id, level, title, message, kind, request_id, thread_id, data) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
             await db.commit()
+
+    @staticmethod
+    def _dump_data(data: Any) -> Optional[str]:
+        if data is None:
+            return None
+        try:
+            return json.dumps(data, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _telemetry_row(r) -> Dict[str, Any]:
+        keys = ("uid", "ts", "scope", "repo_id", "level", "title", "message", "kind", "request_id", "thread_id")
+        d = dict(zip(keys, r[:10]))
+        d["kind"] = d["kind"] or "log"
+        raw = r[10]
+        try:
+            d["data"] = json.loads(raw) if raw else None
+        except (TypeError, ValueError):
+            d["data"] = None
+        return d
+
+    _TELEMETRY_COLS = "uid, ts, scope, repo_id, level, title, message, kind, request_id, thread_id, data"
 
     async def get_telemetry_events(self, repo_id: Optional[str], limit: int) -> List[Dict[str, Any]]:
         """Last `limit` events, oldest first. General events always; repo events only for `repo_id`
@@ -417,7 +477,7 @@ class DatabaseManager:
         limit = max(0, int(limit))
         if limit == 0:
             return []
-        cols = "uid, ts, scope, repo_id, level, title, message"
+        cols = self._TELEMETRY_COLS
         if repo_id and repo_id != GENERAL_REPO_ID:
             sql = (f"SELECT {cols} FROM telemetry_events WHERE scope = 'general' OR (scope = 'repo' AND repo_id = ?) "
                    f"ORDER BY id DESC LIMIT ?")
@@ -428,8 +488,19 @@ class DatabaseManager:
         async with aiosqlite.connect(self.db_path) as db:
             async with db.execute(sql, args) as cursor:
                 rows = await cursor.fetchall()
-        keys = ("uid", "ts", "scope", "repo_id", "level", "title", "message")
-        return [dict(zip(keys, r)) for r in reversed(rows)]
+        return [self._telemetry_row(r) for r in reversed(rows)]
+
+    async def get_telemetry_by_request(self, request_id: str, limit: int = 500) -> List[Dict[str, Any]]:
+        """Events recorded for one chat/change request, oldest first (the Activity timeline's 'Show steps')."""
+        limit = max(0, int(limit))
+        if not request_id or limit == 0:
+            return []
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(
+                f"SELECT {self._TELEMETRY_COLS} FROM telemetry_events WHERE request_id = ? ORDER BY id DESC LIMIT ?",
+                (request_id, limit)) as cursor:
+                rows = await cursor.fetchall()
+        return [self._telemetry_row(r) for r in reversed(rows)]
 
     async def prune_telemetry_events(self, keep: int) -> int:
         """Keep only the newest `keep` rows. Returns how many were removed."""
@@ -447,3 +518,80 @@ class DatabaseManager:
                 "SELECT file_path, chunk_index, content FROM code_chunks "
                 "WHERE repo_id=? AND file_path=? ORDER BY chunk_index", (repo_id, norm_path)) as c:
                 return [{"file_path": _normalize_path(r[0]), "chunk_index": r[1], "content": r[2]} for r in await c.fetchall()]
+
+    # ------------------------------------------------------------------ vector status & background jobs
+    async def set_vector_status(self, repo_id: str, status: str) -> None:
+        """status: none|queued|running|ready|failed."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("UPDATE repositories SET vector_status = ? WHERE repo_id = ?", (status, repo_id))
+            await db.commit()
+
+    async def get_vector_status(self, repo_id: str) -> str:
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute("SELECT vector_status FROM repositories WHERE repo_id = ?", (repo_id,)) as cur:
+                row = await cur.fetchone()
+        return (row[0] if row and row[0] else "none")
+
+    async def set_ingest_mode(self, repo_id: str, mode: str) -> None:
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("UPDATE repositories SET ingest_mode = ? WHERE repo_id = ?", (mode, repo_id))
+            await db.commit()
+
+    async def get_ingest_mode(self, repo_id: str) -> str:
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute("SELECT ingest_mode FROM repositories WHERE repo_id = ?", (repo_id,)) as cur:
+                row = await cur.fetchone()
+        return (row[0] if row and row[0] else "agentic")
+
+    _JOB_COLS = "job_id, repo_id, kind, state, reason, progress, total, error, created_at, updated_at"
+
+    @staticmethod
+    def _job_row(r) -> Dict[str, Any]:
+        keys = ("job_id", "repo_id", "kind", "state", "reason", "progress", "total", "error", "created_at", "updated_at")
+        d = dict(zip(keys, r))
+        d["progress"], d["total"] = int(d["progress"] or 0), int(d["total"] or 0)
+        return d
+
+    async def upsert_job(self, job: Dict[str, Any]) -> None:
+        """job: Job.to_dict() from services/vectorize_jobs.py (state is the enum's string value)."""
+        now_iso = datetime.now(timezone.utc).isoformat()
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("""
+                INSERT INTO jobs (job_id, repo_id, kind, state, reason, progress, total, error, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(job_id) DO UPDATE SET
+                    state=excluded.state, reason=excluded.reason, progress=excluded.progress,
+                    total=excluded.total, error=excluded.error, updated_at=excluded.updated_at
+            """, (job["job_id"], job["repo_id"], job.get("kind") or "vectorize", str(job["state"]),
+                  job.get("reason"), int(job.get("progress") or 0), int(job.get("total") or 0), job.get("error"),
+                  job.get("created_at") or now_iso, job.get("updated_at") or now_iso))
+            await db.commit()
+
+    async def get_job(self, job_id: str) -> Optional[Dict[str, Any]]:
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(f"SELECT {self._JOB_COLS} FROM jobs WHERE job_id = ?", (job_id,)) as cur:
+                row = await cur.fetchone()
+        return self._job_row(row) if row else None
+
+    async def list_jobs(self, repo_id: Optional[str] = None, limit: int = 50) -> List[Dict[str, Any]]:
+        """Newest first."""
+        limit = max(0, int(limit))
+        sql = f"SELECT {self._JOB_COLS} FROM jobs"
+        args: list = []
+        if repo_id:
+            sql += " WHERE repo_id = ?"
+            args.append(repo_id)
+        sql += " ORDER BY created_at DESC, rowid DESC LIMIT ?"
+        args.append(limit)
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(sql, args) as cur:
+                rows = await cur.fetchall()
+        return [self._job_row(r) for r in rows]
+
+    async def latest_job(self, repo_id: str, kind: str = "vectorize") -> Optional[Dict[str, Any]]:
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(
+                f"SELECT {self._JOB_COLS} FROM jobs WHERE repo_id = ? AND kind = ? "
+                "ORDER BY created_at DESC, rowid DESC LIMIT 1", (repo_id, kind)) as cur:
+                row = await cur.fetchone()
+        return self._job_row(row) if row else None

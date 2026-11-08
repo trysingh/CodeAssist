@@ -22,6 +22,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from config.settings import settings
+from services.action_log import action as _action, log_action as _log_action
 from services import call_check, static_check
 from services.model_calls import parse_json_loose
 from services.patch_service import Edit, apply_edits, parse_edits, resolve_edit_paths
@@ -456,10 +457,29 @@ class CodeAgent:
         text = resp.content if isinstance(resp.content, str) else str(resp.content)
         return ModelText(text, reply_meta(resp))
 
+    async def _timed_llm(self, msgs: list, **kw):
+        """self.llm(...) wrapped in an LLM action event (soft: logging never changes the call).
+        The default model (_ollama -> model_calls._build) already logs one LLM event per call through the telemetry
+        callback, so only an injected model gets the agent-level event (no duplicates)."""
+        if not self._custom_llm:
+            return await self.llm(msgs, **kw)
+        try:
+            from services.model_calls import reasoning_model
+            model = reasoning_model()
+        except Exception:  # noqa: BLE001
+            model = None
+        with _action("LLM", "AskAgent", "llm_turn", model=model, data={"messages": len(msgs)}) as h:
+            resp = await self.llm(msgs, **kw)
+            try:
+                h.note(chars=len(str(resp)))
+            except Exception:  # noqa: BLE001
+                pass
+            return resp
+
     async def _reply(self, repo_id: str, msgs: list) -> str:
         """One model turn that is never empty. An empty reply (a thinking model that used its whole output budget thinking, or an
         empty completion) is asked for once more, with thinking off when running out of budget was the cause. Empty twice -> EmptyModelReply."""
-        first = await self.llm(msgs, repo_id=repo_id)
+        first = await self._timed_llm(msgs, repo_id=repo_id)
         text = clean_reply(first)
         if text:
             return text
@@ -467,7 +487,7 @@ class CodeAgent:
         no_think = meta1.get("done_reason") == "length" and not self._custom_llm
         self._emit(f"The model sent an EMPTY reply ({describe_meta(meta1)}); asking once more" + (" with thinking off" if no_think else ""), "WARNING")
         retry = list(msgs) + [AIMessage(content="(empty reply)"), HumanMessage(content=_NUDGE)]
-        second = await self.llm(retry, repo_id=repo_id, **({"reasoning": False} if no_think else {}))
+        second = await self._timed_llm(retry, repo_id=repo_id, **({"reasoning": False} if no_think else {}))
         text = clean_reply(second)
         if text:
             return text
@@ -501,6 +521,14 @@ class CodeAgent:
             name, args, err = act
             obs = err or tools.run(name, args)
             self._emit(f"{name or 'bad action'} {json.dumps(args, default=str)[:120]} -> {len(obs)} chars")
+            try:
+                target = args.get("pattern") or args.get("path") or args.get("name") or "" if isinstance(args, dict) else ""
+                _log_action("RETRIEVE", "AskAgent", f"{name or 'bad action'} {str(target)[:80]}".strip(),
+                            "fail" if err else "ok", f"{len(obs)} chars, {obs.count(chr(10)) + 1 if obs else 0} line(s)",
+                            {"tool": name, "args": args, "chars": len(obs), "lines": obs.count("\n") + 1 if obs else 0,
+                             "tool_calls_left": left - 1})
+            except Exception:  # noqa: BLE001
+                pass
             msgs += [AIMessage(content=reply), HumanMessage(content=f"OBSERVATION ({name or 'error'}):\n{obs}\n\n[{left - 1} tool call(s) left]")]
         msgs.append(HumanMessage(content="The tool budget is used up. Answer now from what you have read. State what you could NOT verify. "
                                          "Do not write an ACTION line."))
@@ -515,7 +543,12 @@ class CodeAgent:
         rounds = max(0, settings.ask_validate_rounds)
         report = ""
         for rnd in range(rounds + 1):
-            chk = await self._check(repo_id, final, tools, snapshot)
+            with _action("SANDBOX", "AskAgent", f"validate edits (round {rnd + 1})") as _h:
+                chk = await self._check(repo_id, final, tools, snapshot)
+                if chk is None:
+                    _h.note("no edit blocks: nothing to validate", status="skip")
+                else:
+                    _h.note("problems found" if chk.problems else "edits check out", ok=not chk.problems)
             if chk is None:                                  # no edit blocks: nothing to validate
                 return final, ""
             report = chk.report

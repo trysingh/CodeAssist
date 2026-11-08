@@ -88,7 +88,26 @@ const Render = {
         if (inTable) out.push("</tbody></table></div>");
         return out.join("");
     },
+    // Answers end with "### Delivery notes" (assumptions / limitations / verified / unverified / requirements):
+    // rendered as a collapsible callout card. A marker inside a code fence is not a heading.
+    findDeliveryNotes: function (src) {
+        const re = /^#{2,4}[ \t]*Delivery notes[ \t]*:?[ \t\r]*$/gim;
+        let m;
+        while ((m = re.exec(src))) {
+            if ((src.slice(0, m.index).split("```").length - 1) % 2 === 0) return { index: m.index, length: m[0].length };
+        }
+        return null;
+    },
     renderMarkdown: function (text) {
+        const src = String(text == null ? "" : text);
+        const dn = this.findDeliveryNotes(src);
+        if (!dn) return this.renderFenced(src);
+        const body = src.slice(dn.index + dn.length);
+        return this.renderFenced(src.slice(0, dn.index)) +
+            "<details class='delivery-notes' open><summary>Delivery notes</summary><div class='delivery-notes-body'>" +
+            this.renderFenced(body) + "</div></details>";
+    },
+    renderFenced: function (text) {
         return String(text == null ? "" : text).split("```").map((part, i) => {
             if (i % 2 === 0) return this.renderBlock(part);
             const lang = (part.match(/^([^\n]*)\n/) || [, ""])[1].trim();
@@ -112,9 +131,17 @@ const LS = {
 const GENERAL = '__general__';
 const S = { web: LS.get('web', 'auto'), repoId: null, threadId: null, repos: [], tab: null, sending: false, files: [], unread: 0, collapsed: LS.get('collapsed', null), poll: null, stream: null, streamKey: '', tlimit: LS.get('tlimit', null), abortController: null };
 S.model = LS.get('model', '');          // '' = server default
-const TABS = ['chat', 'repos', 'ingest', 'telemetry'];
+const AX = window.CodeAssistActivity;   // pure helpers from static/js/activity.js (loaded first)
+// Activity timeline state. events: uid -> ActionEvent (capped); rowIndex: merged-row lookup for lazy detail rendering.
+S.act = { events: new Map(), queries: {}, done: new Set(), groupOpen: new Map(), rowOpen: new Set(), phases: new Set(), failuresOnly: false, text: '', thisThread: false, dirty: false, liveDirty: false, raf: 0, hasRunning: false, repo: null };
+S.rowIndex = new Map();
+S.live = null;            // pending chat request: { id, threadId, requestId, uids:Set, query }
+S.jobs = {};              // job_id -> normalized Job (last seen)
+S.searchMode = null;      // GET /repos/{id}/search-mode for the selected repo
+S.searchJob = null;       // fresher job from SSE for the selected repo
+const TABS = ['chat', 'repos', 'ingest', 'telemetry', 'activity'];
 const STATUS_HISTORY_LIMIT = 5;
-const TITLES = { chat: 'Chat', repos: 'Repositories', ingest: 'Ingest repository', telemetry: 'Telemetry & logs' };
+const TITLES = { chat: 'Chat', repos: 'Repositories', ingest: 'Ingest repository', telemetry: 'Telemetry & logs', activity: 'Agent activity' };
 const isMobile = () => window.innerWidth < 1024;
 const GENERAL_SUGGESTIONS = ['What is new in the latest FastAPI release?', 'Compare Chroma and FAISS for a small RAG POC', 'Summarize this page: https://'];
 const SUGGESTIONS = ['Give me an architecture overview', 'Where is the main entry point?', 'Which modules have the most dependencies?', 'Spot risky or untested code paths'];
@@ -129,7 +156,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     setupAttachments();
     loadModels();
     syncLimitSelect(S.tlimit);
+    buildActivityControls();
     setupNotificationStream();
+    setInterval(() => { if (S.tab === 'activity' && S.act.hasRunning) { S.act.dirty = true; scheduleRender(); } }, 1000);   // tick running durations
     $('chat-messages').addEventListener('scroll', updateJumpBtn);
     window.addEventListener('hashchange', () => switchTab(location.hash.slice(1)));
     await loadRepositories();
@@ -148,7 +177,7 @@ function switchTab(tabId) {
     document.querySelectorAll('.tab-content').forEach(el => {
         const on = el.id === 'tab-' + tabId;
         el.classList.toggle('hidden', !on);
-        if (el.id === 'tab-telemetry') el.classList.toggle('flex', on);
+        if (el.id === 'tab-telemetry' || el.id === 'tab-activity') el.classList.toggle('flex', on);
     });
     document.querySelectorAll('#sidebar nav button').forEach(b => {
         const on = b.id === 'nav-' + tabId;
@@ -164,6 +193,7 @@ function switchTab(tabId) {
     $('focus-btn').classList.toggle('lg:hidden', tabId !== 'chat');
     if (tabId !== 'chat') document.body.classList.remove('focus');
     if (location.hash !== '#' + tabId) history.replaceState(null, '', '#' + tabId);
+    if (tabId === 'activity') renderActivity();
     if (tabId === 'telemetry') { S.unread = 0; renderBadge(); $('telemetry-console').scrollTop = 0; }   // newest line is on top
     applyLayout();
     closeMobileNav();
@@ -196,7 +226,7 @@ function toggleTheme() {
 document.addEventListener('keydown', e => {
     const typing = /INPUT|TEXTAREA|SELECT/.test(document.activeElement?.tagName || '');
     if (e.altKey && !e.ctrlKey && !e.metaKey) {
-        const n = { Digit1: 0, Digit2: 1, Digit3: 2, Digit4: 3 }[e.code];
+        const n = { Digit1: 0, Digit2: 1, Digit3: 2, Digit4: 3, Digit5: 4 }[e.code];
         if (n !== undefined) { e.preventDefault(); return switchTab(TABS[n]); }
         if (e.code === 'KeyB') { e.preventDefault(); return toggleSidebar(); }
         if (e.code === 'KeyT') { e.preventDefault(); switchTab('chat'); return toggleThreads(); }
@@ -291,6 +321,23 @@ function telemetryLine(ev) {
     return line;
 }
 
+function updateLiveStatus(msg) {
+    const st = S.liveStatus && $(S.liveStatus);
+    if (!st) return;
+    if (!S.statusHistory) S.statusHistory = [];
+    if (S.statusHistory[0] !== msg) {
+        S.statusHistory.unshift(msg);
+        if (S.statusHistory.length > STATUS_HISTORY_LIMIT) S.statusHistory.pop();
+    }
+    st.textContent = msg.length > 160 ? msg.slice(0, 157) + '…' : msg;
+    st.title = msg;
+    const histEl = $(S.liveStatus.replace('_s', '_h'));
+    if (histEl) {
+        histEl.innerHTML = S.statusHistory.slice(1).map((m, i) => `<div class="text-[10px] opacity-60 py-0.5">${i + 1}. ${esc(m)}</div>`).join('');
+        histEl.classList.toggle('hidden', S.statusHistory.length <= 1);
+    }
+}
+
 function setupNotificationStream() {
     const repo = streamRepo();
     const key = `${repo}|${S.tlimit}`;
@@ -298,6 +345,8 @@ function setupNotificationStream() {
     if (S.stream) S.stream.close();
     S.streamKey = key;
     renderScopeHint();
+    if (S.act.repo !== repo) { S.act.repo = repo; S.act.events.clear(); S.act.rowOpen.clear(); scheduleRender(); }   // other repo: other timeline
+    loadActionHistory();
 
     const qs = new URLSearchParams();
     if (repo) qs.set('repo_id', repo);
@@ -314,7 +363,15 @@ function setupNotificationStream() {
             if (S.tlimit == null) syncLimitSelect(data.limit);
             const consoleDiv = $('telemetry-console');
             const frag = document.createDocumentFragment();
-            (data.events || []).forEach(ev => frag.prepend(telemetryLine(ev)));    // oldest first in -> newest on top
+            const logs = [], actions = [];
+            (data.events || []).forEach(ev => {
+                const k = AX.eventKind(ev);
+                if (k === 'action') { if (ev.data) actions.push(ev.data); }          // Activity only: never floods the console
+                else if (k === 'job') applyJob(ev.data, true);
+                else logs.push(ev);
+            });
+            if (actions.length) addActionEvents(actions);
+            logs.forEach(ev => frag.prepend(telemetryLine(ev)));                   // oldest first in -> newest on top
             if (!frag.childNodes.length) {
                 const none = document.createElement('div');
                 none.className = 'text-slate-500';
@@ -331,25 +388,12 @@ function setupNotificationStream() {
         setConn(true);
         try {
             const data = typeof event.data === 'string' ? JSON.parse(event.data) : event.data;
+            const kind = AX.eventKind(data);
+            if (kind === 'action') return onActionEvent(data.data);              // Activity + live status only: no console, toast or unread badge
+            if (kind === 'job') return applyJob(data.data, false);               // job UI + toasts
             const level = String(data.level || 'info').toLowerCase();
-            // showToast(data.title, prettyMessage(data), level);
             const st = S.liveStatus && $(S.liveStatus);
-            if (st) {
-                const msg = `${data.title} — ${prettyMessage(data)}`;
-                if (!S.statusHistory) S.statusHistory = [];
-                if (S.statusHistory[0] !== msg) {
-                    S.statusHistory.unshift(msg);
-                    if (S.statusHistory.length > STATUS_HISTORY_LIMIT) S.statusHistory.pop();
-                }
-                st.textContent = msg.length > 160 ? msg.slice(0, 157) + '…' : msg;
-                st.title = msg;
-                const histId = S.liveStatus.replace('_s', '_h');
-                const histEl = $(histId);
-                if (histEl) {
-                    histEl.innerHTML = S.statusHistory.slice(1).map((m, i) => `<div class="text-[10px] opacity-60 py-0.5">${i+1}. ${m}</div>`).join('');
-                    histEl.classList.toggle('hidden', S.statusHistory.length <= 1);
-                }
-            }
+            if (st) updateLiveStatus(`${data.title} — ${prettyMessage(data)}`);
             if (!(st && level === 'info')) showToast(data.title, prettyMessage(data), level);   // info is already in the loader
             const consoleDiv = $('telemetry-console');
             consoleDiv.querySelector(':scope > .text-slate-500')?.remove();          // placeholder line
@@ -424,6 +468,7 @@ async function triggerIngestion() {
         if (!response.ok) throw new Error(result.detail || result.message || `Server returned ${response.status}`);
         LS.set('recent', [repoPath, ...LS.get('recent', []).filter(p => p !== repoPath)].slice(0, 5));
         pathInput.value = '';
+        if (result.repo_id && !S.repoId) LS.set('repo', result.repo_id);        // preselect the new repo once it is listed
         showToast("Ingestion queued", result.message || repoPath, "success");
         await loadRepositories();
         switchTab('repos');
@@ -607,6 +652,7 @@ async function onRepoChanged(preferThread) {
     S.repoId = $('chat-repo-select').value || null;
     LS.set('repo', S.repoId || '');
     setupNotificationStream();      // telemetry follows the selection: general events + this repo's events
+    fetchSearchMode(streamRepo());
     if (!S.repoId) {
         S.threadId = null;
         renderThreads([]);
@@ -663,7 +709,7 @@ async function createThreadRequest(title) {
 }
 
 /* ================= Messages ================= */
-function msgHtml(role, content, meta = '', atts = []) {
+function msgHtml(role, content, meta = '', atts = [], requestId = '') {
     if (role === 'user') {
         const chips = atts.length ? `<div class="flex flex-wrap gap-1.5 ${content ? 'mb-2' : ''}">${atts.map(a => `<span class="inline-flex items-center gap-1 bg-blue-800/60 rounded-md px-2 py-0.5 text-xs"><i data-lucide="${a.kind === 'image' ? 'image' : 'file-text'}" class="w-3 h-3"></i>${esc(a.filename)}</span>`).join('')}</div>` : '';
         return `<div class="flex justify-end"><div class="bg-blue-600 text-white rounded-2xl rounded-br-md px-4 py-2.5 text-sm max-w-[92%] sm:max-w-[85%] whitespace-pre-wrap break-words">${chips}${esc(content)}</div></div>`;
@@ -674,7 +720,7 @@ function msgHtml(role, content, meta = '', atts = []) {
             <div class="text-sm text-slate-700 dark:text-slate-200 leading-relaxed break-words">${Render.renderMarkdown(content)}</div>
             <div class="msg-actions mt-1 flex items-center gap-3 text-[11px] text-slate-500 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity">
                 <button data-copy="msg" class="hover:text-slate-900 dark:hover:text-slate-200 flex items-center gap-1"><i data-lucide="copy" class="w-3 h-3"></i><span>Copy</span></button>${meta}
-            </div>
+            </div>${requestId ? stepsPillHtml(requestId) : ''}
         </div></div>`;
 }
 
@@ -716,7 +762,7 @@ async function selectThread(threadId, threadTitle) {
         const messages = await res.json();
         if (S.threadId !== threadId) return; // user switched while loading
         if (!messages.length) return showEmpty('thread', threadTitle);
-        col.innerHTML = messages.map(m => msgHtml(m.role === 'user' ? 'user' : 'assistant', m.content, '', m.attachments || [])).join('');
+        col.innerHTML = messages.map(m => msgHtml(m.role === 'user' ? 'user' : 'assistant', m.content, '', m.attachments || [], m.request_id || '')).join('');
         icons();
         scrollDown(true);
         $('chat-input-query').focus();
@@ -881,9 +927,11 @@ async function sendChatMessage(e) {
         <div class="flex flex-col gap-1 text-sm text-slate-400 pt-0.5">
             <div class="flex items-center gap-2.5"><span class="think flex gap-1"><span></span><span></span><span></span></span><span id="${id}_s" class="min-w-0 break-words">${files.length ? 'Reading attachments' : (S.repoId === GENERAL ? 'Thinking' : 'Retrieving relevant chunks')}${S.web !== 'off' ? ' · may search the web' : ''}</span> <span id="${id}_t" class="font-mono text-xs text-slate-600 shrink-0">0s</span></div>
             <div id="${id}_h" class="hidden pl-5 border-l border-slate-300 dark:border-slate-700"></div>
+            <div id="${id}_a" class="act-live hidden" aria-label="Live steps"></div>
         </div></div></div>`);
     icons(); scrollDown(true);
     S.liveStatus = id + '_s';
+    S.live = { id, threadId: S.threadId, requestId: null, uids: new Set(), query };
     const t0 = performance.now();
     const tick = setInterval(() => { const el = $(id + '_t'); if (el) el.textContent = Math.floor((performance.now() - t0) / 1000) + 's'; }, 1000);
 
@@ -912,7 +960,9 @@ async function sendChatMessage(e) {
         const result = await res.json();
         files.forEach(f => f._url && URL.revokeObjectURL(f._url));
         $(id)?.remove();
-        col.insertAdjacentHTML('beforeend', msgHtml('assistant', result.answer, `<span>${((performance.now() - t0) / 1000).toFixed(1)}s</span>`));
+        const rid = result.request_id || S.live?.requestId || '';
+        if (rid) { S.act.done.add(rid); S.act.queries[rid] = query; scheduleRender(); }
+        col.insertAdjacentHTML('beforeend', msgHtml('assistant', result.answer, `<span>${((performance.now() - t0) / 1000).toFixed(1)}s</span>`, [], rid));
         icons();
         col.lastElementChild.scrollIntoView({ block: 'start' }); // start reading at the top of the answer
         if (result && result.base_system) {
@@ -933,7 +983,8 @@ async function sendChatMessage(e) {
             showToast("Message failed", err.message, "error");
         }
     } finally {
-        clearInterval(tick); S.liveStatus = null;
+        if (S.live?.requestId) S.act.done.add(S.live.requestId);   // stopped/failed: nothing more will close its open steps
+        clearInterval(tick); S.liveStatus = null; S.live = null;
         S.sending = false; S.abortController = null; updateComposer(); input.focus();
     }
 }
@@ -988,7 +1039,8 @@ document.addEventListener('click', async e => {
         // a.textContent = res.ok ? `Applied (${res.body.written.length + res.body.deleted.length} file(s))`
         //                        : 'Apply failed: ' + (res.body.detail || res.body.note || res.status);
         if (res.ok) {
-            a.textContent = `Applied ${res.body.count || 0} files`;
+            const nApplied = res.body.count ?? ((res.body.written || []).length + (res.body.deleted || []).length);
+            a.textContent = `Applied ${nApplied} file(s)`;
             showToast('Success', `Successfully applied changes to the repository.`, 'success');
 
             if (res.body && res.body.used_docker !== undefined) {
@@ -1011,3 +1063,343 @@ document.addEventListener('click', async e => {
         delete a.dataset.busy;
     }
 });
+
+/* ================= Agent activity (timeline, live steps, per-answer steps) ================= */
+/* Pure merge/group/filter logic lives in static/js/activity.js (AX). This section is DOM + state only. */
+const ACT_EVENT_CAP = 8000;     // events kept in memory
+const ACT_DOM_CAP = 1500;       // rows rendered at once
+const LIVE_ROWS = 12;           // rows shown in the pending-answer panel
+
+function parseMaybeJson(v) { if (typeof v !== 'string') return v; try { return JSON.parse(v); } catch { return null; } }
+
+function addActionEvents(list) {
+    const A = S.act;
+    for (const ev of list) {
+        if (!ev || typeof ev !== 'object' || ev.uid == null) continue;
+        A.events.set(String(ev.uid), ev);
+    }
+    if (A.events.size > ACT_EVENT_CAP) {                        // Map iterates in insertion order: drop the oldest 10 %
+        let drop = Math.ceil(ACT_EVENT_CAP * 0.1);
+        for (const k of A.events.keys()) { if (drop-- <= 0) break; A.events.delete(k); }
+    }
+    A.dirty = true;
+    scheduleRender();
+}
+
+function liveMatches(ev) {
+    const L = S.live;
+    if (!L) return false;
+    if (L.requestId && ev.request_id && String(ev.request_id) === String(L.requestId)) return true;
+    return !!ev.thread_id && String(ev.thread_id) === String(L.threadId);   // request_id is only known once the response lands
+}
+
+function onActionEvent(raw) {
+    const ev = parseMaybeJson(raw);
+    if (!ev || typeof ev !== 'object') return;
+    addActionEvents([ev]);
+    const L = S.live;
+    if (!S.sending || !L || !liveMatches(ev)) return;
+    if (ev.uid != null) L.uids.add(String(ev.uid));
+    if (!L.requestId && ev.request_id) { L.requestId = ev.request_id; S.act.queries[ev.request_id] = L.query; }
+    S.act.liveDirty = true; scheduleRender();
+    const status = AX.normStatus(ev.status);
+    if (status !== 'ok' && status !== 'skip') updateLiveStatus([ev.phase, ev.agent, ev.action].filter(Boolean).join(' · '));
+}
+
+async function loadActionHistory() {
+    try {
+        const qs = new URLSearchParams({ limit: '500' });
+        if (streamRepo()) qs.set('repo_id', streamRepo());
+        const res = await fetch('/api/v1/actions?' + qs);
+        if (!res.ok) return;
+        const body = await res.json();
+        addActionEvents(body.events || []);
+    } catch { /* older backend without /actions: the timeline fills from SSE only */ }
+}
+
+/* ---- rendering helpers ---- */
+function actStatusIcon(r) {
+    if (r.open) return '<span class="act-spin" role="img" aria-label="running"></span>';
+    const m = { ok: ['✓', 'ok'], fail: ['✗', 'failed'], skip: ['–', 'skipped'], info: ['•', 'info'] }[r.status] || ['•', 'info'];
+    return `<span class="act-ic act-${esc(r.status)}" role="img" aria-label="${m[1]}">${m[0]}</span>`;
+}
+function actPhaseChip(phase) { return `<span class="act-phase" style="--ph:${AX.phaseHue(phase)}">${esc(phase || '—')}</span>`; }
+function actTime(r) { return r.startMs ? fmtTs(new Date(r.startMs).toISOString()) : ''; }
+
+function actJson(data) {
+    if (data == null || (typeof data === 'object' && !Object.keys(data).length)) return '';
+    let txt;
+    try { txt = JSON.stringify(data, null, 2); } catch { txt = String(data); }
+    return txt.length > 20000 ? txt.slice(0, 20000) + '\n… (truncated)' : txt;
+}
+function actDetailHtml(r) {
+    const json = actJson(r.data);
+    const times = `${esc(actTime(r))}${r.endMs ? ' → ' + esc(fmtTs(new Date(r.endMs).toISOString())) : ''}`;
+    return `<div class="act-row-d">
+        ${r.detail ? `<p class="act-detail-full">${esc(r.detail)}</p>` : ''}
+        <p class="act-meta">${times}${r.request_id ? ' · request ' + esc(r.request_id) : ''}${r.thread_id ? ' · thread ' + esc(r.thread_id) : ''}${r.model ? ' · ' + esc(r.model) : ''}</p>
+        ${json ? `<pre class="act-json">${esc(json)}</pre>` : '<p class="act-meta">No data payload.</p>'}
+    </div>`;
+}
+
+/* One merged row. `inline` rows (mini timelines) render their detail up-front (hidden); the big list renders it only when expanded. */
+function actRowHtml(r, inline) {
+    S.rowIndex.set(r.uid, r);
+    const open = S.act.rowOpen.has(r.uid);
+    const label = [r.phase, r.agent, r.action].filter(Boolean).join(' ');
+    return `<div class="act-row" data-status="${r.open ? 'start' : esc(r.status)}">
+        <button type="button" class="act-row-h" data-act-row="${esc(r.uid)}" aria-expanded="${open}" aria-label="${esc(label)}: toggle details">
+            ${actStatusIcon(r)}${actPhaseChip(r.phase)}
+            <span class="act-agent">${esc(r.agent)}</span><span class="act-action">${esc(r.action)}</span>
+            ${r.model ? `<span class="act-model">${esc(r.model)}</span>` : ''}
+            ${r.detail ? `<span class="act-detail">${esc(r.detail)}</span>` : ''}
+            <span class="act-dur">${esc(AX.fmtDuration(r.duration_ms))}</span>
+        </button>${open || inline ? actDetailHtml(r).replace('class="act-row-d"', open ? 'class="act-row-d"' : 'class="act-row-d" hidden') : ''}
+    </div>`;
+}
+
+/* Rows whose request already answered but never got a closing event would spin forever: show them as skipped. */
+function settleRows(rows) {
+    rows.forEach(r => { if (r.open && r.request_id && S.act.done.has(r.request_id)) { r.open = false; r.status = 'skip'; } });
+    return rows;
+}
+
+function scheduleRender() {
+    if (S.act.raf) return;
+    const run = () => {
+        S.act.raf = 0;
+        if (S.act.dirty && S.tab === 'activity') renderActivity();
+        if (S.act.liveDirty) renderLive();
+    };
+    S.act.raf = (window.requestAnimationFrame || (f => setTimeout(f, 16)))(run);
+}
+
+function actGroupOpen(g, firstKey, filtering) {
+    if (S.act.groupOpen.has(g.key)) return S.act.groupOpen.get(g.key);
+    return g.status === 'running' || g.key === firstKey || filtering;
+}
+
+function renderActivity() {
+    const A = S.act, list = $('activity-list');
+    A.dirty = false;
+    if (!list) return;
+    const focusKey = document.activeElement?.closest?.('#activity-list') ? (document.activeElement.dataset.actRow || document.activeElement.dataset.actGroup) : null;
+    const rows = settleRows(AX.mergeActionEvents([...A.events.values()]));
+    const filtering = !!(A.phases.size || A.failuresOnly || A.text.trim() || A.thisThread);
+    const filtered = AX.filterRows(rows, { phases: A.phases, failuresOnly: A.failuresOnly, text: A.text, threadId: A.thisThread ? S.threadId : null });
+    const groups = AX.groupByRequest(filtered, { queries: A.queries });
+    A.hasRunning = groups.some(g => g.status === 'running');
+    const vis = AX.selectVisible(groups, g => actGroupOpen(g, groups[0]?.key, filtering), ACT_DOM_CAP);
+    S.rowIndex.clear();
+
+    const sum = $('activity-summary');
+    if (sum) sum.textContent = rows.length
+        ? `${groups.length} request${groups.length === 1 ? '' : 's'} · ${filtered.length}${filtered.length !== rows.length ? ' of ' + rows.length : ''} steps${vis.hidden ? ` · ${vis.hidden} oldest rows hidden (showing newest ${ACT_DOM_CAP})` : ''}`
+        : 'No activity yet. Steps appear here live while the assistant works.';
+
+    if (!groups.length) {
+        list.innerHTML = `<div class="act-empty">${rows.length ? 'No steps match the current filters.' : 'No agent activity recorded yet.'}</div>`;
+        return;
+    }
+    list.innerHTML = vis.groups.map(({ group: g, rows: gr, open, truncated }) => {
+        const c = g.counts;
+        const counts = `${c.total} step${c.total === 1 ? '' : 's'}${c.fail ? ` · <span class="act-fail-txt">${c.fail} failed</span>` : ''}${c.skip ? ` · ${c.skip} skipped` : ''}${c.open ? ` · ${c.open} running` : ''}`;
+        const status = { running: ['running', 'Running'], fail: ['fail', 'Failed'], ok: ['ok', 'Done'] }[g.status];
+        return `<section class="act-group" data-status="${status[0]}">
+            <button type="button" class="act-group-h" data-act-group="${esc(g.key)}" aria-expanded="${open}" aria-label="${esc(g.label)}: ${status[1]}, ${c.total} steps">
+                <span class="act-chevron" aria-hidden="true">▸</span>
+                <span class="act-group-title">${esc(g.label)}</span>
+                <span class="act-group-meta">${esc(fmtTs(new Date(g.startMs).toISOString()))}</span>
+                <span class="act-group-meta">${esc(AX.fmtDuration(g.durationMs))}</span>
+                <span class="act-badge act-badge-${status[0]}">${status[1]}</span>
+                <span class="act-group-meta act-group-counts">${counts}</span>
+            </button>
+            ${open ? `<div class="act-rows">${truncated ? `<div class="act-empty">${truncated} older steps not shown</div>` : ''}${gr.map(r => actRowHtml(r, false)).join('')}</div>` : ''}
+        </section>`;
+    }).join('');
+    if (focusKey) [...list.querySelectorAll('[data-act-row],[data-act-group]')].find(b => (b.dataset.actRow || b.dataset.actGroup) === focusKey)?.focus({ preventScroll: true });
+}
+
+function renderLive() {
+    const L = S.live, A = S.act;
+    A.liveDirty = false;
+    const el = L && $(L.id + '_a');
+    if (!el) return;
+    const events = [...L.uids].map(u => A.events.get(u)).filter(Boolean);
+    const rows = AX.mergeActionEvents(events);
+    el.classList.toggle('hidden', !rows.length);
+    if (!rows.length) return;
+    const stick = el.scrollHeight - el.scrollTop - el.clientHeight < 24;
+    const keep = rows.slice(-LIVE_ROWS);
+    el.innerHTML = `<div class="act-live-h">Working · ${rows.length} step${rows.length === 1 ? '' : 's'}${rows.length > keep.length ? ' (latest ' + keep.length + ')' : ''}</div>` + keep.map(r => actRowHtml(r, true)).join('');
+    if (stick) el.scrollTop = el.scrollHeight;
+}
+
+/* ---- Activity tab controls ---- */
+function buildActivityControls() {
+    const box = $('activity-phases');
+    if (!box) return;
+    box.innerHTML = AX.PHASES.map(p => `<button type="button" class="act-phase act-phase-btn" style="--ph:${AX.phaseHue(p)}" data-phase="${p}" aria-pressed="false">${p}</button>`).join('');
+    box.addEventListener('click', e => {
+        const b = e.target.closest('[data-phase]');
+        if (!b) return;
+        const on = !S.act.phases.has(b.dataset.phase);
+        on ? S.act.phases.add(b.dataset.phase) : S.act.phases.delete(b.dataset.phase);
+        b.setAttribute('aria-pressed', String(on));
+        onActivityFilter();
+    });
+    $('activity-list').addEventListener('click', e => {
+        const rb = e.target.closest('[data-act-row]');
+        if (rb) return toggleActRow(rb);
+        const gb = e.target.closest('[data-act-group]');
+        if (gb) { S.act.groupOpen.set(gb.dataset.actGroup, gb.getAttribute('aria-expanded') !== 'true'); S.act.dirty = true; renderActivity(); }
+    });
+}
+
+function onActivityFilter() {
+    const A = S.act;
+    A.failuresOnly = !!$('activity-failures')?.checked;
+    A.thisThread = !!$('activity-thread')?.checked;
+    A.text = $('activity-text')?.value || '';
+    A.dirty = true; scheduleRender();
+}
+function clearActivity() { S.act.events.clear(); S.act.rowOpen.clear(); S.act.groupOpen.clear(); S.act.dirty = true; renderActivity(); }
+async function reloadActivity() { await loadActionHistory(); showToast('Activity', 'Timeline refreshed.', 'info'); }
+
+/* Expand/collapse one row anywhere (activity list, live panel, per-answer steps). Detail HTML is created lazily. */
+function toggleActRow(btn) {
+    const key = btn.dataset.actRow, open = btn.getAttribute('aria-expanded') !== 'true';
+    btn.setAttribute('aria-expanded', String(open));
+    open ? S.act.rowOpen.add(key) : S.act.rowOpen.delete(key);
+    let d = btn.nextElementSibling;
+    if (d && !d.classList.contains('act-row-d')) d = null;
+    if (!d && open && S.rowIndex.has(key)) {
+        btn.insertAdjacentHTML('afterend', actDetailHtml(S.rowIndex.get(key)));
+        d = btn.nextElementSibling;
+    }
+    if (d) d.hidden = !open;
+}
+document.addEventListener('click', e => {         // rows inside the live panel and per-answer step panels
+    const rb = e.target.closest('.act-live [data-act-row], .steps-panel [data-act-row]');
+    if (rb) toggleActRow(rb);
+});
+
+/* ---- Per-answer "Steps (n)" ---- */
+function stepRowsFor(rid) {
+    const evs = [...S.act.events.values()].filter(ev => String(ev.request_id) === String(rid));
+    return settleRows(AX.mergeActionEvents(evs));
+}
+function stepsPillHtml(rid) {
+    const n = stepRowsFor(rid).length;
+    return `<div class="steps-wrap"><button type="button" class="steps-pill" data-steps="${esc(rid)}" aria-expanded="false" aria-label="Show the steps taken for this answer"><i data-lucide="list-checks" class="w-3 h-3"></i><span>${n ? `Steps (${n})` : 'Steps'}</span></button>
+        <div class="steps-panel hidden" role="region" aria-label="Steps taken"></div></div>`;
+}
+function renderStepsPanel(panel, rid) {
+    const rows = stepRowsFor(rid);
+    panel.innerHTML = rows.length ? rows.map(r => actRowHtml(r, true)).join('') : '<div class="act-empty">No recorded steps for this answer.</div>';
+    const label = panel.parentElement.querySelector('.steps-pill span');
+    if (label && rows.length) label.textContent = `Steps (${rows.length})`;
+}
+document.addEventListener('click', async e => {
+    const btn = e.target.closest('[data-steps]');
+    if (!btn) return;
+    const panel = btn.parentElement.querySelector('.steps-panel'), rid = btn.dataset.steps;
+    const open = btn.getAttribute('aria-expanded') !== 'true';
+    btn.setAttribute('aria-expanded', String(open));
+    panel.classList.toggle('hidden', !open);
+    if (!open) return;
+    renderStepsPanel(panel, rid);                       // whatever streamed in live shows immediately
+    if (panel.dataset.loaded) return;
+    panel.insertAdjacentHTML('afterbegin', '<div class="act-empty" data-loading>Loading steps…</div>');
+    try {
+        const res = await fetch('/api/v1/actions?' + new URLSearchParams({ request_id: rid, limit: '1000' }));
+        if (!res.ok) throw new Error(`Server returned ${res.status}`);
+        S.act.done.add(rid);
+        addActionEvents((await res.json()).events || []);
+        panel.dataset.loaded = '1';
+    } catch (err) {
+        panel.querySelector('[data-loading]')?.remove();
+        panel.insertAdjacentHTML('afterbegin', `<div class="act-empty">Couldn't load steps: ${esc(err.message)}</div>`);
+        return;
+    }
+    renderStepsPanel(panel, rid);
+});
+
+/* ================= Search mode + vectorize jobs ================= */
+function repoLabel(id) { const r = S.repos.find(x => String(x.repo_id) === String(id)); return r ? r.title : id; }
+
+async function fetchSearchMode(repoId) {
+    if (!repoId) { S.searchMode = null; S.searchJob = null; return renderSearchMode(); }
+    try {
+        const res = await fetch(`/api/v1/repos/${encodeURIComponent(repoId)}/search-mode`);
+        if (!res.ok) throw new Error(`Server returned ${res.status}`);
+        const mode = await res.json();
+        if (streamRepo() !== repoId) return;                                      // user moved on
+        S.searchMode = mode; S.searchJob = null;
+        const job = AX.normalizeJob(mode.job);
+        if (job && job.job_id) S.jobs[job.job_id] = job;                           // known: no toast on later duplicates
+    } catch { S.searchMode = null; }                                               // older backend: hide the badge
+    renderSearchMode();
+}
+
+function renderSearchMode() {
+    const box = $('search-mode');
+    if (!box) return;
+    const info = S.searchMode ? AX.searchModeInfo(S.searchMode, S.searchJob) : null;
+    box.classList.toggle('hidden', !info);
+    box.classList.toggle('flex', !!info);
+    if (!info) return;
+    box.dataset.kind = info.kind;
+    $('search-mode-label').textContent = info.label;
+    const failMsg = info.kind === 'failed' && info.job?.error ? ` — ${info.job.error}` : '';
+    $('search-mode-badge').title = `Search mode: ${info.label}${failMsg}`;
+    const bar = $('search-mode-bar');
+    bar.classList.toggle('hidden', info.kind !== 'vectorizing');
+    bar.dataset.indeterminate = String(info.kind === 'vectorizing' && info.pct == null);
+    $('search-mode-fill').style.width = (info.pct == null ? 100 : info.pct) + '%';
+    bar.setAttribute('aria-valuenow', String(info.pct == null ? 0 : info.pct));
+    const btn = $('vectorize-btn');
+    btn.classList.toggle('hidden', !info.canBuild);
+    btn.classList.toggle('inline-flex', info.canBuild);
+    btn.querySelector('span').textContent = info.kind === 'failed' ? 'Retry index' : 'Build vector index';
+}
+
+/* A job update arrived (SSE, history replay or the vectorize response). Replays never toast. */
+function applyJob(raw, replay) {
+    const job = AX.normalizeJob(parseMaybeJson(raw));
+    if (!job || !job.job_id) return;
+    const prev = S.jobs[job.job_id];
+    S.jobs[job.job_id] = job;
+    if (!replay) {
+        const name = repoLabel(job.repo_id);
+        if (!prev && AX.isActiveJob(job)) showToast('Vector index', `Vectorizing ${name} in the background${job.reason ? ' (' + job.reason + ')' : ''}. You'll be notified when it finishes.`, 'info');
+        if (AX.isTerminalJob(job) && !(prev && prev.state === job.state)) {
+            if (job.state === 'COMPLETED') showToast('Vector index ready', `Semantic search is now enabled for ${name}.`, 'success');
+            else if (job.state === 'FAILED') showToast('Vectorize failed', `${name}: ${job.error || 'unknown error'}`, 'error');
+            else showToast('Vectorize cancelled', name, 'warning');
+        }
+    }
+    if (String(job.repo_id) !== String(streamRepo())) return;
+    S.searchJob = job;
+    if (!S.searchMode) S.searchMode = { vector_status: 'none' };
+    renderSearchMode();
+    if (!replay && AX.isTerminalJob(job)) fetchSearchMode(streamRepo());           // authoritative status after a job ends
+}
+
+async function buildVectorIndex() {
+    const repoId = streamRepo();
+    if (!repoId) return;
+    if (!confirm(`Build a vector index for "${repoId}"?\n\nThis is a long-running background job: it can take several minutes on large repositories. You can keep chatting (agentic search keeps working) and you will be notified here when it finishes.`)) return;
+    const btn = $('vectorize-btn');
+    btn.disabled = true;
+    try {
+        const res = await fetch(`/api/v1/repos/${encodeURIComponent(repoId)}/vectorize`, { method: 'POST' });
+        const job = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(job.detail || `Server returned ${res.status}`);
+        applyJob(job, false);
+    } catch (err) {
+        showToast("Couldn't start vectorize", err.message, 'error');
+    } finally {
+        btn.disabled = false;
+    }
+}

@@ -13,9 +13,17 @@ from services.attachment_service import AttachmentService
 from services.web_search_service import WebSearchService, decide_web, now_str
 import asyncio
 from models.schemas import GENERAL_REPO_ID
-from services.model_calls import reasoning_arg, reasoning_model
+from services.model_calls import reasoning_arg, reasoning_model, chat_base_url
+from services.agentic_search import AgenticSearch, RepoCorpus, needs_vectors
 from services.code_agent import EmptyModelReply, clean_reply, describe_meta, leads_from_context, reply_meta
+import hashlib
 import re
+import time
+try:  # soft import: the action log is optional here
+    from services.action_log import log_action
+except Exception:  # noqa: BLE001
+    def log_action(*_a, **_k):  # type: ignore[misc]
+        return None
 MAX_FILE_CHARS = settings.change_context_chars
 
 
@@ -35,18 +43,27 @@ class AgentState(TypedDict):
     web_footer: str
     web_query: str        # query this thread's last web search ran ("" = last turn did not use the web)
     web_note: str         # why the last search gave nothing ("" = fine or not attempted)
+    retrieval_meta: dict  # {"mode": named|agentic|vector|hybrid, "confidence", "reasons", "job_id", "vector_status"}
 
 class RAGWorkflowManager:
     """
     LangGraph state machine with relational chunk expansion and SQLite conversation persistence.
     """
     def __init__(self, db_manager: DatabaseManager, vector_service: VectorStoreService,
-                 attachment_service: AttachmentService = None, web_service: WebSearchService = None):
+                 attachment_service: AttachmentService = None, web_service: WebSearchService = None,
+                 repo_store=None, jobs=None, vector_status_fn=None):
         self.db_manager = db_manager
         self.vector_service = vector_service
         self.attachments = attachment_service or AttachmentService(vector_service)
         self.web = web_service or WebSearchService()
         self.code_agent = None      # services/code_agent.CodeAgent, set by the controller; None = single-shot answer from retrieved chunks
+        # v2 agentic retrieval. All optional; the controller may also assign them after construction (like code_agent).
+        self.repo_store = repo_store                # services/repo_store.RepoStore (raw snapshot); None = old vector-only path
+        self.jobs = jobs                            # services/vectorize_jobs.VectorizeJobManager; None = never auto-vectorize
+        self.vector_status_fn = vector_status_fn    # async (repo_id) -> none|queued|running|ready|failed
+        self.retrieval_meta_by_thread: dict = {}    # thread_id -> last retrieval_meta (for the reasoning supervisor's facts)
+        self._corpus_cache: dict = {}               # repo_id -> (key, RepoCorpus)
+        self._retry_after: dict = {}                # repo_id -> monotonic time before which a FAILED vectorize is not retried
 
     async def _attachment_context_node(self, state: AgentState) -> dict:
         thread_id = state.get("thread_id")
@@ -84,11 +101,17 @@ class RAGWorkflowManager:
     async def _retrieve_and_expand_node(self, state: AgentState) -> dict:
         repo_id = state["repo_id"]
         if repo_id == GENERAL_REPO_ID:
-            return {"context_str": ""}
+            return {"context_str": "", "retrieval_meta": {}}
         last_user_msg = state["messages"][-1].content
 
         query = str(last_user_msg).lower()
         all_paths = await self.db_manager.list_file_paths(repo_id)
+        if self.repo_store is not None and (not all_paths or str(getattr(settings, "retrieval_mode", "agentic")).lower() != "vector"):
+            # agentic-only repos have no code_chunks: the raw snapshot knows the files
+            try:
+                all_paths = sorted(set(all_paths) | set(await self.repo_store.list_paths(repo_id, 0)))
+            except Exception:  # noqa: BLE001 - raw store unavailable: chunk table only (old behaviour)
+                pass
         named = [p for p in all_paths if re.search(
             r'(?<![\w.\-])' + re.escape(p.replace("\\", "/").split("/")[-1].lower()) + r'(?![\w])', query)]
         if named:
@@ -96,18 +119,149 @@ class RAGWorkflowManager:
             for p in sorted(named):
                 chunks = await self.db_manager.get_file_chunks(repo_id, p)
                 text = "\n\n".join(c["content"] for c in chunks)
+                if not chunks and self.repo_store is not None:      # not vectorized (yet): read the verbatim snapshot
+                    try:
+                        raw = await self.repo_store.get_file(repo_id, p, 0)
+                        text = raw.data.decode("utf-8", errors="replace") if raw else ""
+                        chunks = [text] if text else []
+                    except Exception:  # noqa: BLE001
+                        pass
                 status = "COMPLETE"
                 if used + len(text) > MAX_FILE_CHARS:
                     text, status = text[: max(0, MAX_FILE_CHARS - used)], "TRUNCATED (budget)"
                 used += len(text)
                 blocks.append(f"--- [FULL_FILE: {status}] {p} ({len(chunks)} chunks) ---\n{text}")
-            return {"context_str": "\n\n".join(blocks)}
+            meta = {"mode": "named", "confidence": 1.0, "reasons": [], "job_id": None, "vector_status": None}
+            self._remember_meta(state, meta)
+            return {"context_str": "\n\n".join(blocks), "retrieval_meta": meta}
 
 
 
         
+        return await self._retrieve_unnamed(state, repo_id, str(last_user_msg), all_paths)
+
+    # ------------------------------------------------------------------ v2 retrieval switch
+    def last_retrieval_meta(self, thread_id: str) -> dict:
+        return dict(self.retrieval_meta_by_thread.get(thread_id) or {})
+
+    def _remember_meta(self, state: AgentState, meta: dict) -> None:
+        tid = state.get("thread_id")
+        if tid:
+            self.retrieval_meta_by_thread[tid] = meta
+            while len(self.retrieval_meta_by_thread) > 200:
+                self.retrieval_meta_by_thread.pop(next(iter(self.retrieval_meta_by_thread)))
+
+    async def _vector_status(self, repo_id: str) -> str:
+        try:
+            if self.jobs is not None and self.jobs.status(repo_id) in ("queued", "running"):
+                return self.jobs.status(repo_id)
+            if self.vector_status_fn is not None:
+                return str(await self.vector_status_fn(repo_id) or "none")
+            getter = getattr(self.db_manager, "get_vector_status", None)
+            if getter is not None:
+                return str(await getter(repo_id) or "none")
+        except Exception:  # noqa: BLE001 - unknown status = no vectors
+            pass
+        return "none"
+
+    async def _agentic_corpus(self, repo_id: str) -> RepoCorpus:
+        """Corpus of the raw snapshot (rev 0 = disk as last seen). Cached per repo, keyed by the files' content hashes."""
+        store = self.repo_store
+        key = None
+        try:
+            idx = await store.index(repo_id, 0)
+            key = hashlib.sha1("\n".join(f"{p}:{h}" for p, h in sorted(idx.items())).encode("utf-8")).hexdigest()
+        except Exception:  # noqa: BLE001 - no index(): fall back to rebuilding every time
+            idx = None
+        cached = self._corpus_cache.get(repo_id)
+        if key is not None and cached and cached[0] == key:
+            return cached[1]
+        snap = await store.snapshot_bytes(repo_id, 0)
+        corpus = await asyncio.to_thread(RepoCorpus.from_mapping, snap)
+        if key is None:
+            key = hashlib.sha1("\n".join(sorted(corpus.paths())).encode("utf-8")).hexdigest() + f":{len(corpus)}"
+        self._corpus_cache[repo_id] = (key, corpus)
+        return corpus
+
+    @staticmethod
+    def _format_agentic(blocks, budget: int) -> str:
+        out, used = [], 0
+        for b in blocks:
+            piece = f"--- [AGENTIC_MATCH] File: {b.path} (lines {b.start}-{b.end}; {b.why}) ---\n{b.text}"
+            if used + len(piece) > budget:
+                piece = piece[: max(0, budget - used)]
+                if len(piece) > 200:
+                    out.append(piece)
+                break
+            out.append(piece)
+            used += len(piece) + 2
+        return "\n\n".join(out)
+
+    async def _retrieve_unnamed(self, state: AgentState, repo_id: str, question: str, all_paths: list) -> dict:
+        """Retrieval switch (docs/DESIGN_v2.md section 5). Vector path when no raw store or vectors are ready; else agentic."""
+        mode = str(getattr(settings, "retrieval_mode", "agentic") or "agentic").lower()
+        status = await self._vector_status(repo_id)
+        if status in ("none", "") and all_paths:
+            status = "ready"                        # legacy repo: chunks were embedded before vector_status existed
+        meta = {"mode": "vector", "confidence": 1.0, "reasons": [], "job_id": None, "vector_status": status}
+
+        corpus = None
+        if self.repo_store is not None:
+            try:
+                corpus = await self._agentic_corpus(repo_id)
+            except Exception as e:  # noqa: BLE001 - raw store unreadable: old path
+                meta["reasons"].append(f"raw store unavailable ({type(e).__name__}); used vector search")
+            if corpus is not None and len(corpus) == 0:
+                corpus = None
+        vectors_ready = status == "ready"
+
+        if corpus is None or (vectors_ready and mode == "vector"):
+            ctx = await self._vector_context(repo_id, question)
+            self._remember_meta(state, meta)
+            return {"context_str": ctx, "retrieval_meta": meta}
+
+        search = AgenticSearch(corpus)
+        result = await asyncio.to_thread(search.retrieve, question)
+        agentic_ctx = self._format_agentic(result.blocks, MAX_FILE_CHARS)
+        meta.update(mode="agentic", confidence=result.confidence, reasons=list(result.reasons))
+
+        if vectors_ready:                           # agentic blocks + semantic hits (mode "agentic" upgrades to hybrid once ready)
+            meta["mode"] = "hybrid"
+            vec_ctx = await self._vector_context(repo_id, question)
+            parts = [c for c in (agentic_ctx, "" if vec_ctx.startswith("No relevant code chunks") else vec_ctx) if c]
+            context = "\n\n".join(parts)
+        else:
+            context = agentic_ctx
+            threshold = float(getattr(settings, "vectorize_confidence_threshold", 0.45))
+            need, why = needs_vectors(result, threshold)
+            if need:
+                meta["reasons"] = [why]
+                fallback = str(getattr(settings, "vectorize_fallback", "auto") or "auto").lower()
+                cooling = status == "failed" and time.monotonic() < self._retry_after.get(repo_id, 0.0)
+                if fallback == "auto" and self.jobs is not None and status in ("none", "failed") and not cooling:
+                    try:
+                        job = await self.jobs.enqueue(repo_id, why)
+                        meta["job_id"] = job.job_id
+                        self._retry_after[repo_id] = time.monotonic() + 600.0
+                    except Exception as e:  # noqa: BLE001 - never fail the chat because a background job could not start
+                        meta["reasons"].append(f"could not start background vectorize: {type(e).__name__}: {e}")
+                elif status in ("queued", "running"):
+                    try:
+                        latest = await self.jobs.store.latest(repo_id, "vectorize") if self.jobs is not None else None
+                        meta["job_id"] = latest.job_id if latest else None
+                    except Exception:  # noqa: BLE001
+                        pass
+            if not context:
+                context = "No relevant code found by agentic search."
+        log_action("RETRIEVE", "RAGGraph", "retrieval switch", status="info",
+                   detail=f"mode={meta['mode']} confidence={meta['confidence']:.2f} vectors={status}",
+                   data={k: meta[k] for k in ("mode", "confidence", "job_id", "vector_status")})
+        self._remember_meta(state, meta)
+        return {"context_str": context, "retrieval_meta": meta}
+
+    async def _vector_context(self, repo_id: str, question: str) -> str:
         # 1. Primary semantic search in ChromaDB
-        primary_docs = self.vector_service.similarity_search(repo_id, str(last_user_msg), k=4)
+        primary_docs = self.vector_service.similarity_search(repo_id, question, k=4)
         
         # 2. Collect adjacent chunk IDs (prev_chunk_id / next_chunk_id) to place related chunks together
         neighbor_ids = set()
@@ -151,7 +305,7 @@ class RAGWorkflowManager:
             formatted_blocks.append(f"{header}\n{item['content']}")
             
         context_str = "\n\n".join(formatted_blocks) if formatted_blocks else "No relevant code chunks found."
-        return {"context_str": context_str}
+        return context_str
 
     def _system_prompt(self, state: AgentState) -> str:
         repo_id = state.get("repo_id", "unknown_repo")
@@ -242,7 +396,7 @@ class RAGWorkflowManager:
         think = reasoning_arg(settings.ask_reasoning)
         llm = ChatOllama(
             model=model,
-            base_url=settings.ollama_base_url,
+            base_url=chat_base_url(),
             temperature=0.1,
             num_ctx=settings.change_num_ctx,
             callbacks=[callback],
@@ -285,6 +439,8 @@ class RAGWorkflowManager:
                     {"messages": [HumanMessage(content=user_input)], "repo_id": repo_id, "thread_id": thread_id, "web_mode": web},
                     config=config
                 )
+                if result.get("retrieval_meta"):
+                    self.retrieval_meta_by_thread[thread_id] = result["retrieval_meta"]    # also readable via last_retrieval_meta()
                 return result["messages"][-1].content + (result.get("web_footer") or "")
             except asyncio.CancelledError:
                 raise

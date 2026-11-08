@@ -20,4 +20,11 @@ os.environ["ENGINE_CHANGE_REPAIR_ATTEMPTS"] = "0"         # ... and expect every
 os.environ["ENGINE_CHANGE_DIAGNOSE"] = "false"            # ... and no extra diagnosis model call
 os.environ["ENGINE_CHANGE_GAP_DECIDE"] = "false"          # ... and no targeted gap check
 os.environ["ENGINE_SANDBOX_ENABLED"] = "false"      # Phase 1 tests do not touch Docker; Phase 2 tests opt in explicitly
+# ---- v2 defaults: legacy tests stay on the legacy (vector) path; v2 tests opt in with monkeypatch.setattr(settings, ...)
+os.environ["ENGINE_REASONING_SUPERVISOR"] = "false"    # no intake/cross-check wrapper (and no delivery notes) around scripted answers
+os.environ["ENGINE_ACTION_LOG_ENABLED"] = "true"       # logging itself is harmless; the ring buffer is what v2 tests read
+os.environ["ENGINE_RETRIEVAL_MODE"] = "vector"         # legacy retrieval: vector search over code_chunks, no agentic switch
+os.environ["ENGINE_INGEST_MODE"] = "vector"            # ingest_repository embeds before returning, as it always did
+os.environ["ENGINE_VECTORIZE_FALLBACK"] = "off"        # never enqueue background jobs behind a legacy test's back
+os.environ["ENGINE_WATCH_ON_INGEST"] = "false"         # no file-system observers started by ingest_repository in tests
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))

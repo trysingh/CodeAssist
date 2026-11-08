@@ -1,0 +1,9 @@
+REQUEST (base revision 0):
+share the complete steps. I believe I can use the unfreeze command to first open the gate and then make desired changes to the file and then freeze it again
+
+ekit baseline unfreeze --reason "Let feature routers own session establishment on GET /"
+# edit src/app/web/pages.py / registry wiring: add the feature hook
+ekit baseline accept --reason "Feature hook for GET / session establishment, 001-session-identity-username"
+ekit gate baseline
+
+SETTINGS: max_attempts=3 repair_attempts=3 partial_apply=True diagnose=True gap_decide=True patcher=gemma4:31b-cloud escalation=-

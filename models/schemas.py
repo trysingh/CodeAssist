@@ -51,6 +51,10 @@ class TelemetryEvent(BaseModel):
     level: str = "INFO"
     title: str
     message: str
+    kind: str = "log"                # log | action | telemetry | job
+    request_id: Optional[str] = None
+    thread_id: Optional[str] = None
+    data: Optional[dict] = None
 
 
 class ChatRequest(BaseModel):

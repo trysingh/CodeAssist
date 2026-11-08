@@ -15,6 +15,7 @@ from models.schemas import ChatRequest
 from config.settings import settings
 from services.notifier import notifier
 from services.model_calls import list_chat_models
+from services import action_log
 
 
 
@@ -33,10 +34,24 @@ class ChangeRequest(BaseModel):
     base_rev: int | None = None
     model: str = ""
 
+_sink_registered = False
+
+def register_action_sink() -> None:
+    """Forward every ActionEvent to the notifier (SSE + telemetry table). Once per process, gated by settings.action_log_enabled."""
+    global _sink_registered
+    if settings.action_log_enabled and not _sink_registered:
+        action_log.add_sink(action_log.make_notifier_sink(notifier.notify))
+        _sink_registered = True
+
 @app.on_event("startup")
 async def startup_event():
     await controller.db.init_db()
     notifier.bind(controller.db)        # persist notifications + thread-safe SSE fan-out (needs the running loop)
+    register_action_sink()
+    try:
+        await controller.reconcile_jobs()   # no vectorize job survives a restart: close stale rows, fix vector_status
+    except Exception as exc:                # noqa: BLE001 - never block startup on bookkeeping
+        print(f"[startup] job reconcile failed: {type(exc).__name__}: {exc}", flush=True)
     # Sandbox images are built in the background (docker build runs in a worker thread); start() returns at
     # once. Started BEFORE restore_all_watchers(): that call waits up to 5 s for console input and then
     # re-syncs offline changes, and the build can run meanwhile.
@@ -72,14 +87,72 @@ async def serve_static(file_type: str, file_name: str):
     media_type = "text/css" if file_type == "css" else "application/javascript"
     return FileResponse(path=str(file_path), media_type=media_type)
 
+async def _run_ingest(repo_root: str) -> None:
+    try:
+        await controller.ingest_repository(repo_root)
+    except Exception as exc:     # noqa: BLE001 - a background task has nobody to raise to: tell the user
+        notifier.notify("Ingestion failed", f"{repo_root}: {type(exc).__name__}: {exc}", level="ERROR")
+
 @app.post("/api/v1/ingest")
 async def trigger_ingest(repo_root: str, background_tasks: BackgroundTasks):
-    background_tasks.add_task(controller.ingest_repository, repo_root)
-    return {"message": "Ingestion job queued in background", "repo_root": repo_root}
+    """Fast agentic ingest in the background (searchable in seconds); watch the notification stream for 'Repo ready'."""
+    repo_id = controller.compute_repo_id(Path(repo_root))     # the same id the controller derives
+    background_tasks.add_task(_run_ingest, repo_root)
+    return {"message": "Ingestion job queued in background", "repo_root": repo_root, "repo_id": repo_id}
 
 @app.get("/api/v1/repos")
 async def list_repos():
-    return await controller.list_ingested_repos()
+    """RepoInfo fields plus vector_status (none|queued|running|ready|failed) and ingest_mode (agentic|vector)."""
+    return await controller.list_repos_enriched()
+
+class VectorizeRequest(BaseModel):
+    reason: str = ""
+
+@app.post("/api/v1/repos/{repo_id}/vectorize")
+async def vectorize_repo(repo_id: str, req: Optional[VectorizeRequest] = None):
+    """Enqueue (deduplicated) the background vector-index job for a repo. Returns the Job."""
+    try:
+        job = await controller.start_vectorize(repo_id, (req.reason if req else "") or "requested by user")
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    return job.to_dict()
+
+@app.get("/api/v1/repos/{repo_id}/search-mode")
+async def repo_search_mode(repo_id: str):
+    try:
+        return await controller.search_mode(repo_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+@app.get("/api/v1/jobs")
+async def list_jobs(repo_id: Optional[str] = None, limit: int = 50):
+    await controller.db.init_db()
+    jobs = await controller.db.list_jobs(repo_id, max(1, min(int(limit), 500)))
+    out = []
+    for j in jobs:                                   # a running job's live progress is fresher than its throttled DB row
+        live = controller.jobs.get_live(j["job_id"])
+        out.append(live.to_dict() if live is not None else j)
+    return {"jobs": out}
+
+@app.get("/api/v1/jobs/{job_id}")
+async def get_job(job_id: str):
+    await controller.db.init_db()
+    live = controller.jobs.get_live(job_id)
+    job = live.to_dict() if live is not None else await controller.db.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return job
+
+@app.get("/api/v1/actions")
+async def list_actions(request_id: Optional[str] = None, repo_id: Optional[str] = None, limit: int = 500):
+    """Activity events (ActionEvent dicts, oldest first). In-memory ring buffer first; after a restart, the stored telemetry rows."""
+    limit = max(1, min(int(limit), 5000))
+    events = action_log.recent(request_id=request_id, repo_id=repo_id, limit=limit)
+    if not events and request_id:
+        await controller.db.init_db()
+        rows = await controller.db.get_telemetry_by_request(request_id, limit)
+        events = action_log.events_from_telemetry_rows(rows, repo_id)
+    return {"events": events}
 
 @app.get("/api/v1/repos/{repo_id}/threads")
 async def list_repo_threads(repo_id: str):
@@ -108,12 +181,15 @@ async def chat_endpoint(req: ChatRequest):
         await controller.db.init_db()
         await controller.db.create_thread(req.thread_id, req.repo_id, req.thread_id)
         await controller.db.save_chat_message(req.thread_id, "user", req.query)
+        request_id = uuid.uuid4().hex[:12]      # groups this turn's Activity events; returned so the UI can open "Show steps"
         try:
-            response = await controller.chat_with_repo(req.repo_id, req.thread_id, req.query, web=req.web, model=req.model)
+            response = await controller.chat_with_repo(req.repo_id, req.thread_id, req.query, web=req.web, model=req.model,
+                                                       request_id=request_id)
         except asyncio.CancelledError:
             return JSONResponse(
                 status_code=499,
                 content={
+                    "request_id": request_id,
                     "repo_id": req.repo_id,
                     "thread_id": req.thread_id,
                     "answer": "[Request stopped by user]",
@@ -121,7 +197,8 @@ async def chat_endpoint(req: ChatRequest):
                 }
             )
         await controller.db.save_chat_message(req.thread_id, "assistant", response)
-        return {"repo_id": req.repo_id, "thread_id": req.thread_id, "base_system": platform.system(), "answer": response}
+        return {"request_id": request_id, "repo_id": req.repo_id, "thread_id": req.thread_id,
+                "base_system": platform.system(), "answer": response}
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
@@ -158,12 +235,15 @@ async def chat_with_attachments(
     msg_id = await controller.db.save_chat_message(thread_id, "user", query)
     saved = await controller.store_attachments(thread_id, msg_id, prepared)
 
+    request_id = uuid.uuid4().hex[:12]
     try:
-        response = await controller.chat_with_repo(repo_id, thread_id, query, web=web, attachments=prepared, model=model)
+        response = await controller.chat_with_repo(repo_id, thread_id, query, web=web, attachments=prepared, model=model,
+                                                   request_id=request_id)
     except asyncio.CancelledError:
         return JSONResponse(
             status_code=499,
             content={
+                "request_id": request_id,
                 "repo_id": repo_id,
                 "thread_id": thread_id,
                 "answer": "[Request stopped by user]",
@@ -172,16 +252,18 @@ async def chat_with_attachments(
             }
         )
     await controller.db.save_chat_message(thread_id, "assistant", response)
-    return {"repo_id": repo_id, "thread_id": thread_id, "answer": response, "attachments": saved}
+    return {"request_id": request_id, "repo_id": repo_id, "thread_id": thread_id, "answer": response, "attachments": saved}
 
 @app.post("/api/v1/repos/{repo_id}/changes")
 async def propose_change(repo_id: str, req: ChangeRequest):
     """Skips the ask/change router: always runs the change agents. Returns a proposal; writes nothing to disk."""
+    request_id = uuid.uuid4().hex[:12]
     try:
-        res = await controller.propose_change(repo_id, req.request, req.base_rev, model=req.model)
+        with action_log.request_scope(request_id, None, repo_id=repo_id):
+            res = await controller.propose_change(repo_id, req.request, req.base_rev, model=req.model)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
-    return {**res.__dict__, "markdown": res.to_markdown()}
+    return {**res.__dict__, "markdown": res.to_markdown(), "request_id": request_id}
 
 @app.get("/api/v1/repos/{repo_id}/revisions")
 async def list_revisions(repo_id: str):

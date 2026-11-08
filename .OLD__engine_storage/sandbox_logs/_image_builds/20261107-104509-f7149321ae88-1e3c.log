@@ -1,0 +1,70 @@
+#0 building with "desktop-linux" instance using docker driver
+
+#1 [internal] load build definition from Dockerfile
+#1 transferring dockerfile: 288B 0.0s done
+#1 DONE 0.1s
+
+#2 [internal] load metadata for docker.io/library/python:3.12-slim
+#2 DONE 0.1s
+
+#3 [internal] load .dockerignore
+#3 transferring context: 2B done
+#3 DONE 0.1s
+
+#4 [1/5] FROM docker.io/library/python:3.12-slim@sha256:aa943ce411423c7582288f18707ff66eddcbaeb510502d747a72aeb34f30d159
+#4 resolve docker.io/library/python:3.12-slim@sha256:aa943ce411423c7582288f18707ff66eddcbaeb510502d747a72aeb34f30d159 0.0s done
+#4 DONE 0.0s
+
+#5 [internal] load build context
+#5 transferring context: 494B done
+#5 DONE 0.1s
+
+#6 [2/5] COPY sbx-entry /usr/local/bin/sbx-entry
+#6 CACHED
+
+#7 [3/5] RUN chmod 0755 /usr/local/bin/sbx-entry
+#7 CACHED
+
+#8 [4/5] COPY requirements.txt /tmp/requirements.txt
+#8 DONE 0.2s
+
+#9 [5/5] RUN pip install --no-cache-dir pytest -r /tmp/requirements.txt
+#9 2.517 Collecting pytest
+#9 2.592   Downloading pytest-9.2.0-py3-none-any.whl.metadata (7.9 kB)
+#9 2.615 Collecting iniconfig>=2 (from pytest)
+#9 2.628   Downloading iniconfig-2.3.1-py3-none-any.whl.metadata (2.8 kB)
+#9 2.657 Collecting packaging>=24 (from pytest)
+#9 2.669   Downloading packaging-26.3-py3-none-any.whl.metadata (3.5 kB)
+#9 2.692 Collecting pluggy<2,>=1.6 (from pytest)
+#9 2.704   Downloading pluggy-1.7.0-py3-none-any.whl.metadata (5.0 kB)
+#9 2.738 Collecting pygments>=2.15 (from pytest)
+#9 2.749   Downloading pygments-2.21.0-py3-none-any.whl.metadata (2.5 kB)
+#9 2.763 Downloading pytest-9.2.0-py3-none-any.whl (411 kB)
+#9 2.847 Downloading iniconfig-2.3.1-py3-none-any.whl (7.6 kB)
+#9 2.860 Downloading packaging-26.3-py3-none-any.whl (129 kB)
+#9 2.891 Downloading pluggy-1.7.0-py3-none-any.whl (27 kB)
+#9 2.906 Downloading pygments-2.21.0-py3-none-any.whl (1.3 MB)
+#9 3.078    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1.3/1.3 MB 7.8 MB/s eta 0:00:00
+#9 3.109 Installing collected packages: pygments, pluggy, packaging, iniconfig, pytest
+#9 4.431 Successfully installed iniconfig-2.3.1 packaging-26.3 pluggy-1.7.0 pygments-2.21.0 pytest-9.2.0
+#9 4.432 WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager, possibly rendering your system unusable. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv. Use the --root-user-action option if you know what you are doing and want to suppress this warning.
+#9 4.538 
+#9 4.538 [notice] A new release of pip is available: 25.0.1 -> 26.3
+#9 4.538 [notice] To update, run: pip install --upgrade pip
+#9 DONE 4.8s
+
+#10 exporting to image
+#10 exporting layers
+#10 exporting layers 1.7s done
+#10 exporting manifest sha256:8e9dedb4c8c71e4dcbe2aab9d31acb9a9e2910a7d00a2cec532d3fb88a5f0e2b
+#10 exporting manifest sha256:8e9dedb4c8c71e4dcbe2aab9d31acb9a9e2910a7d00a2cec532d3fb88a5f0e2b 0.0s done
+#10 exporting config sha256:13cc4b6bf37fa20b6f4a058614c719f3e3bb8026f43422f17da01bdc1539c8a3 0.0s done
+#10 exporting attestation manifest sha256:f6d4c12542ae3c7fa640f9477733339ed1a89c059a4dece4db8ea8b479539366 0.1s done
+#10 exporting manifest list sha256:cda28097be05ae57c302628f34fe55a60565b4bc22f6642f2e4606cd417f86c6
+#10 exporting manifest list sha256:cda28097be05ae57c302628f34fe55a60565b4bc22f6642f2e4606cd417f86c6 0.0s done
+#10 naming to docker.io/library/coderag-sbx:f7149321ae88 done
+#10 unpacking to docker.io/library/coderag-sbx:f7149321ae88
+#10 unpacking to docker.io/library/coderag-sbx:f7149321ae88 1.2s done
+#10 DONE 3.3s
+
+View build details: docker-desktop://dashboard/build/desktop-linux/desktop-linux/ft2u5hmttkdbbq3b2ockq418n

@@ -1,0 +1,77 @@
+FFF...................................................F.....             [100%]
+=================================== FAILURES ===================================
+______________ test_serve_dashboard_context_contains_base_system _______________
+tests/test_change_r1_api_view.py:27: in test_serve_dashboard_context_contains_base_system
+    assert args[0] == "index.html"
+E   AssertionError: assert <MagicMock spec='Request' id='140436284624528'> == 'index.html'
+__________________ test_serve_dashboard_request_still_passed ___________________
+tests/test_change_r1_api_view.py:47: in test_serve_dashboard_request_still_passed
+    assert context["request"] == mock_request
+           ^^^^^^^^^^^^^^^^^^
+E   TypeError: string indices must be integers, not 'str'
+____________________ test_serve_dashboard_platform_dynamic _____________________
+tests/test_change_r1_api_view.py:59: in test_serve_dashboard_platform_dynamic
+    assert context["base_system"] == "MockOS"
+           ^^^^^^^^^^^^^^^^^^^^^^
+E   TypeError: string indices must be integers, not 'str'
+_________ test_js_syntax_errors_are_reported_and_modern_syntax_is_not __________
+tests/test_verdicts_and_web_checks.py:137: in test_js_syntax_errors_are_reported_and_modern_syntax_is_not
+    assert [r.check for r in bad] == ["js-syntax"] and not bad[0].ok and bad[0].line and "foo(" in bad[0].message
+E   AssertionError: assert (['js-syntax'] == ['js-syntax']
+E     
+E     Use -v to get more diff and not True)
+E    +  where True = CheckResult(path='static/app.js', check='js-syntax', ok=True, message='parser unavailable (DownloadError)', line=None, skipped=True).ok
+=============================== warnings summary ===============================
+views/api_view.py:36
+  /work/views/api_view.py:36: DeprecationWarning: 
+          on_event is deprecated, use lifespan event handlers instead.
+  
+          Read more about it in the
+          [FastAPI docs for Lifespan Events](https://fastapi.tiangolo.com/advanced/events/).
+          
+    @app.on_event("startup")
+
+../usr/local/lib/python3.12/site-packages/fastapi/applications.py:4723
+../usr/local/lib/python3.12/site-packages/fastapi/applications.py:4723
+  /usr/local/lib/python3.12/site-packages/fastapi/applications.py:4723: DeprecationWarning: 
+          on_event is deprecated, use lifespan event handlers instead.
+  
+          Read more about it in the
+          [FastAPI docs for Lifespan Events](https://fastapi.tiangolo.com/advanced/events/).
+          
+    return self.router.on_event(event_type)  # ty: ignore[deprecated]
+
+views/api_view.py:49
+  /work/views/api_view.py:49: DeprecationWarning: 
+          on_event is deprecated, use lifespan event handlers instead.
+  
+          Read more about it in the
+          [FastAPI docs for Lifespan Events](https://fastapi.tiangolo.com/advanced/events/).
+          
+    @app.on_event("shutdown")
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/test_change_r1_api_view.py::test_serve_dashboard_context_contains_base_system
+FAILED tests/test_change_r1_api_view.py::test_serve_dashboard_request_still_passed
+FAILED tests/test_change_r1_api_view.py::test_serve_dashboard_platform_dynamic
+FAILED tests/test_verdicts_and_web_checks.py::test_js_syntax_errors_are_reported_and_modern_syntax_is_not
+4 failed, 56 passed, 4 warnings in 33.57s
+
+::SBX-EXIT:: 1
+::SBX-JUNIT-BEGIN::
+<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="0" failures="4" skipped="0" tests="60" time="33.583" timestamp="2026-11-07T05:43:24.727126+00:00" hostname="0aabf85ad1ea"><testcase classname="tests.test_change_r1_api_view" name="test_serve_dashboard_context_contains_base_system" time="0.005"><failure message="AssertionError: assert &lt;MagicMock spec='Request' id='140436284624528'&gt; == 'index.html'">tests/test_change_r1_api_view.py:27: in test_serve_dashboard_context_contains_base_system
+    assert args[0] == "index.html"
+E   AssertionError: assert &lt;MagicMock spec='Request' id='140436284624528'&gt; == 'index.html'</failure></testcase><testcase classname="tests.test_change_r1_api_view" name="test_serve_dashboard_request_still_passed" time="0.003"><failure message="TypeError: string indices must be integers, not 'str'">tests/test_change_r1_api_view.py:47: in test_serve_dashboard_request_still_passed
+    assert context["request"] == mock_request
+           ^^^^^^^^^^^^^^^^^^
+E   TypeError: string indices must be integers, not 'str'</failure></testcase><testcase classname="tests.test_change_r1_api_view" name="test_serve_dashboard_platform_dynamic" time="0.002"><failure message="TypeError: string indices must be integers, not 'str'">tests/test_change_r1_api_view.py:59: in test_serve_dashboard_platform_dynamic
+    assert context["base_system"] == "MockOS"
+           ^^^^^^^^^^^^^^^^^^^^^^
+E   TypeError: string indices must be integers, not 'str'</failure></testcase><testcase classname="tests.test_phase1" name="test_parse_and_apply_exact" time="0.000" /><testcase classname="tests.test_phase1" name="test_crlf_preserved" time="0.000" /><testcase classname="tests.test_phase1" name="test_substring_is_not_a_match" time="0.000" /><testcase classname="tests.test_phase1" name="test_ambiguous_search_rejected_and_file_untouched" time="0.000" /><testcase classname="tests.test_phase1" name="test_indent_insensitive_match_reindents" time="0.001" /><testcase classname="tests.test_phase1" name="test_failed_block_means_no_partial_file" time="0.001" /><testcase classname="tests.test_phase1" name="test_new_file_and_existing_file_guard" time="0.001" /><testcase classname="tests.test_phase1" name="test_path_resolution_basename_and_unknown" time="0.001" /><testcase classname="tests.test_phase1" name="test_windows_separators_are_normalised" time="0.001" /><testcase classname="tests.test_phase1" name="test_unsafe_and_secret_paths" time="0.001" /><testcase classname="tests.test_phase1" name="test_diff_stats" time="0.000" /><testcase classname="tests.test_phase1" name="test_static_checks" time="0.003" /><testcase classname="tests.test_phase1" name="test_preexisting_failures_ignored" time="0.001" /><testcase classname="tests.test_phase1" name="test_store_base_and_revisions_and_revert" time="0.056" /><testcase classname="tests.test_phase1" name="test_materialize_and_prune" time="0.017" /><testcase classname="tests.test_phase1" name="test_rules_router" time="0.000" /><testcase classname="tests.test_phase1" name="test_router_prefix_model_and_fallback" time="0.001" /><testcase classname="tests.test_phase1" name="test_change_happy_path_creates_revision_not_disk_write" time="0.088" /><testcase classname="tests.test_phase1" name="test_change_retries_after_bad_search_then_succeeds" time="0.089" /><testcase classname="tests.test_phase1" name="test_change_retries_after_syntax_error_and_keeps_applied_state" time="0.095" /><testcase classname="tests.test_phase1" name="test_change_fails_cleanly_after_max_attempts_and_saves_nothing" time="0.079" /><testcase classname="tests.test_phase1" name="test_change_cannot_complete_and_no_files_and_new_file" time="0.208" /><testcase classname="tests.test_phase1" name="test_followup_builds_on_latest_revision_and_stale_base_rejected" time="0.121" /><testcase classname="tests.test_phase1" name="test_preexisting_problem_in_edited_file_does_not_block_unrelated_edit" time="0.177" /><testcase classname="tests.test_phase1" name="test_incomplete_raw_store_gives_actionable_error_and_trace" time="0.059" /><testcase classname="tests.test_phase1" name="test_file_tree_pick_rescues_vague_request" time="0.081" /><testcase classname="tests.test_phase1" name="test_help_and_ask_guard" time="0.001" /><testcase classname="tests.test_release_gate" name="test_find_entries_finds_app_and_factory_and_skips_tests" time="0.001" /><testcase classname="tests.test_release_gate" name="test_boot_script_runs_without_unix_signals" time="0.003" /><testcase classname="tests.test_release_gate" name="test_gate_matrix" time="0.000" /><testcase classname="tests.test_release_gate" name="test_boot_check_catches_what_import_smoke_cannot[services/items.py-def load_items():\n    return [{'name': 'a', 'qty': 2}]\n-cannot import name 'load']" time="1.670" /><testcase classname="tests.test_release_gate" name="test_boot_check_catches_what_import_smoke_cannot[controllers/home.py-broken1-'user' is undefined]" time="2.908" /><testcase classname="tests.test_release_gate" name="test_boot_check_catches_what_import_smoke_cannot[main.py-broken2-NEEDED_KEY]" time="2.864" /><testcase classname="tests.test_release_gate" name="test_boot_check_catches_what_import_smoke_cannot[templates/index.html-&lt;h1&gt;{{ user.name|currency }}&lt;/h1&gt;\n-No filter named 'currency']" time="1.672" /><testcase classname="tests.test_release_gate" name="test_template_only_change_gets_a_boot_verdict_and_its_own_level" time="0.536" /><testcase classname="tests.test_release_gate" name="test_failures_that_already_exist_on_the_base_are_not_blamed_on_the_change" time="1.074" /><testcase classname="tests.test_release_gate" name="test_an_app_that_cannot_boot_even_before_the_change_is_not_called_verified" time="0.108" /><testcase classname="tests.test_release_gate" name="test_pipeline_holds_back_a_change_that_has_no_proving_test[strict-False]" time="0.773" /><testcase classname="tests.test_release_gate" name="test_pipeline_holds_back_a_change_that_has_no_proving_test[smoke-True]" time="0.885" /><testcase classname="tests.test_release_gate" name="test_pipeline_holds_back_a_change_that_has_no_proving_test[off-True]" time="0.844" /><testcase classname="tests.test_release_gate" name="test_pipeline_holds_back_when_the_sandbox_cannot_run" time="0.168" /><testcase classname="tests.test_release_gate" name="test_pipeline_repairs_a_template_crash_from_the_real_traceback" time="2.902" /><testcase classname="tests.test_release_gate" name="test_pipeline_gives_up_without_sharing_when_the_app_stays_broken" time="3.339" /><testcase classname="tests.test_verdicts_and_web_checks" name="test_failures_that_only_exist_on_unapplied_revisions_are_not_excused_by_default" time="1.398" /><testcase classname="tests.test_verdicts_and_web_checks" name="test_the_old_rule_is_one_setting_away" time="1.565" /><testcase classname="tests.test_verdicts_and_web_checks" name="test_a_failure_that_also_exists_on_disk_is_still_excused" time="1.471" /><testcase classname="tests.test_verdicts_and_web_checks" name="test_the_baseline_is_not_reused_between_a_disk_and_a_base_comparison" time="2.962" /><testcase classname="tests.test_verdicts_and_web_checks" name="test_the_unapplied_stack_is_announced" time="1.423" /><testcase classname="tests.test_verdicts_and_web_checks" name="test_markdown_tells_the_user_the_result_holds_for_the_stack" time="0.001" /><testcase classname="tests.test_verdicts_and_web_checks" name="test_every_not_run_path_carries_a_known_code" time="0.012" /><testcase classname="tests.test_verdicts_and_web_checks" name="test_unverified_picks_the_code_from_what_happened" time="0.001" /><testcase classname="tests.test_verdicts_and_web_checks" name="test_js_syntax_errors_are_reported_and_modern_syntax_is_not" time="0.001"><failure message="AssertionError: assert (['js-syntax'] == ['js-syntax']&#10;  &#10;  Use -v to get more diff and not True)&#10; +  where True = CheckResult(path='static/app.js', check='js-syntax', ok=True, message='parser unavailable (DownloadError)', line=None, skipped=True).ok">tests/test_verdicts_and_web_checks.py:137: in test_js_syntax_errors_are_reported_and_modern_syntax_is_not
+    assert [r.check for r in bad] == ["js-syntax"] and not bad[0].ok and bad[0].line and "foo(" in bad[0].message
+E   AssertionError: assert (['js-syntax'] == ['js-syntax']
+E     
+E     Use -v to get more diff and not True)
+E    +  where True = CheckResult(path='static/app.js', check='js-syntax', ok=True, message='parser unavailable (DownloadError)', line=None, skipped=True).ok</failure></testcase><testcase classname="tests.test_verdicts_and_web_checks" name="test_js_check_is_skipped_not_passed_when_the_parser_is_missing" time="0.001" /><testcase classname="tests.test_verdicts_and_web_checks" name="test_a_js_error_that_was_already_there_is_not_blamed_on_the_change" time="0.003" /><testcase classname="tests.test_verdicts_and_web_checks" name="test_template_references_must_exist" time="0.002" /><testcase classname="tests.test_verdicts_and_web_checks" name="test_dynamic_template_names_and_missing_context_are_not_judged" time="0.001" /><testcase classname="tests.test_verdicts_and_web_checks" name="test_a_missing_template_that_the_base_file_already_referenced_is_not_new" time="0.001" /></testsuite></testsuites>
+::SBX-JUNIT-END::

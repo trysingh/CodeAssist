@@ -155,6 +155,16 @@ class EngineSettings(BaseSettings):
     sandbox_build_run: List[str] = Field(default=[])      # extra `RUN <cmd>` lines in the image build (the only step with network),
                                                           # e.g. ["python -m nltk.downloader punkt"]; tiktoken's vocabulary is fetched automatically
 
+    # ---- v2: agentic retrieval, background vectorize, reasoning supervisor, activity log (docs/DESIGN_v2.md section 6) ----
+    ingest_mode: str = Field(default="agentic")        # agentic = raw snapshot + file/symbol search, NO embeddings (fast); vector = also enqueue a vectorize job right after ingest
+    retrieval_mode: str = Field(default="agentic")     # agentic | vector | hybrid. agentic upgrades to hybrid by itself once a repo's vectors are ready; vector = legacy path
+    vectorize_fallback: str = Field(default="auto")    # auto = a weak agentic result enqueues a background vectorize job; off = never
+    vectorize_confidence_threshold: float = Field(default=0.45)   # agentic confidence below this counts as "weak"
+    reasoning_supervisor: bool = Field(default=True)   # intake -> baseline policy -> execute -> cross-check -> delivery notes around every chat turn
+    reasoning_intake_llm: bool = Field(default=False)  # let the chat model refine the intake brief (one extra small call); heuristics always run
+    watch_on_ingest: bool = Field(default=True)        # start the file watcher for a repo right after it is ingested (False = only at app start)
+    action_log_enabled: bool = Field(default=True)     # forward every agent/tool/LLM step to the Activity timeline (SSE + telemetry table)
+
     # Notifiations Configuration
     notify_at_os_level: bool = Field(default=False)
 

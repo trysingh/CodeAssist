@@ -89,6 +89,15 @@ class StdoutTelemetryCallback(BaseCallbackHandler):
         sys.stdout.write(trace_line + "\n")
         sys.stdout.flush()
         
+        try:       # one LLM action event per call (soft-fail)
+            from services.action_log import log_action
+            log_action(phase="LLM", agent=str(self.phase), action="llm_call", status="ok",
+                       detail=f"{self.model_name}: {input_tokens} in / {output_tokens} out",
+                       data={"input_tokens": input_tokens, "output_tokens": output_tokens, "total_tokens": total_tokens},
+                       model=self.model_name, duration_ms=int(elapsed * 1000), repo_id=self.repo_id or None)
+        except Exception:
+            pass
+
         if self.emitter:
             try:
                 self.emitter(json.dumps(telemetry_data))

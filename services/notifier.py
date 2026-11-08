@@ -102,19 +102,31 @@ class NotificationDispatcher:
                 pass
         return _current_repo.get()
 
-    def notify(self, title: str, message: str, level: str = "INFO", repo_id: Optional[str] = None):
+    def notify(self, title: str, message: str, level: str = "INFO", repo_id: Optional[str] = None, *,
+               kind: str = "log", request_id: Optional[str] = None, thread_id: Optional[str] = None,
+               data: Optional[dict] = None):
         # Handle cases where message might be passed as a dictionary (e.g. Telemetry payload)
         if isinstance(message, dict):
             message = json.dumps(message)
 
+        if request_id is None or thread_id is None:      # default from the action_log ContextVars
+            try:
+                from services import action_log as _al
+                request_id = request_id if request_id is not None else _al.current_request_id()
+                thread_id = thread_id if thread_id is not None else _al.current_thread_id()
+            except Exception:
+                pass
+        is_action = kind == "action"       # action events are high-volume: SSE/DB only, no stdout / OS popup
+
         # 1. Logs / Stdout
         timestamp_log = f"\n[NOTIFICATION [{level}]] {title} — {message}\n"
-        sys.stdout.write(timestamp_log)
-        sys.stdout.flush()
+        if not is_action:
+            sys.stdout.write(timestamp_log)
+            sys.stdout.flush()
 
         # 2. Windows OS Level Desktop Notification
         try:
-            if settings.notify_at_os_level:
+            if settings.notify_at_os_level and not is_action:
                 notification.notify(
                     title=f"CodeRAG Engine: {title}",
                     message=message,
@@ -128,7 +140,8 @@ class NotificationDispatcher:
         try:
             scope, rid = _scope_of(self._resolve_repo(title, str(message), repo_id))
             ev = TelemetryEvent(uid=uuid.uuid4().hex, ts=_now_iso(), scope=scope, repo_id=rid,
-                                level=str(level), title=title, message=str(message))
+                                level=str(level), title=title, message=str(message),
+                                kind=kind or "log", request_id=request_id, thread_id=thread_id, data=data)
             self._publish(ev)
         except Exception as exc:
             sys.stderr.write(f"[NOTIFIER] dropped event '{title}': {type(exc).__name__}: {exc}\n")

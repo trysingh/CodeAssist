@@ -27,7 +27,7 @@ import re
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Dict, List, Optional, Tuple, TypedDict
+from typing import TYPE_CHECKING, Annotated, Callable, Dict, List, Optional, Tuple, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
@@ -40,6 +40,8 @@ from services.patch_service import (apply_edits, diff_stats, join_diffs, make_di
 from services.repo_store import RepoStore, StaleRevision
 from services.sandbox_service import CaseResult, SandboxService, SandboxVerdict
 from services import gates
+from services.action_log import action as _action
+from services.reasoning.baseline import flag
 
 if TYPE_CHECKING:  # avoid importing chroma/ollama just to type-hint
     from models.database import DatabaseManager
@@ -488,11 +490,13 @@ _TEST_SIDE_ERR = re.compile(r"fixture '[^']+' not found|NameError|SyntaxError|In
 class RepoChangeService:
     def __init__(self, db: "DatabaseManager", vector_service: "VectorStoreService", store: RepoStore,
                  llm_text: LLMText = ask_text, llm_json: LLMJson = ask_json, emit=None,
-                 sandbox: Optional[SandboxService] = None, choice_fn=decide_choice):
+                 sandbox: Optional[SandboxService] = None, choice_fn=decide_choice,
+                 locate_fn: Optional[Callable[[str, int], List[str]]] = None):
         self.db, self.vector, self.store = db, vector_service, store
         self.llm_text, self.llm_json = llm_text, llm_json      # chat models: text / JSON
         self.choice_fn = choice_fn                             # decision model (tev1): classification
         self._emit_fn = emit
+        self.locate_fn = locate_fn           # agentic file locator: (query, k) -> repo-relative paths
         self.sandbox = sandbox or SandboxService(store, emit=emit)
         self.graph = self._build()
 
@@ -520,7 +524,7 @@ class RepoChangeService:
                              "log_path": self._open_log(repo_id, request, base_rev)}
         try:
             out = await self.graph.ainvoke(
-                init, config={"recursion_limit": 24 + 5 * settings.change_max_attempts + 3 * settings.change_repair_attempts})
+                init, config={"recursion_limit": 24 + 5 * flag('change_max_attempts', settings.change_max_attempts) + 3 * settings.change_repair_attempts})
         except Exception as e:  # noqa: BLE001 — surface, never crash the chat
             res.errors.append(f"change pipeline error: {type(e).__name__}: {e}")
             return res
@@ -540,7 +544,7 @@ class RepoChangeService:
         res.ok = out.get("status") == "ok" and res.revision is not None
         if not res.ok and out.get("log_path"):
             res.notes.append(f"attempt log (raw model replies, problems, diagnosis): {out['log_path']}")
-        if out.get("gated") or (not res.ok and (settings.change_gate or "off").strip().lower() in ("smoke", "strict")):
+        if out.get("gated") or (not res.ok and (flag('change_gate', settings.change_gate) or "off").strip().lower() in ("smoke", "strict")):
             if res.attempts:      # the gate is on: a diff that did not pass verification is not shown, not even as "not saved"
                 res.notes.append("The attempted edits are not shown because they did not pass verification. "
                                  "ENGINE_CHANGE_GATE=off shows and saves unverified proposals.")
@@ -668,7 +672,7 @@ class RepoChangeService:
             d.mkdir(parents=True, exist_ok=True)
             path = d / f"{time.strftime('%Y%m%d-%H%M%S')}-{int(time.time() * 1000) % 1000:03d}.log"
             path.write_text(
-                f"REQUEST (base revision {base_rev}):\n{request}\n\nSETTINGS: max_attempts={settings.change_max_attempts} "
+                f"REQUEST (base revision {base_rev}):\n{request}\n\nSETTINGS: max_attempts={flag('change_max_attempts', settings.change_max_attempts)} "
                 f"repair_attempts={settings.change_repair_attempts} partial_apply={settings.change_partial_apply} "
                 f"diagnose={settings.change_diagnose} gap_decide={settings.change_gap_decide} "
                 f"patcher={reasoning_model(settings.patcher_model)} escalation={settings.change_escalation_model or '-'}\n",
@@ -750,7 +754,7 @@ class RepoChangeService:
         stuck = bool(problems) and sig == state.get("apply_sig")
         free = state.get("free", 0)
         can_free = free < settings.change_repair_attempts and not stuck
-        if self._spent(state) >= settings.change_max_attempts and not can_free:
+        if self._spent(state) >= flag('change_max_attempts', settings.change_max_attempts) and not can_free:
             return {**out, "status": "failed", "errors": problems or ["no usable edits produced"]}
         self._emit(f"Attempt {state['attempt']} needs a fix: {len(problems)} problem(s) - {self._brief(problems)}"
                    + (f" (free repair {free + 1}/{settings.change_repair_attempts})" if can_free else ""), "WARNING")
@@ -819,12 +823,17 @@ class RepoChangeService:
         semantic: List[str] = []
         missing: List[str] = []          # search hits that are not in the raw store
         trace: List[str] = [f"raw store holds {len(known)} file(s) at revision {base_rev}"]
-        try:
-            docs = await asyncio.to_thread(self.vector.similarity_search, repo_id,
-                                           request + (("\n" + ctx[:1500]) if ctx else ""), 8)
-        except Exception as e:  # noqa: BLE001 — retrieval helps, it is not required
-            trace.append(f"semantic search failed: {type(e).__name__}: {e}")
-            docs = []
+        agentic_first = self.locate_fn is not None and str(getattr(settings, "retrieval_mode", "agentic")) == "agentic"
+        docs: list = []
+        if agentic_first:
+            trace.append("retrieval_mode=agentic: using agentic file locator")
+        else:
+            try:
+                docs = await asyncio.to_thread(self.vector.similarity_search, repo_id,
+                                               request + (("\n" + ctx[:1500]) if ctx else ""), 8)
+            except Exception as e:  # noqa: BLE001 — retrieval helps, it is not required
+                trace.append(f"semantic search failed: {type(e).__name__}: {e}")
+                docs = []
         for d in docs:
             p = str(d.metadata.get("file_path", "")).replace("\\", "/")   # chunk table keeps Windows separators
             if p in known:
@@ -834,6 +843,17 @@ class RepoChangeService:
                 missing.append(p)
         trace.append(f"semantic search: {len(docs)} chunk(s), {len(semantic)} file(s) in raw store, "
                      f"{len(missing)} not in raw store")
+        if self.locate_fn is not None and not semantic:      # vector search failed / empty (or agentic mode)
+            try:
+                found = await asyncio.to_thread(self.locate_fn, request + (("\n" + ctx[:500]) if ctx else ""),
+                                                int(settings.change_max_files))
+                for p in found or []:
+                    p = str(p).replace("\\", "/")
+                    if p in known and p not in semantic:
+                        semantic.append(p)
+                trace.append(f"agentic locate: {len(semantic)} file(s)")
+            except Exception as e:  # noqa: BLE001
+                trace.append(f"agentic locate failed: {type(e).__name__}: {e}")
 
         cands = list(dict.fromkeys(named + semantic))
         if not cands:
@@ -1009,7 +1029,7 @@ class RepoChangeService:
         prompt = _PROMPT.format(request=state["request"], context=self._ctx_block(state), plan=plan,
                                 feedback=fb, files="\n\n".join(blocks))
         model = reasoning_model(settings.patcher_model)
-        if settings.change_escalation_model and attempt - state.get("free", 0) >= settings.change_max_attempts:
+        if settings.change_escalation_model and attempt - state.get("free", 0) >= flag('change_max_attempts', settings.change_max_attempts):
             model = settings.change_escalation_model          # the last counted attempt gets the strongest model
         self._emit(f"Attempt {attempt}: asking {model} for edits"
                    + (f" (focused on {', '.join(focus_all)})" if focus_all else ""))
@@ -1125,7 +1145,7 @@ class RepoChangeService:
                             gap_hint[p] = why
             for p in gap:
                 gap_seen[p] = gap_seen.get(p, 0) + 1
-            if gap and (self._spent(state) < settings.change_max_attempts or state.get("free", 0) < settings.change_repair_attempts):
+            if gap and (self._spent(state) < flag('change_max_attempts', settings.change_max_attempts) or state.get("free", 0) < settings.change_repair_attempts):
                 have, fresh = [p for p in gap if p in planned], [p for p in gap if p not in planned]
                 gap_msg = ("The plan lists file(s) that have no edits yet: " + ", ".join(gap) + "\nFor each one do exactly one of:\n"
                            + (f"  a) EXISTING file(s) {', '.join(have)}: output FILE:/SEARCH/REPLACE blocks whose SEARCH quotes lines "
@@ -1183,7 +1203,7 @@ class RepoChangeService:
 
     async def _gate(self, state: ChangeState) -> dict:
         """Nothing is reviewed, saved or shown unless the sandbox evidence meets ENGINE_CHANGE_GATE."""
-        why = gates.release_gate(state.get("tests", {}), list(state["working"]), settings.change_gate)
+        why = gates.release_gate(state.get("tests", {}), list(state["working"]), flag('change_gate', settings.change_gate))
         if not why:
             return {}
         self._emit("Held back by the verification gate: " + why[0], "WARNING")
@@ -1302,7 +1322,7 @@ class RepoChangeService:
     async def _author_tests(self, state: ChangeState) -> dict:
         """Write pytest tests for the changed source so the sandbox checks the NEW behaviour, not only the old tests.
         Never blocks a change: every failure here only means 'no generated tests'."""
-        if state.get("status") == "failed" or not settings.change_author_tests or not self.sandbox.enabled:
+        if state.get("status") == "failed" or not flag('change_author_tests', settings.change_author_tests) or not self.sandbox.enabled:
             return {}
         fb, tries = state.get("author_feedback", ""), state.get("author_tries", 0)
         have = [p for p in state.get("gen_tests", []) if p in state["working"]]
@@ -1553,7 +1573,7 @@ class RepoChangeService:
     async def _tests_first(self, state: ChangeState) -> dict:
         """Write the tests from request + plan (never from the code), prove they are red on the old code, then freeze them.
         Any failure here only means 'no pre-written tests': the old after-the-edit author step is still the fallback."""
-        if not (settings.change_tests_first and settings.change_author_tests and self.sandbox.enabled):
+        if not (flag('change_tests_first', settings.change_tests_first) and flag('change_author_tests', settings.change_author_tests) and self.sandbox.enabled):
             return {}
         planned, new = self._plan_files(state.get("plan", ""), state["known"])
         src = [p for p in dict.fromkeys((planned + new or state["targets"]) + state.get("stubbed", []))
@@ -1595,7 +1615,7 @@ class RepoChangeService:
         """A reviewer with a fresh context (request, scope and final diff only) checks coverage per requirement and unrequested
         edits. A problem it can pin on one symbol goes back to that symbol's task; anything else goes to the single patch. One round;
         with no attempts left it only annotates. Fail-open: a reviewer that cannot answer never blocks a change that passed the checks."""
-        if state.get("status") == "failed" or not settings.change_review or state.get("review_done"):
+        if state.get("status") == "failed" or not flag('change_review', settings.change_review) or state.get("review_done"):
             return {}
         notes = list(state["notes"])
         gen = set(state.get("gen_tests", []))
@@ -1658,7 +1678,7 @@ class RepoChangeService:
         if not issues:
             return {"review_done": True, "notes": notes, "trace": ["review: nothing to fix"]}
         text = [f"{i['file'] + '::' + i['name'] if i['name'] else i['file'] or '(whole change)'}: {i['problem']}" for i in issues]
-        if self._spent(state) >= settings.change_max_attempts:       # nothing left to spend: tell the human, do not block
+        if self._spent(state) >= flag('change_max_attempts', settings.change_max_attempts):       # nothing left to spend: tell the human, do not block
             return {"review_done": True, "notes": notes + [f"review (not fixed, no attempts left): {t}" for t in text],
                     "trace": [f"review: {len(issues)} issue(s), annotated"]}
         self._emit(f"Review found {len(issues)} issue(s): " + " | ".join(text)[:300], "WARNING")
@@ -1938,7 +1958,7 @@ class RepoChangeService:
                         "and fix that one)")
             lines.append(f"test {c.id} fails{hint}: {c.message}\n" + "\n".join("    " + l for l in c.detail.splitlines()[-14:]))
         problems = [f"{len(real)} test(s) newly failing after the change:"] + lines
-        out_of_tries = self._spent(state) >= settings.change_max_attempts or sig == state.get("last_sig")
+        out_of_tries = self._spent(state) >= flag('change_max_attempts', settings.change_max_attempts) or sig == state.get("last_sig")
         if out_of_tries and gen and all(is_gen(c) for c in real):
             # The change passes every existing test; only tests written for it keep failing (the code or the test is wrong, the
             # loop could not tell which). Save the change WITHOUT them and say so loudly, instead of throwing the work away.
@@ -1969,21 +1989,59 @@ class RepoChangeService:
                 "trace": [f"attempt {state['attempt']}: {len(real)} new test failure(s)"]}
 
     # ------------------------------------------------------------------ wiring
+    _PHASES = {"locate": "RETRIEVE", "plan": "DECOMPOSE", "contract": "CONTRACT", "tests_first": "TEST",
+               "author_tests": "TEST", "tasks": "IMPLEMENT", "patch": "IMPLEMENT", "apply_check": "HARDEN",
+               "fix_tasks": "HARDEN", "sandbox": "SANDBOX", "gate": "CROSSCHECK", "review": "CROSSCHECK",
+               "persist": "DELIVER"}
+
+    @classmethod
+    def _logged(cls, node_name: str, fn):
+        """Wrap a graph node so it emits start/ok/fail action events. Supports sync and async nodes; never alters results."""
+        phase = cls._PHASES.get(node_name, "IMPLEMENT")
+        is_async = asyncio.iscoroutinefunction(fn)
+
+        def _close(h, out):
+            try:
+                if isinstance(out, dict):
+                    st = out.get("status")
+                    errs = out.get("errors") or []
+                    if st == "failed":
+                        h.note(str(errs[0])[:200] if errs else "failed", status="fail")
+                    elif st:
+                        h.note(f"status={st}")
+            except Exception:  # noqa: BLE001 — logging must not break a node
+                pass
+
+        if is_async:
+            async def awrapped(state):
+                with _action(phase, f"ChangeGraph.{node_name}", node_name) as h:
+                    out = await fn(state)
+                    _close(h, out)
+                    return out
+            return awrapped
+
+        def wrapped(state):
+            with _action(phase, f"ChangeGraph.{node_name}", node_name) as h:
+                out = fn(state)
+                _close(h, out)
+                return out
+        return wrapped
+
     def _build(self):
         g = StateGraph(ChangeState)
-        g.add_node("locate", self._locate)
-        g.add_node("plan", self._plan)
-        g.add_node("contract", self._contract)
-        g.add_node("tests_first", self._tests_first)
-        g.add_node("tasks", self._tasks)
-        g.add_node("patch", self._patch)
-        g.add_node("apply_check", self._apply_check)
-        g.add_node("author_tests", self._author_tests)
-        g.add_node("sandbox", self._sandbox)
-        g.add_node("gate", self._gate)
-        g.add_node("review", self._review)
-        g.add_node("fix_tasks", self._fix_tasks)
-        g.add_node("persist", self._persist)
+        g.add_node("locate", self._logged("locate", self._locate))
+        g.add_node("plan", self._logged("plan", self._plan))
+        g.add_node("contract", self._logged("contract", self._contract))
+        g.add_node("tests_first", self._logged("tests_first", self._tests_first))
+        g.add_node("tasks", self._logged("tasks", self._tasks))
+        g.add_node("patch", self._logged("patch", self._patch))
+        g.add_node("apply_check", self._logged("apply_check", self._apply_check))
+        g.add_node("author_tests", self._logged("author_tests", self._author_tests))
+        g.add_node("sandbox", self._logged("sandbox", self._sandbox))
+        g.add_node("gate", self._logged("gate", self._gate))
+        g.add_node("review", self._logged("review", self._review))
+        g.add_node("fix_tasks", self._logged("fix_tasks", self._fix_tasks))
+        g.add_node("persist", self._logged("persist", self._persist))
         g.add_edge(START, "locate")
         g.add_conditional_edges("locate", lambda s: END if s.get("status") == "failed" else "plan",
                                 {END: END, "plan": "plan"})

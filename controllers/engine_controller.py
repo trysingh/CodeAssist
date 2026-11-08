@@ -5,6 +5,8 @@ import sys
 import time
 import re
 import asyncio
+import contextvars
+import uuid
 import orjson
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Callable
@@ -28,6 +30,15 @@ from services.patch_service import join_diffs, make_diff
 from services.apply_service import apply_revision as apply_revision_to_disk
 from services.apply_service import disk_conflicts
 from services.model_calls import model_scope
+from services import action_log as al
+from services.agentic_search import AgenticSearch
+from services.vectorize_jobs import DbJobStore, JobState, VectorizeJobManager
+from services.reasoning import BaselinePolicy, IntakeAgent, IntakeBrief, ReasoningSupervisor, VerifierAgent
+
+# Set by _chat_impl for the duration of one supervised turn (same asyncio task), read by _route_chat. Keeps _route_chat's
+# 4-argument signature (tests and subclasses rely on it) while letting the supervisor see the routing decision and collect facts.
+_PRE_DECISION: contextvars.ContextVar = contextvars.ContextVar("chat_pre_decision", default=None)
+_CHAT_FACTS: contextvars.ContextVar = contextvars.ContextVar("chat_facts", default=None)
 
 class EngineController:
     """MVC Controller coordinating Repository Ingestion, Job Resumption, and Conversational RAG."""
@@ -46,6 +57,132 @@ class EngineController:
         self.warmer = SandboxWarmer(self.change_service.sandbox, self._warm_repo_ids)
         self.active_chats: Dict[str, asyncio.Task] = {}
         self._chat_lock = asyncio.Lock()
+        # ---- v2: background vectorize jobs, agentic file locator, reasoning supervisor
+        self.jobs = VectorizeJobManager(DbJobStore(self.db), work=self.vectorize_repository, notify=notifier.notify,
+                                        set_vector_status=self.db.set_vector_status)
+        self.rag_manager.repo_store = self.repo_store       # rag_manager is built before repo_store exists
+        self.rag_manager.jobs = self.jobs
+        self.rag_manager.vector_status_fn = self.db.get_vector_status
+        self._agentic: Dict[str, Tuple[object, AgenticSearch]] = {}     # repo_id -> (corpus it was built from, searcher)
+        self.change_service.locate_fn = self._locate_files
+        self.supervisor = self._build_supervisor()
+
+    # ------------------------------------------------------------------ v2 helpers
+    def _build_supervisor(self) -> ReasoningSupervisor:
+        llm_json = None
+        if settings.reasoning_intake_llm:
+            from services.model_calls import ask_json, reasoning_model
+
+            def llm_json(prompt: str) -> dict:
+                """Sync callable for IntakeAgent; runs in the event loop's thread pool, so drive the coroutine to completion."""
+                try:
+                    return asyncio.run(ask_json(reasoning_model(), prompt, phase="INTAKE")) or {}
+                except Exception:   # noqa: BLE001 - the heuristics stand on their own
+                    return {}
+        return ReasoningSupervisor(
+            IntakeAgent(llm_json=llm_json), VerifierAgent(),
+            defaults_provider=lambda: {
+                "change_gate": settings.change_gate, "change_review": settings.change_review,
+                "change_tests_first": settings.change_tests_first, "change_author_tests": settings.change_author_tests,
+                "change_max_attempts": settings.change_max_attempts},
+            enabled=settings.reasoning_supervisor)
+
+    async def _warm_agentic(self, repo_id: str) -> None:
+        """Build (or reuse) the repo's agentic searcher in the async path so the change graph's locator thread only reads it."""
+        try:
+            corpus = await self.rag_manager._agentic_corpus(repo_id)
+            cur = self._agentic.get(repo_id)
+            if cur is None or cur[0] is not corpus:
+                self._agentic[repo_id] = (corpus, AgenticSearch(corpus))
+        except Exception:   # noqa: BLE001 - no raw store yet / bare controller: the locator simply finds nothing
+            return
+
+    def _locate_files(self, query: str, k: int) -> List[str]:
+        """locate_fn of the change graph (runs in a worker thread): the repo comes from notifier.repo_scope."""
+        from services.notifier import _current_repo
+        entry = getattr(self, "_agentic", {}).get(_current_repo.get() or "")
+        return entry[1].locate_files(query, k) if entry else []
+
+    def invalidate_agentic(self, repo_id: str) -> None:
+        try:
+            getattr(self, "_agentic", {}).pop(repo_id, None)
+            self.rag_manager._corpus_cache.pop(repo_id, None)
+        except Exception:   # noqa: BLE001
+            pass
+
+    async def _vector_status(self, repo_id: str) -> str:
+        getter = getattr(self.db, "get_vector_status", None)
+        if getter is None:
+            return "ready"      # a database without the column is a pre-v2 one: its chunks were embedded at ingest
+        try:
+            status = str(await getter(repo_id) or "none")
+            if status == "none" and getattr(self.db, "list_file_paths", None) is not None \
+                    and await self.db.list_file_paths(repo_id):
+                return "ready"      # ingested before vector_status existed: its chunks are a usable index (same rule as rag_graph)
+            return status
+        except Exception:   # noqa: BLE001
+            return "none"
+
+    async def _db_call(self, name: str, *args) -> None:
+        fn = getattr(self.db, name, None)
+        if fn is not None:
+            await fn(*args)
+
+    async def reconcile_jobs(self) -> int:
+        """At application start no vectorize job can still be running: close stale rows and fix vector_status."""
+        await self.db.init_db()
+        n = 0
+        for j in await self.db.list_jobs(None, 500):
+            if j["state"] in (JobState.QUEUED.value, JobState.RUNNING.value):
+                j = {**j, "state": JobState.FAILED.value, "error": "interrupted by restart"}
+                await self.db.upsert_job(j)
+                n += 1
+        for r in await self.db.list_repos():
+            if await self.db.get_vector_status(r.repo_id) in ("queued", "running"):
+                await self.db.set_vector_status(r.repo_id, "failed")
+        if n:
+            notifier.notify("Vectorize jobs interrupted",
+                            f"{n} vectorize job(s) were interrupted by a restart. They resume from the last finished file "
+                            f"the next time a search needs vectors, or via POST /api/v1/repos/<id>/vectorize.", level="WARNING")
+        return n
+
+    async def start_vectorize(self, repo_id: str, reason: str = "requested by user"):
+        """Enqueue (deduplicated) a background vectorize job for an ingested repo."""
+        await self.db.init_db()
+        if not await self.db.get_repo(repo_id):
+            raise ValueError(f"Repository ID '{repo_id}' not found.")
+        return await self.jobs.enqueue(repo_id, reason or "requested by user")
+
+    async def list_repos_enriched(self) -> List[dict]:
+        """Repo list for the API/UI: RepoInfo + vector_status + ingest_mode. An agentic repo is searchable as soon as it is
+        ingested, so its processed count is the file total until chunks exist (the old counter only counted embedded files)."""
+        out = []
+        for r in await self.list_ingested_repos():
+            d = r.model_dump(mode="json")
+            vs = await self._vector_status(r.repo_id)
+            mode = "agentic"
+            try:
+                mode = await self.db.get_ingest_mode(r.repo_id)
+            except Exception:   # noqa: BLE001
+                pass
+            d["vector_status"], d["ingest_mode"] = vs, mode
+            if r.status == JobStatus.COMPLETED and vs != "ready":
+                d["processed_files"] = r.total_files
+            out.append(d)
+        return out
+
+    async def search_mode(self, repo_id: str) -> dict:
+        await self.db.init_db()
+        if not await self.db.get_repo(repo_id):
+            raise ValueError(f"Repository ID '{repo_id}' not found.")
+        vs = await self._vector_status(repo_id)
+        mode = str(settings.retrieval_mode or "agentic").lower()
+        if vs == "ready":
+            retrieval = "vector" if mode == "vector" else "hybrid"
+        else:
+            retrieval = "agentic"
+        return {"ingest_mode": await self.db.get_ingest_mode(repo_id), "vector_status": vs,
+                "retrieval_mode": retrieval, "job": await self.db.latest_job(repo_id, "vectorize")}
 
     async def _warm_repo_ids(self) -> List[str]:
         await self.db.init_db()
@@ -187,7 +324,8 @@ class EngineController:
 
             notifier.notify("Syncing Repository", f"Checking for offline updates in '{repo.title}'...", level="INFO", repo_id=repo.repo_id)
             completed_hashes = await self.db.get_completed_file_hashes(repo.repo_id)
-            current_files = self.scan_supported_files(root_path)
+            # Without a vector index there is nothing per-file to re-embed: the raw snapshot sync below is the whole catch-up.
+            current_files = self.scan_supported_files(root_path) if await self._vector_status(repo.repo_id) == "ready" else []
             
             offline_updates_count = 0
             for fpath in current_files:
@@ -269,6 +407,20 @@ class EngineController:
             await self.repo_store.upsert_base_files(repo_id, [(rel_path.replace("\\", "/"), full_path.read_bytes())])
             return
 
+        # The verbatim snapshot is what agentic search, the sandbox and the patcher read: refresh it for every change.
+        raw_bytes = full_path.read_bytes()
+        raw = await self.repo_store.upsert_base_files(repo_id, [(rel_path, raw_bytes)])
+        if raw["shadowed"]:
+            await self._record_disk_sync(repo_id, {raw["shadowed"][0]: raw_bytes})
+        if is_requirements_path(rel_path):
+            request_prewarm(repo_id)  # dependencies changed -> new image tag; build it now, not on the next change request
+        self.invalidate_agentic(repo_id)
+        al.log_action("INGEST", "Watcher", "refresh raw snapshot", "ok", rel_path, repo_id=repo_id)
+
+        # Embeddings only exist (and so only need refreshing) once the repo has been vectorized.
+        if await self._vector_status(repo_id) != "ready":
+            return
+
         fhash = self.compute_file_hash(full_path)
         completed_hashes = await self.db.get_completed_file_hashes(repo_id)
 
@@ -278,14 +430,7 @@ class EngineController:
         notifier.notify("Code Change Detected", f"Re-chunking and refreshing vectors for: {rel_path}", repo_id=repo_id)
 
         ext = full_path.suffix.lower()
-        content = full_path.read_text(encoding="utf-8", errors="replace")
-
-        raw_bytes = full_path.read_bytes()
-        raw = await self.repo_store.upsert_base_files(repo_id, [(rel_path.replace("\\", "/"), raw_bytes)])
-        if raw["shadowed"]:
-            await self._record_disk_sync(repo_id, {raw["shadowed"][0]: raw_bytes})
-        if is_requirements_path(rel_path):
-            request_prewarm(repo_id)  # dependencies changed -> new image tag; build it now, not on the next change request
+        content = raw_bytes.decode("utf-8", errors="replace")
 
         strategy = ChunkingRegistry.get_strategy(ext)
         chunk_docs = strategy.chunk_file(repo_id, rel_path, fhash, content, settings.chunk_size, settings.chunk_overlap)
@@ -301,7 +446,7 @@ class EngineController:
 
         if chunk_docs:
             self.vector_service.delete_chunks_by_file(repo_id, rel_path)
-            self.vector_service.embed_and_persist_chunks(repo_id, chunk_docs)
+            await asyncio.to_thread(self.vector_service.embed_and_persist_chunks, repo_id, chunk_docs)
             await self.db.save_chunks_batch(repo_id, sqlite_rows)
 
         await self.db.record_file_job(repo_id, rel_path, fhash, JobStatus.COMPLETED)
@@ -313,7 +458,11 @@ class EngineController:
             repo_id=repo_id
         )
 
-    async def ingest_repository(self, repo_root_str: str) -> RepoInfo:
+    async def ingest_repository(self, repo_root_str: str, *, vectorize: bool = False, watch: bool = True) -> RepoInfo:
+        """FAST agentic ingest: scan, raw snapshot, repo registered and COMPLETED (searchable by grep/glob/read/symbols) with NO
+        embeddings. vectorize=True or settings.ingest_mode == "vector" additionally runs the background vectorize job
+        (see vectorize_repository) and waits for it before returning, which is the classic blocking behaviour."""
+        t0 = time.perf_counter()
         await self.db.init_db()
         root_path = Path(repo_root_str).resolve()
         if not root_path.exists() or not root_path.is_dir():
@@ -321,31 +470,95 @@ class EngineController:
 
         repo_id = self.compute_repo_id(root_path)
         title = root_path.name
-        all_files = self.scan_supported_files(root_path)
-        
-        await self.db.upsert_repo(repo_id, title, str(root_path), JobStatus.PROCESSING, len(all_files))
-        await self.snapshot_raw_files(repo_id, root_path)
-        request_prewarm(repo_id)      # build the sandbox image while the chunks are being embedded (no-op without a running app)
+        want_vectors = vectorize or str(settings.ingest_mode).lower() == "vector"
+        with al.request_scope(None, None, repo_id=repo_id):
+            with al.action("INGEST", "Ingest", "scan files", detail=str(root_path)) as h:
+                all_files = await asyncio.to_thread(self.scan_supported_files, root_path)
+                h.note(f"{len(all_files)} supported file(s)")
 
+            await self.db.upsert_repo(repo_id, title, str(root_path), JobStatus.PROCESSING, len(all_files))
+            with al.action("INGEST", "Ingest", "snapshot raw files") as h:
+                snap = await self.snapshot_raw_files(repo_id, root_path)
+                h.note(f"stored={(snap or {}).get('stored')} updated={(snap or {}).get('updated')}")
+            request_prewarm(repo_id)      # build the sandbox image while the repo is being used (no-op without a running app)
+            self.invalidate_agentic(repo_id)
+
+            prior = await self._vector_status(repo_id) if hasattr(self.db, "get_vector_status") else "none"
+            await self._db_call("set_ingest_mode", repo_id, "vector" if want_vectors else "agentic")
+            if prior not in ("ready", "queued", "running"):
+                await self._db_call("set_vector_status", repo_id, "none")
+            # Searchable now: status COMPLETED and the file total (upsert keeps the counts consistent without touching file_jobs,
+            # which belong to vectorize_repository).
+            await self.db.upsert_repo(repo_id, title, str(root_path), JobStatus.COMPLETED, len(all_files))
+            secs = time.perf_counter() - t0
+            notifier.notify("Repo ready (agentic search)",
+                            f"Repo ready (agentic search) in {secs:.1f}s: {len(all_files)} file(s) in '{title}'."
+                            + (" Building the vector index next." if want_vectors else ""),
+                            level="SUCCESS", repo_id=repo_id)
+            al.log_action("INGEST", "Ingest", "repo ready", "ok", f"{len(all_files)} file(s) in {secs:.1f}s",
+                          data={"files": len(all_files), "mode": "vector" if want_vectors else "agentic"}, duration_ms=int(secs * 1000))
+
+            if watch and getattr(settings, "watch_on_ingest", True):
+                try:
+                    from services.watcher_service import watcher_manager
+                    watcher_manager.start_watching(repo_id, str(root_path))
+                except Exception as exc:    # noqa: BLE001 - watchdog missing / inotify limit: ingest itself succeeded
+                    notifier.notify("Watcher Not Started", f"{type(exc).__name__}: {exc}", level="WARNING", repo_id=repo_id)
+
+            # An already vectorized repo has stale embeddings after a re-ingest: refresh them too (resumes at the changed files).
+            if want_vectors or prior == "ready":
+                reason = "requested at ingest" if want_vectors else "refresh after re-ingest"
+                if getattr(self, "jobs", None) is not None:
+                    job = await self.jobs.enqueue(repo_id, reason)
+                    if want_vectors:
+                        done = await self.jobs.wait(job.job_id)
+                        if done is not None and done.state == JobState.FAILED:
+                            raise RuntimeError(f"Vectorizing failed: {done.error}")
+                elif want_vectors:      # bare controller (no job manager): do the work inline
+                    await self.vectorize_repository(repo_id, root_path=root_path)
+                    await self._db_call("set_vector_status", repo_id, "ready")
+        return await self.db.get_repo(repo_id)
+
+    async def vectorize_repository(self, repo_id: str, progress_cb: Optional[Callable[[int, int], None]] = None,
+                                   root_path: Optional[Path] = None) -> None:
+        """Chunk + embed every supported file (resumes: files whose hash is already COMPLETED are skipped).
+        progress_cb(done_files, total_files) is called after each file batch. Embedding runs in a worker thread."""
+        await self.db.init_db()
+        if root_path is None:
+            repo = await self.db.get_repo(repo_id)
+            if not repo:
+                raise ValueError(f"Repository ID '{repo_id}' not found.")
+            root_path = Path(repo.root_path)
+        if not root_path.is_dir():
+            raise FileNotFoundError(f"Repository root path does not exist: {root_path}")
+        all_files = await asyncio.to_thread(self.scan_supported_files, root_path)
+        total = len(all_files)
+
+        def hashes() -> Dict[str, Tuple[Path, str]]:
+            return {self.rel_key(f, root_path): (f, self.compute_file_hash(f)) for f in all_files}
+        current = await asyncio.to_thread(hashes)
         completed_hashes = await self.db.get_completed_file_hashes(repo_id)
         pending_tasks: List[Tuple[str, str, str, str, int, int]] = []
-        
-        for fpath in all_files:
-            rel_path = self.rel_key(fpath, root_path)
-            fhash = self.compute_file_hash(fpath)
+        for rel_path, (fpath, fhash) in current.items():
             if completed_hashes.get(rel_path) == fhash:
                 continue
             await self.db.record_file_job(repo_id, rel_path, fhash, JobStatus.PROCESSING)
             pending_tasks.append((repo_id, str(fpath), rel_path, fhash, settings.chunk_size, settings.chunk_overlap))
 
-        batch_size = settings.batch_size
+        done = total - len(pending_tasks)
+        if progress_cb:
+            progress_cb(done, total)
+        al.log_action("VECTORIZE", "Vectorizer", "plan", "info", f"{len(pending_tasks)} of {total} file(s) to embed",
+                      data={"pending": len(pending_tasks), "total": total}, repo_id=repo_id)
+
+        batch_size = max(1, settings.batch_size)
         for i in range(0, len(pending_tasks), batch_size):
             batch_tasks = pending_tasks[i : i + batch_size]
-            chunked_results = parallel_chunk_files(batch_tasks, max_workers=settings.max_workers)
-            
+            chunked_results = await asyncio.to_thread(parallel_chunk_files, batch_tasks, max_workers=settings.max_workers)
+
             batch_chunks_for_vector = []
             sqlite_rows = []
-            
+
             for rel_path, fhash, chunk_docs, err in chunked_results:
                 if err:
                     await self.db.record_file_job(repo_id, rel_path, fhash, JobStatus.FAILED, err)
@@ -360,40 +573,73 @@ class EngineController:
                     ))
 
             if batch_chunks_for_vector:
-                self.vector_service.embed_and_persist_chunks(repo_id, batch_chunks_for_vector)
+                await asyncio.to_thread(self.vector_service.embed_and_persist_chunks, repo_id, batch_chunks_for_vector)
                 await self.db.save_chunks_batch(repo_id, sqlite_rows)
-                
+
             for rel_path, fhash, chunk_docs, err in chunked_results:
                 if not err:
                     await self.db.record_file_job(repo_id, rel_path, fhash, JobStatus.COMPLETED)
+            done += len(batch_tasks)
+            al.log_action("VECTORIZE", "Vectorizer", "embed batch", "ok", f"{done}/{total} file(s), {len(batch_chunks_for_vector)} chunk(s)",
+                          data={"done": done, "total": total, "chunks": len(batch_chunks_for_vector)}, repo_id=repo_id)
+            if progress_cb:
+                progress_cb(done, total)
 
         await self.db.update_repo_status(repo_id, JobStatus.COMPLETED)
-        return await self.db.get_repo(repo_id)
 
     async def list_ingested_repos(self) -> List[RepoInfo]:
         await self.db.init_db()
         return await self.db.list_repos()
 
     async def _chat_impl(self, repo_id: str, thread_id: str, query: str, web: str,
-                       attachments: Optional[List[dict]], model: str) -> str:
-        """Actual chat execution - extracted for task tracking and cancellation support."""
+                       attachments: Optional[List[dict]], model: str, request_id: Optional[str] = None) -> str:
+        """Actual chat execution - extracted for task tracking and cancellation support.
+        Every step logged below carries `request_id` (the Activity timeline groups by it)."""
         await self.db.init_db()
         repo = await self.db.get_repo(repo_id)
         if not repo:
             raise ValueError(f"Repository ID '{repo_id}' not found.")
-        note = ""
-        if attachments:
-            found = await derive_request(query, attachments, repo_id=repo_id)
-            if found.source == "image":
-                query, note = found.request, found.note()
-            elif not query.strip():
-                query = "Please review the attached content."
-        with repo_scope(repo_id), model_scope(model):
-            return note + await self._route_chat(repo_id, thread_id, query, web)
+        rid = request_id or uuid.uuid4().hex[:12]
+        with al.request_scope(rid, thread_id, repo_id=repo_id):
+            note = ""
+            if attachments:
+                found = await derive_request(query, attachments, repo_id=repo_id)
+                if found.source == "image":
+                    query, note = found.request, found.note()
+                elif not query.strip():
+                    query = "Please review the attached content."
+            with repo_scope(repo_id), model_scope(model):
+                supervisor = getattr(self, "supervisor", None)
+                if supervisor is None or not supervisor.enabled or repo_id == GENERAL_REPO_ID:
+                    return note + await self._route_chat(repo_id, thread_id, query, web)
+                pre = await self._decide(repo_id, query, web)
+                decision = pre[2]
+                if decision.intent == "help":           # the command list needs no intake / delivery notes
+                    return note + await self._route_chat(repo_id, thread_id, query, web)
+                try:
+                    repo_files = await self.repo_store.list_paths(repo_id, 0)
+                except Exception:   # noqa: BLE001
+                    repo_files = []
+                facts: dict = {}
+                t_pre, t_facts = _PRE_DECISION.set(pre), _CHAT_FACTS.set(facts)
+
+                async def execute(_brief: IntakeBrief, _policy: BaselinePolicy):
+                    answer = await self._route_chat(repo_id, thread_id, query, web)
+                    return answer, facts
+
+                try:
+                    answer = await supervisor.run(query=decision.query, intent=decision.intent,
+                                                  repo_files=repo_files, execute=execute)
+                finally:
+                    _PRE_DECISION.reset(t_pre)
+                    _CHAT_FACTS.reset(t_facts)
+                return note + answer
 
     async def chat_with_repo(self, repo_id: str, thread_id: str, query: str, web: str = "auto",
-                             attachments: Optional[List[dict]] = None, model: str = "") -> str:
-        """Attachments = prepared attachments of THIS message. Supports cancellation via stop_chat()."""
+                             attachments: Optional[List[dict]] = None, model: str = "",
+                             request_id: Optional[str] = None) -> str:
+        """Attachments = prepared attachments of THIS message. Supports cancellation via stop_chat().
+        request_id: the caller may pre-generate it (the API returns it with the answer); default = generated per turn."""
         if not hasattr(self, 'active_chats'):
             self.active_chats = {}
         if not hasattr(self, '_chat_lock'):
@@ -404,7 +650,7 @@ class EngineController:
             if prev and not prev.done():
                 prev.cancel()
             task = asyncio.create_task(
-                self._chat_impl(repo_id, thread_id, query, web, attachments, model),
+                self._chat_impl(repo_id, thread_id, query, web, attachments, model, request_id),
                 name=f"chat-{thread_id}"
             )
             self.active_chats[thread_id] = task
@@ -463,33 +709,65 @@ class EngineController:
             return ""
         return last.split("\n\n", 2)[-1].rsplit("\n\nTo build it", 1)[0]
 
-    async def _route_chat(self, repo_id: str, thread_id: str, query: str, web: str) -> str:
+    async def _decide(self, repo_id: str, query: str, web: str):
+        """-> (query without a /web prefix, web mode, RouteDecision). The one place that routes a message."""
         query, web = split_web_prefix(query, web)
         if repo_id == GENERAL_REPO_ID:
             # No codebase: only explicit prefixes matter (model routing would misread "write a script..." as a change).
-            decision = await route_intent(query, model="", repo_id=repo_id)
+            return query, web, await route_intent(query, model="", repo_id=repo_id)
+        return query, web, await route_intent(query, repo_id=repo_id)
+
+    def _note_facts(self, **facts) -> None:
+        """Best-effort facts for the cross-check (only collected while a supervised turn is running)."""
+        box = _CHAT_FACTS.get()
+        if box is not None:
+            box.update({k: v for k, v in facts.items() if v is not None})
+
+    def _note_retrieval(self, thread_id: str) -> None:
+        try:
+            meta = self.rag_manager.last_retrieval_meta(thread_id)
+        except Exception:   # noqa: BLE001
+            meta = {}
+        if meta:
+            self._note_facts(retrieval_mode=meta.get("mode"), retrieval_confidence=meta.get("confidence"),
+                             vectorize_job=meta.get("job_id"))
+
+    async def _route_chat(self, repo_id: str, thread_id: str, query: str, web: str) -> str:
+        pre = _PRE_DECISION.get()
+        query, web, decision = pre if pre is not None else await self._decide(repo_id, query, web)
+        if repo_id == GENERAL_REPO_ID:
             if decision.intent == "help":
                 return COMMANDS_HELP
             if decision.intent in ("change", "plan") and decision.source == "prefix":
                 return "Code changes need a repository. Pick one in the selector, or ask your question here."
             return await self.rag_manager.invoke_chat(repo_id, thread_id, decision.query, web=web)
-        decision = await route_intent(query, repo_id=repo_id)
         if decision.intent == "help":
             return COMMANDS_HELP
         if decision.intent == "plan":
+            await self._warm_agentic(repo_id)
             return await self.change_service.plan_only(repo_id, decision.query,
                                                        context=await self._thread_context(thread_id))
         if decision.intent == "change":
             ctx = await self._thread_context(thread_id)
             plan = await self._last_plan(thread_id, decision.query)
-            return (await self.propose_change(repo_id, decision.query, context=ctx, plan=plan)).to_markdown()
-        return await self.rag_manager.invoke_chat(repo_id, thread_id, decision.query, web=web)
+            res = await self.propose_change(repo_id, decision.query, context=ctx, plan=plan)
+            t = res.tests or {}
+            ran = bool(t.get("ran")) and not t.get("inconclusive")
+            self._note_facts(tests_ran=ran, tests_passed=(bool(t.get("ok")) if ran else None),
+                             sandbox=(("passed" if t.get("ok") else "failed") if ran else None),
+                             files_changed=[f.get("path") for f in (res.files or []) if f.get("path")] if res.ok else [],
+                             retrieval_mode=str(settings.retrieval_mode))
+            return res.to_markdown()
+        answer = await self.rag_manager.invoke_chat(repo_id, thread_id, decision.query, web=web)
+        self._note_retrieval(thread_id)
+        return answer
 
     async def propose_change(self, repo_id: str, request: str, base_rev: Optional[int] = None,
                              context: str = "", plan: str = "", model: str = "") -> ChangeResult:
         await self.db.init_db()
         if not await self.db.get_repo(repo_id):
             raise ValueError(f"Repository ID '{repo_id}' not found.")
+        await self._warm_agentic(repo_id)        # the change graph's locator thread only reads this cache
         with model_scope(model):
             return await self.change_service.run(repo_id, request, base_rev, context=context, plan=plan)
 
@@ -592,6 +870,7 @@ class EngineController:
             print(f"Warning: Could not reset repository indexes for {repo_id}: {e}")
 
         
+        await self._db_call("set_vector_status", repo_id, "none")     # no chunks left: back to agentic search
         notifier.notify("Index Reset", f"Successfully cleared all indexes for repository {repo_id}.", level="SUCCESS", repo_id=repo_id)
 
     async def remove_repo(self, repo_id: str):

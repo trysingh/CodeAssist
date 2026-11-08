@@ -25,7 +25,7 @@
         href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap"
         rel="stylesheet">
     <script src="https://unpkg.com/lucide@latest"></script>
-    <link rel="stylesheet" href="/static/css/styles.css?v=4">
+    <link rel="stylesheet" href="/static/css/styles.css?v=5">
 </head>
 
 <body
@@ -87,6 +87,11 @@
                     <span id="telemetry-badge"
                         class="hidden text-[11px] font-mono text-white bg-blue-600 rounded-full px-1.5 min-w-[1.25rem] text-center"></span>
                 </button>
+                <button onclick="switchTab('activity'); closeMobileNav();" id="nav-activity" data-tip="Activity (Alt+5)"
+                    class="nav-btn w-full flex items-center gap-3 px-3.5 py-3 lg:py-2.5 rounded-lg text-sm font-medium transition-colors">
+                    <i data-lucide="list-tree" class="w-4 h-4 shrink-0"></i><span
+                        class="lbl flex-1 text-left">Activity</span>
+                </button>
                 <a href="/docs" target="_blank" data-tip="APIs"
                     class="nav-btn w-full flex items-center gap-3 px-3.5 py-3 lg:py-2.5 rounded-lg text-sm font-medium transition-colors">
                     <i data-lucide="book-open" class="w-4 h-4 shrink-0"></i><span class="lbl">APIs</span>
@@ -122,6 +127,18 @@
                         class="bg-slate-100 dark:bg-slate-900 border border-lightCardBorder dark:border-cardBorder text-xs text-slate-900 dark:text-white rounded-lg px-2.5 py-1.5 font-mono flex-1 sm:flex-initial min-w-0 max-w-full sm:max-w-xs truncate focus:outline-none focus:border-blue-500">
                         <option value="">Select repository</option>
                     </select>
+                    <div id="search-mode" data-kind="agentic" class="hidden items-center gap-1.5 shrink-0">
+                        <span id="search-mode-badge" class="sm-badge" role="status" aria-live="polite" title="Search mode">
+                            <span class="sm-dot" aria-hidden="true"></span>
+                            <span id="search-mode-label" class="truncate">Agentic search</span>
+                            <span id="search-mode-bar" class="sm-bar hidden" role="progressbar" aria-label="Vectorize progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span id="search-mode-fill"></span></span>
+                        </span>
+                        <button id="vectorize-btn" type="button" onclick="buildVectorIndex()" aria-label="Build vector index"
+                            title="Build vector index (long-running background job)"
+                            class="hidden items-center gap-1 h-7 px-2 rounded-lg text-[11px] font-medium border border-slate-300 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white hover:bg-slate-200 dark:hover:bg-slate-800 disabled:opacity-50 transition-colors">
+                            <i data-lucide="zap" class="w-3 h-3"></i><span class="hidden md:inline">Build vector index</span>
+                        </button>
+                    </div>
                     <span id="active-thread-badge" class="text-xs text-slate-400 truncate hidden md:block">No thread
                         selected</span>
                 </div>
@@ -357,13 +374,36 @@
                         <div class="text-slate-500">[System] Telemetry console active...</div>
                     </div>
                 </section>
+
+                <!-- TAB: ACTIVITY -->
+                <section id="tab-activity" class="tab-content hidden h-full flex-col p-3 sm:p-4 md:p-6 gap-3">
+                    <div class="max-w-5xl mx-auto w-full flex flex-wrap justify-between items-center gap-2">
+                        <div class="min-w-0">
+                            <h3 class="text-lg font-semibold text-slate-900 dark:text-white">Agent activity</h3>
+                            <p id="activity-summary" class="text-[11px] text-slate-500 truncate">No activity yet.</p>
+                        </div>
+                        <div class="flex flex-wrap items-center gap-2">
+                            <label class="act-check"><input type="checkbox" id="activity-failures" onchange="onActivityFilter()"> Failures only</label>
+                            <label class="act-check"><input type="checkbox" id="activity-thread" onchange="onActivityFilter()"> Current thread only</label>
+                            <input id="activity-text" type="search" oninput="onActivityFilter()" placeholder="Filter steps" aria-label="Filter steps by text"
+                                class="bg-slate-100 dark:bg-slate-900 border border-lightCardBorder dark:border-cardBorder rounded-xl px-3 py-1.5 text-xs text-slate-900 dark:text-white placeholder-slate-500 focus:outline-none focus:border-blue-500 w-36 sm:w-44">
+                            <button onclick="reloadActivity()" aria-label="Reload activity history"
+                                class="bg-slate-200 dark:bg-slate-800 hover:bg-slate-300 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 px-3.5 py-2 sm:py-1.5 rounded-xl text-xs">Reload</button>
+                            <button onclick="clearActivity()" aria-label="Clear activity view"
+                                class="bg-slate-200 dark:bg-slate-800 hover:bg-slate-300 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 px-3.5 py-2 sm:py-1.5 rounded-xl text-xs">Clear</button>
+                        </div>
+                    </div>
+                    <div id="activity-phases" class="max-w-5xl mx-auto w-full flex flex-wrap gap-1.5" role="group" aria-label="Filter by phase"></div>
+                    <div id="activity-list"
+                        class="max-w-5xl mx-auto w-full flex-1 min-h-0 overflow-y-auto space-y-2 pr-1"></div>
+                </section>
             </div>
         </main>
     </div>
 
     <!-- ============ MOBILE BOTTOM TAB BAR (< 1024px) ============ -->
     <nav id="mobile-bottom-nav"
-        class="lg:hidden h-14 bg-lightCardBg dark:bg-cardBg border-t border-lightCardBorder dark:border-cardBorder grid grid-cols-4 shrink-0 z-30 select-none">
+        class="lg:hidden h-14 bg-lightCardBg dark:bg-cardBg border-t border-lightCardBorder dark:border-cardBorder grid grid-cols-5 shrink-0 z-30 select-none">
         <button onclick="switchTab('chat')" data-mob-tab="chat"
             class="mob-nav-btn active flex flex-col items-center justify-center gap-1 text-slate-400">
             <i data-lucide="message-square-code" class="w-4 h-4"></i>
@@ -383,6 +423,11 @@
             class="mob-nav-btn flex flex-col items-center justify-center gap-1 text-slate-400">
             <i data-lucide="activity" class="w-4 h-4"></i>
             <span class="text-[10px] font-medium">Telemetry</span>
+        </button>
+        <button onclick="switchTab('activity')" data-mob-tab="activity"
+            class="mob-nav-btn flex flex-col items-center justify-center gap-1 text-slate-400">
+            <i data-lucide="list-tree" class="w-4 h-4"></i>
+            <span class="text-[10px] font-medium">Activity</span>
         </button>
     </nav>
 
@@ -428,7 +473,8 @@
         </div>
     </div>
 
-    <script src="/static/js/app.js?v=3"></script>
+    <script src="/static/js/activity.js?v=1"></script>
+    <script src="/static/js/app.js?v=4"></script>
 </body>
 
 </html>

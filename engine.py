@@ -2,7 +2,8 @@
 """
 Phase 1 CLI & FastAPI Entrypoint.
 Supports:
-  > python engine.py ingest --repo <repo-root>   (also supports --rep0 alias)
+  > python engine.py ingest --repo <repo-root> [--vectorize]   (also supports --rep0 alias)
+  > python engine.py ingest jobs [repo-id]
   > python engine.py ingest list
   > python engine.py ingest chat <repo-id> [--thread <thread-id>]
   > python engine.py serve --port 8000
@@ -19,9 +20,11 @@ def main():
 
     # 'ingest' command group
     ingest_parser = subparsers.add_parser("ingest", help="Ingest repositories, list repos, or chat with an ingested repo")
-    ingest_parser.add_argument("action", nargs="?", default="run", help="Optional sub-action: 'list' or 'chat'")
-    ingest_parser.add_argument("target_id", nargs="?", default=None, help="Repo ID when using 'ingest chat <repo-id>'")
+    ingest_parser.add_argument("action", nargs="?", default="run", help="Optional sub-action: 'list', 'chat' or 'jobs'")
+    ingest_parser.add_argument("target_id", nargs="?", default=None, help="Repo ID when using 'ingest chat <repo-id>' or 'ingest jobs [repo-id]'")
     ingest_parser.add_argument("--repo", "--rep0", dest="repo_root", default=None, help="Root path of the repository to ingest")
+    ingest_parser.add_argument("--vectorize", action="store_true", help="Also build the vector index now and wait for it (default: agentic search only, vectors on demand)")
+    ingest_parser.add_argument("--trace", action="store_true", help="With 'ingest chat': print the step trace (intake, retrieval, tools, checks) after each answer")
     ingest_parser.add_argument("--thread", dest="thread_id", default="default_thread", help="Conversation thread ID for state persistence")
 
     # 'serve' command group for Web/FastAPI mode
@@ -46,9 +49,11 @@ def main():
             if not args.target_id:
                 print("Error: Please provide <repo-id>. Usage: python engine.py ingest chat <repo-id>")
                 sys.exit(1)
-            cli.run_chat(args.target_id, session_id=args.thread_id)
+            cli.run_chat(args.target_id, session_id=args.thread_id, trace=args.trace)
+        elif args.action == "jobs":
+            cli.run_jobs(args.target_id)
         elif args.repo_root:
-            cli.run_ingest(args.repo_root)
+            cli.run_ingest(args.repo_root, vectorize=args.vectorize)
         else:
             ingest_parser.print_help()
 

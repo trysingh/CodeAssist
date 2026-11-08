@@ -1,0 +1,57 @@
+REQUEST (base revision 0):
+Currently the app outputs the bundled repo with the same name for every repo passed to it. Can we make this more alligned with the repo name/title/functionality and add a time based 6 chars at the end to allow multiple versions of the same repo bundling. Do not change the logic to make the bundling, just work on renaming the output. Ensure special chars are taken care of before the final file is released
+
+SETTINGS: max_attempts=3 repair_attempts=3 partial_apply=True diagnose=True gap_decide=True patcher=gemma4:31b-cloud escalation=-
+
+===== 17:17:19 PATCH attempt 1 model=gemma4:31b-cloud prompt~5731 tokens, 3 file(s) shown =====
+FILE: bundling_engine.py
+<<<<<<< SEARCH
+def main() -> None:
+    """Orchestrates the bundling process by calling generate_bundle_filename to determine the output path before calling bundle_repo."""
+    raise NotImplementedError("contract: main")
+=======
+def main() -> None:
+    """Orchestrates the bundling process by calling generate_bundle_filename to determine the output path before calling bundle_repo."""
+    parser = argparse.ArgumentParser(description="Enterprise Repo Flat-File Bundler & Unbundler")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    # Bundle command
+    bundle_parser = subparsers.add_parser("bundle", help="Bundle a repository into a flat file")
+    bundle_parser.add_argument("repo_path", type=str, help="Path to the repository to bundle")
+    bundle_parser.add_argument("-o", "--output", type=str, help="Output bundle file path (optional)")
+    bundle_parser.add_argument("--ignore", nargs="*", default=[], help="Additional patterns to ignore")
+    bundle_parser.add_argument("--exclude-json", action="store_true", help="Exclude .json and .jsonl files")
+    bundle_parser.add_argument("--max-size", type=float, default=10.0, help="Max file size in MB (default: 10.0)")
+
+    # Unbundle command
+    unbundle_parser = subparsers.add_parser("unbundle", help="Reconstruct a repository from a bundle file")
+    unbundle_parser.add_argument("bundle_file", type=str, help="Path to the bundle file")
+    unbundle_parser.add_argument("target_dir", type=str, help="Directory to restore the repository into")
+    unbundle_parser.add_argument("--overwrite", action="store_true", help="Overwrite existing files in target directory")
+
+    args = parser.parse_args()
+
+    if args.command == "bundle":
+        repo_path = Path(args.repo_path)
+        
+        if args.output:
+            output_file = Path(args.output)
+        else:
+            # Use the new dynamic filename generation
+            generated_name = generate_bundle_filename(repo_path)
+            output_file = generated_name.with_suffix(".txt")
+
+        bundle_repo(
+            repo_path=repo_path,
+            output_file=output_file,
+            extra_ignores=args.ignore,
+            exclude_json_data=args.exclude_json,
+            max_file_size_mb=args.max_size
+        )
+    elif args.command == "unbundle":
+        unbundle_repo(
+            bundle_file=Path(args.bundle_file),
+            target_dir=Path(args.target_dir),
+            overwrite=args.overwrite
+        )
+>>>>>>> REPLACE

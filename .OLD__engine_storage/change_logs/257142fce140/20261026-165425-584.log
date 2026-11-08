@@ -1,0 +1,4 @@
+REQUEST (base revision 5):
+share the request journey for creating a dynamic fix and releasing the patch with plan develop validate phase
+
+SETTINGS: max_attempts=3 repair_attempts=3 partial_apply=True diagnose=True gap_decide=True patcher=gemma4:31b-cloud escalation=-
