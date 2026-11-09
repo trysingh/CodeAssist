@@ -535,6 +535,9 @@ def _newspaper3k(url: str, html: Optional[str] = None) -> StrategyResult:
 def _readability(html: str) -> StrategyResult:
     t0 = time.perf_counter()
     try:
+        # remove null bytes
+        if html:
+            html = "".join(ch for ch in html if ch == "\n" or ch == "\r" or ch == "\t" or ord(ch) >= 32)
         doc = Document(html)
         soup = BeautifulSoup(doc.summary(), "lxml")
         text = clean_text(soup.get_text(separator="\n"))
