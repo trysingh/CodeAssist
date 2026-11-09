@@ -26,5 +26,6 @@ os.environ["ENGINE_ACTION_LOG_ENABLED"] = "true"       # logging itself is harml
 os.environ["ENGINE_RETRIEVAL_MODE"] = "vector"         # legacy retrieval: vector search over code_chunks, no agentic switch
 os.environ["ENGINE_INGEST_MODE"] = "vector"            # ingest_repository embeds before returning, as it always did
 os.environ["ENGINE_VECTORIZE_FALLBACK"] = "off"        # never enqueue background jobs behind a legacy test's back
+os.environ["ENGINE_REPEAT_REQUEST_GUARD"] = "false"    # v3.2: legacy tests may repeat a request on purpose; the v3.2 tests opt in
 os.environ["ENGINE_WATCH_ON_INGEST"] = "false"         # no file-system observers started by ingest_repository in tests
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))

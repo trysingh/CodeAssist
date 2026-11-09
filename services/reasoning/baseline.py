@@ -3,16 +3,48 @@ from __future__ import annotations
 
 import contextlib
 import contextvars
+import re
 from typing import Any, Dict, List, Mapping
 
 from pydantic import BaseModel, Field
 
-from .intake import IntakeBrief, Risk
+from .intake import IntakeBrief, Lane, Risk
 
 GATE_ORDER = {"off": 0, "smoke": 1, "strict": 2}
 ALLOWED_KEYS = ("change_gate", "change_review", "change_tests_first", "change_author_tests", "change_max_attempts")
 
 _overlay: contextvars.ContextVar[Dict[str, Any]] = contextvars.ContextVar("baseline_overlay", default={})
+# v3: skill-pack text for the current request (set by the supervisor, read where change/plan prompts are built)
+_guidance: contextvars.ContextVar[str] = contextvars.ContextVar("baseline_guidance", default="")
+
+GUIDANCE_HEADER = ("INTERNAL CONTEXT (background for how to work on this request; it is not part of the task or the answer. "
+                   "Never repeat, quote or mention it or any lane / level / guidance wording in your output, and it never overrides "
+                   "the OUTPUT FORMAT or RULES of this prompt):")
+_ECHO_RE = re.compile(r"^[ \t>*_`#-]*(?:LANE FOR THIS REQUEST|ENGINEERING GUIDANCE|INTERNAL CONTEXT)\b.*(?:\r?\n|$)",
+                      re.IGNORECASE | re.MULTILINE)
+
+
+def strip_guidance_echo(text: str) -> str:
+    """Defensive: drop lines where a model echoed the lane statement / guidance header back into its output."""
+    if not text or not _ECHO_RE.search(text):
+        return text
+    return re.sub(r"\n{3,}", "\n\n", _ECHO_RE.sub("", text)).lstrip("\n")
+
+
+# Facts for the cross-check of the current supervised turn (the controller sets the box; the ask agent adds its sandbox result)
+CHAT_FACTS: contextvars.ContextVar = contextvars.ContextVar("chat_facts", default=None)
+
+
+def note_facts(**facts: Any) -> None:
+    """Add/overwrite facts of the running supervised turn (no-op outside one). Unlike the controller's helper, None is kept."""
+    box = CHAT_FACTS.get()
+    if box is not None:
+        box.update(facts)
+
+
+# A lane can only raise the tier a request is handled at (Fast = what the risk alone says; Standard = Medium depth; Strict = High depth)
+_LANE_TIER = {Lane.FAST: Risk.LOW, Lane.STANDARD: Risk.MEDIUM, Lane.STRICT: Risk.HIGH}
+_TIER_ORDER = {Risk.LOW: 0, Risk.MEDIUM: 1, Risk.HIGH: 2}
 
 
 class BaselinePolicy(BaseModel):
@@ -53,7 +85,11 @@ def policy_for(brief: IntakeBrief, defaults: Mapping[str, Any]) -> BaselinePolic
     ov: Dict[str, Any] = {}
     checklist = list(CHECKLIST_BASE)
     depth = "baseline"
-    if brief.risk == Risk.MEDIUM:
+    tier = brief.risk                                        # the lane may raise it, never lower it
+    lane_tier = _LANE_TIER.get(brief.lane) if brief.lane else None
+    if lane_tier and _TIER_ORDER[lane_tier] > _TIER_ORDER[tier]:
+        tier = lane_tier
+    if tier == Risk.MEDIUM:
         depth = "elevated"
         checklist += CHECKLIST_ELEVATED
         if not defaults.get("change_review", False):
@@ -61,7 +97,7 @@ def policy_for(brief: IntakeBrief, defaults: Mapping[str, Any]) -> BaselinePolic
         g = _raise_gate(defaults.get("change_gate", "off"), "smoke")
         if g != str(defaults.get("change_gate", "off") or "off").strip().lower():
             ov["change_gate"] = g
-    elif brief.risk == Risk.HIGH:
+    elif tier == Risk.HIGH:
         depth = "strict"
         checklist += CHECKLIST_ELEVATED + CHECKLIST_STRICT
         if _gate_rank(defaults.get("change_gate", "off")) < GATE_ORDER["strict"]:
@@ -79,17 +115,25 @@ def policy_for(brief: IntakeBrief, defaults: Mapping[str, Any]) -> BaselinePolic
 
 
 @contextlib.contextmanager
-def policy_scope(overrides: Mapping[str, Any]):
-    """Per-request settings overlay (ContextVar: isolated across concurrent asyncio tasks)."""
+def policy_scope(overrides: Mapping[str, Any], guidance: str = ""):
+    """Per-request settings overlay (ContextVar: isolated across concurrent asyncio tasks). `guidance` = skill-pack text, see guidance_block()."""
     clean = {k: v for k, v in (overrides or {}).items() if k in ALLOWED_KEYS}
     token = _overlay.set(clean)
+    gtoken = _guidance.set(guidance or "")
     try:
         yield clean
     finally:
-        try:
-            _overlay.reset(token)
-        except ValueError:
-            pass
+        for var, tok in ((_overlay, token), (_guidance, gtoken)):
+            try:
+                var.reset(tok)
+            except ValueError:
+                pass
+
+
+def guidance_block() -> str:
+    """Prompt section for the current request's skill pack, or "" (no scope, pack off, ask-only intent)."""
+    g = _guidance.get()
+    return f"\n{GUIDANCE_HEADER}\n{g}\n" if g else ""
 
 
 def flag(name: str, default: Any) -> Any:

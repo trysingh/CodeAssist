@@ -34,11 +34,15 @@ from services import action_log as al
 from services.agentic_search import AgenticSearch
 from services.vectorize_jobs import DbJobStore, JobState, VectorizeJobManager
 from services.reasoning import BaselinePolicy, IntakeAgent, IntakeBrief, ReasoningSupervisor, VerifierAgent
+from services.reasoning.baseline import CHAT_FACTS
+from services.reasoning.crosscheck import facts_from_sandbox
+from services.reasoning.stacking import find_repeat, repeat_reply
+from services.reasoning.skill_pack import guidance_for
 
 # Set by _chat_impl for the duration of one supervised turn (same asyncio task), read by _route_chat. Keeps _route_chat's
 # 4-argument signature (tests and subclasses rely on it) while letting the supervisor see the routing decision and collect facts.
 _PRE_DECISION: contextvars.ContextVar = contextvars.ContextVar("chat_pre_decision", default=None)
-_CHAT_FACTS: contextvars.ContextVar = contextvars.ContextVar("chat_facts", default=None)
+_CHAT_FACTS = CHAT_FACTS        # shared with services/code_agent.py (the ask agent adds its sandbox result), see reasoning/baseline.py
 
 class EngineController:
     """MVC Controller coordinating Repository Ingestion, Job Resumption, and Conversational RAG."""
@@ -80,12 +84,15 @@ class EngineController:
                 except Exception:   # noqa: BLE001 - the heuristics stand on their own
                     return {}
         return ReasoningSupervisor(
-            IntakeAgent(llm_json=llm_json), VerifierAgent(),
+            IntakeAgent(llm_json=llm_json, lane_override=settings.lane_override), VerifierAgent(),
             defaults_provider=lambda: {
                 "change_gate": settings.change_gate, "change_review": settings.change_review,
                 "change_tests_first": settings.change_tests_first, "change_author_tests": settings.change_author_tests,
                 "change_max_attempts": settings.change_max_attempts},
-            enabled=settings.reasoning_supervisor)
+            enabled=settings.reasoning_supervisor,
+            guidance_provider=lambda brief, _policy: guidance_for(
+                brief, enabled=settings.skill_pack_enabled, pack_dir=settings.skill_pack_dir,
+                max_chars=settings.skill_pack_max_chars))
 
     async def _warm_agentic(self, repo_id: str) -> None:
         """Build (or reuse) the repo's agentic searcher in the async path so the change graph's locator thread only reads it."""
@@ -737,12 +744,12 @@ class EngineController:
         query, web, decision = pre if pre is not None else await self._decide(repo_id, query, web)
         if repo_id == GENERAL_REPO_ID:
             if decision.intent == "help":
-                return COMMANDS_HELP
+                return decision.reply or COMMANDS_HELP
             if decision.intent in ("change", "plan") and decision.source == "prefix":
                 return "Code changes need a repository. Pick one in the selector, or ask your question here."
             return await self.rag_manager.invoke_chat(repo_id, thread_id, decision.query, web=web)
         if decision.intent == "help":
-            return COMMANDS_HELP
+            return decision.reply or COMMANDS_HELP
         if decision.intent == "plan":
             await self._warm_agentic(repo_id)
             return await self.change_service.plan_only(repo_id, decision.query,
@@ -750,17 +757,37 @@ class EngineController:
         if decision.intent == "change":
             ctx = await self._thread_context(thread_id)
             plan = await self._last_plan(thread_id, decision.query)
+            hit = await self._repeat_hit(repo_id, decision.query)
+            if hit is not None:         # same request as the latest unapplied revision: answer with it, no model call, no new revision
+                self._note_facts(skip_notes=True)
+                return repeat_reply(hit, repo_id)
             res = await self.propose_change(repo_id, decision.query, context=ctx, plan=plan)
-            t = res.tests or {}
-            ran = bool(t.get("ran")) and not t.get("inconclusive")
-            self._note_facts(tests_ran=ran, tests_passed=(bool(t.get("ok")) if ran else None),
-                             sandbox=(("passed" if t.get("ok") else "failed") if ran else None),
+            # tests_* only when real tests ran (count > 0); a boot / import check alone sets boot_checked / import_checked
+            try:        # best-effort: gathering facts for the notes must never fail the turn (the revision is already saved)
+                facts = facts_from_sandbox(res.tests or {})
+                facts.update(achieved_level=res.verification or facts.get("achieved_level"),     # one key, no duplicate kwargs
                              files_changed=[f.get("path") for f in (res.files or []) if f.get("path")] if res.ok else [],
-                             retrieval_mode=str(settings.retrieval_mode))
+                             retrieval_mode=str(settings.retrieval_mode),
+                             static_checked=True if res.ok else None,      # a saved proposal passed apply_check (edits applied + static checks)
+                             revision=res.revision if res.ok else None, plan=res.plan, change_files=list(res.files or []),
+                             stacked_on=list(res.stacked_on or []))        # for the plain summary at the top of the reply
+                self._note_facts(**facts)
+            except Exception as e:
+                sys.stdout.write(f"[REASONING] facts for the delivery notes skipped: {type(e).__name__}: {e}\n")
             return res.to_markdown()
         answer = await self.rag_manager.invoke_chat(repo_id, thread_id, decision.query, web=web)
         self._note_retrieval(thread_id)
         return answer
+
+    async def _repeat_hit(self, repo_id: str, query: str) -> Optional[dict]:
+        """The latest unapplied revision when `query` repeats its request (settings.repeat_request_guard), else None. Never raises."""
+        if not settings.repeat_request_guard:
+            return None
+        try:
+            return await find_repeat(self.repo_store, repo_id, query)
+        except Exception as e:  # noqa: BLE001 - the guard is an optimisation: on any problem build the change as usual
+            sys.stdout.write(f"[REASONING] repeat-request check skipped: {type(e).__name__}: {e}\n")
+            return None
 
     async def propose_change(self, repo_id: str, request: str, base_rev: Optional[int] = None,
                              context: str = "", plan: str = "", model: str = "") -> ChangeResult:

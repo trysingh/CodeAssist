@@ -73,3 +73,41 @@ SSE notifications gain `kind` (`log`, `action`, `job`), `request_id`, `thread_id
 | `WATCH_ON_INGEST` | `true` | start the file watcher as soon as a repo is ingested |
 
 Existing repos ingested before v2 keep working: their chunks count as a ready vector index, so they stay on vector/hybrid retrieval.
+
+
+## v3: skill pack & lanes
+Design: `docs/DESIGN_v3.md`. Changes: `CHANGELOG.md`.
+
+Each change / plan request is put in a **lane** by the intake step: **Fast** (presentational CSS, copy, docs, one-file renames, disposable scripts),
+**Standard** (the default) or **Strict** (High risk, auth, payments, migrations, IaC / CI-CD, front-end security triggers such as `innerHTML`,
+`eval`, tokens in `localStorage`, cookies, CSP, third-party scripts). The highest trigger wins and an unsure case takes the higher lane. A lane only
+raises the existing change gate / review / tests-first for that request, never lowers your settings. The lane, the recommended validation level
+and a verification label (Verified - executed in sandbox / container, Statically checked, Unverified (user must run)) appear in the Delivery notes;
+a Fast lane gets a few lines.
+
+The **skill pack** (`skills/risk-proportional-code-dev/`) is the written playbook the lane selects from: `SKILL.md` is always added to the
+change / plan prompts, the files in `references/` only when the lane needs them (validation ladder, regulated domains, delivery and review).
+Ask-only questions get none of it. To change the rules, edit the markdown (picked up on the next request, no restart). To swap the pack, point
+`ENGINE_SKILL_PACK_DIR` at another folder with a `SKILL.md` (frontmatter `name:` and `description:`) and the same four `references/*.md` file names.
+If the folder is missing or broken the request runs as in v2 and one line is logged.
+
+Force a lane for one request by writing `lane: fast` (or `lane: standard`, `use the strict lane`) in it, or for all requests with `ENGINE_LANE_OVERRIDE`.
+An override can raise a lane but cannot take a request below Strict while a Strict trigger is present.
+
+| Setting (env prefix `ENGINE_`) | Default | Meaning |
+|---|---|---|
+| `SKILL_PACK_ENABLED` | `true` | `false` = no skill text in prompts (lanes still raise the baseline policy and show in the notes) |
+| `SKILL_PACK_DIR` | `skills/risk-proportional-code-dev` | pack folder; a relative path is resolved against the project root |
+| `SKILL_PACK_MAX_CHARS` | `12000` | cap on the pack text added to a prompt (about 3k tokens; the full Strict set is about 10k characters) |
+| `LANE_OVERRIDE` | empty | `fast` / `standard` / `strict` for every request; empty = automatic |
+
+**v3.1 notes.** A request that mixes types (for example colours plus JavaScript audio) takes the highest lane of the types it touches. The Delivery notes end
+with a validation run: `Recommended: L1, L3 · Achieved: L1 (boot smoke)` and one line per recommended level saying whether it ran or was skipped and why.
+"Verified - executed in container: N sandbox tests passed" appears only when N tests really ran; a boot check alone is labelled as such. A message that starts
+with an unknown `/word` (for example `/apply`) gets an "Unknown command" reply with the command list instead of being answered as a question; paths such as
+`/home/x fails` are not commands. Use `/change` to propose a revision.
+
+**v3.2 notes.** A `/change` built on unapplied revisions says so ("Builds on unapplied revision(s) 22 ...") and gives the cumulative stats and the cumulative `.patch`. Asking
+again for what the latest unapplied revision already implements (request >= 90% similar) returns that revision with its apply links and makes no model call; add "redo",
+"again", "regenerate" or "from scratch" to rebuild, or set `ENGINE_REPEAT_REQUEST_GUARD=false`. A short **Summary** (changed / apply / verified / next) heads each saved change.
+

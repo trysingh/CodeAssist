@@ -26,6 +26,8 @@ from services.action_log import action as _action, log_action as _log_action
 from services import call_check, static_check
 from services.model_calls import parse_json_loose
 from services.patch_service import Edit, apply_edits, parse_edits, resolve_edit_paths
+from services.reasoning.baseline import guidance_block, note_facts
+from services.reasoning.crosscheck import facts_from_sandbox
 from services.sandbox_service import is_test_file
 
 PROTOCOL = """
@@ -501,7 +503,7 @@ class CodeAgent:
         if not snapshot:
             raise ValueError("the raw store has no files for this repo (re-ingest it)")
         tools = RepoTools(snapshot)
-        msgs: list = [SystemMessage(content=system + PROTOCOL)] + list(history)
+        msgs: list = [SystemMessage(content=system + guidance_block() + PROTOCOL)] + list(history)   # guidance: core skill text for an edit-like ask, "" otherwise
         final = await self._loop(repo_id, msgs, tools, settings.ask_max_steps)
         report = ""
         if settings.ask_validate:
@@ -584,6 +586,8 @@ class CodeAgent:
             return self._failed(perr)
         known = sorted(snapshot)
         edits, _notes, rerr = resolve_edit_paths([_strip_line_numbers(e) for e in edits], known)
+        # facts for the delivery notes (this check can run again after a repair: each run starts from "nothing verified")
+        note_facts(**{**facts_from_sandbox(None), "edits_proposed": True, "static_checked": False})
         if perr or rerr:
             return self._failed(list(perr) + list(rerr))
         paths = sorted({e.path for e in edits})
@@ -611,6 +615,7 @@ class CodeAgent:
             calls = []
         if calls:
             return self._failed(["call check: " + c for c in calls[:5]])
+        note_facts(static_checked=True)
 
         files = ", ".join(f"`{p}`" for p in sorted(working))
         head = f"\n\n---\n**Sandbox check of the proposed edit(s)** ({files}; applied to a copy, nothing was written to your repo)\n"
@@ -623,6 +628,7 @@ class CodeAgent:
         except Exception as e:  # noqa: BLE001
             return Check(report=head + applied + f"- **Not run in the sandbox:** {type(e).__name__}: {e}\n")
         t = v.to_dict()
+        note_facts(**facts_from_sandbox(t))
         if v.ran and not v.ok:
             from services.repo_change import RepoChangeService
             tops = {p.split("/")[0].removesuffix(".py") for p in list(snapshot) + list(working)}
@@ -631,6 +637,7 @@ class CodeAgent:
                 return self._failed([f"test {c.id} fails: {c.message}\n" + "\n".join("    " + l for l in c.detail.splitlines()[-14:])
                                      for c in real[:3]])
             t.update(ok=False, inconclusive=True, note="The failures come from the sandbox environment (missing package or network), not from the edit.")
+            note_facts(**facts_from_sandbox(t))
         from services.repo_change import ChangeResult
         line = ChangeResult(ok=True, repo_id=repo_id, request="", tests=t)._tests_line()
         tail = "- To get this as a saved, downloadable revision, send the request again with `/change`.\n"

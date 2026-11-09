@@ -165,6 +165,13 @@ class EngineSettings(BaseSettings):
     watch_on_ingest: bool = Field(default=True)        # start the file watcher for a repo right after it is ingested (False = only at app start)
     action_log_enabled: bool = Field(default=True)     # forward every agent/tool/LLM step to the Activity timeline (SSE + telemetry table)
 
+    # ---- v3: risk-proportional skill pack + lanes (docs/DESIGN_v3.md)
+    skill_pack_enabled: bool = Field(default=True)     # False = no skill text in prompts (lanes are still classified and raise the baseline policy)
+    skill_pack_dir: str = Field(default="skills/risk-proportional-code-dev")   # relative paths resolve against the project root; swap in your own pack here
+    skill_pack_max_chars: int = Field(default=12000)   # cap on the pack text added to a change/plan prompt (~3k tokens); the core SKILL.md comes first
+    repeat_request_guard: bool = Field(default=True)   # a /change that repeats the request of the latest unapplied revision is answered with that revision instead of regenerating it ("redo" overrides)
+    lane_override: str = Field(default="")             # "" = automatic | fast | standard | strict. Never takes a request below Strict when a Strict trigger is present
+
     # Notifiations Configuration
     notify_at_os_level: bool = Field(default=False)
 

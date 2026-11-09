@@ -58,6 +58,20 @@ code (find, grep, full files) before answering, and checks any fix it suggests i
 It uses the web only when needed (see the Web chip next to the message box)."""
 
 
+_KNOWN_COMMANDS = {"ask", "change", "fix", "edit", "implement", "plan", "web", "help", "commands"}
+_UNKNOWN_CMD = re.compile(r"^\s*/([A-Za-z][\w-]*)(?=\s|$)")      # "/word" then space or end; "/home/x" and "/v1/api" are paths, not commands
+
+
+def unknown_command(query: str) -> Optional[str]:
+    """The word of a leading "/word" that is not a known command, else None."""
+    m = _UNKNOWN_CMD.match(query or "")
+    return m.group(1) if m and m.group(1).lower() not in _KNOWN_COMMANDS else None
+
+
+def unknown_command_reply(word: str) -> str:
+    return (f"Unknown command `/{word}`. Did you mean `/change` (propose a revision) or `/ask`?\n\n" + COMMANDS_HELP)
+
+
 def is_help(query: str) -> bool:
     q = query.strip()
     return bool(_HELP_PREFIX.match(q) or (_STRONG_ASK.match(q) and _HELP_ASK.search(q) and _HELP_HINT.search(q)))
@@ -75,6 +89,7 @@ class RouteDecision:
     query: str             # message with any /prefix removed
     source: str            # prefix | model | rules
     confidence: float
+    reply: str = ""        # "help" only: text to show instead of the plain command list (e.g. an unknown-command hint)
 
 
 def route_by_rules(query: str) -> RouteDecision:
@@ -95,6 +110,9 @@ async def route_intent(query: str, *, noul_fn: NoulFn = decide_noul,
         word = m.group(1).lower()
         intent = "ask" if word == "ask" else "plan" if word == "plan" else "change"
         return RouteDecision(intent, query[m.end():].strip(), "prefix", 1.0)
+    bad = unknown_command(query)
+    if bad:         # never guess: "/apply ..." must not silently become a read-only ask. No model call.
+        return RouteDecision("help", query.strip(), "rules", 1.0, reply=unknown_command_reply(bad))
 
     q = query.strip()
     if not settings.router_auto:           # default: nothing is changed or planned unless the user typed /change, /fix, /plan ...
