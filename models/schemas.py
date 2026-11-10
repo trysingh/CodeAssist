@@ -63,3 +63,5 @@ class ChatRequest(BaseModel):
     query: str
     web: str = "auto"               # auto | on | off
     model: str = ""                 # empty = server default
+    runner: str = ""                # empty = the server's LLM_RUNNER; else a registered, configured runner (GET /api/v1/runners)
+    token_mode: str = ""            # empty = server setting; auto | lean | normal

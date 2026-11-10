@@ -131,6 +131,8 @@ const LS = {
 const GENERAL = '__general__';
 const S = { web: LS.get('web', 'auto'), repoId: null, threadId: null, repos: [], tab: null, sending: false, files: [], unread: 0, collapsed: LS.get('collapsed', null), poll: null, stream: null, streamKey: '', tlimit: LS.get('tlimit', null), abortController: null };
 S.model = LS.get('model', '');          // '' = server default
+S.runner = LS.get('runner', '');        // '' = the server's LLM_RUNNER; else a runner name from /api/v1/runners (chat only: embeddings never switch)
+S.tokenMode = LS.get('tokenMode', '');  // '' = the server's TOKEN_MODE until the user picks one; auto | lean | normal
 const AX = window.CodeAssistActivity;   // pure helpers from static/js/activity.js (loaded first)
 // Activity timeline state. events: uid -> ActionEvent (capped); rowIndex: merged-row lookup for lazy detail rendering.
 S.act = { events: new Map(), queries: {}, done: new Set(), groupOpen: new Map(), rowOpen: new Set(), phases: new Set(), failuresOnly: false, text: '', thisThread: false, dirty: false, liveDirty: false, raf: 0, hasRunning: false, repo: null };
@@ -154,7 +156,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     panel.dataset.open = String(isMobile() ? false : LS.get('threads', true));
     setupComposer();
     setupAttachments();
-    loadModels();
+    wireChatSettings();
+    loadRunners();      // fills the runner switch, then loadModels()
+    initTokenMode();
     syncLimitSelect(S.tlimit);
     buildActivityControls();
     setupNotificationStream();
@@ -306,7 +310,16 @@ function prettyMessage(ev) {
     if (ev.title === 'Telemetry Trace') {      // LLM trace: JSON payload -> one readable line
         try {
             const t = JSON.parse(ev.message);
-            return `${t.phase} · ${t.model} · in ${t.input_tokens} / out ${t.output_tokens} / total ${t.total_tokens} tok · ${t.duration_sec}s`;
+            const extra = (t.cached_input_tokens ? ` · cached ${t.cached_input_tokens}` : '') + (t.est_tokens_saved ? ` · saved ~${t.est_tokens_saved}` : '') +
+                (t.runner ? ` · ${t.runner}` : '') + (t.token_mode ? ` · mode ${t.token_mode}` : '');
+            return `${t.phase} · ${t.model} · in ${t.input_tokens} / out ${t.output_tokens} / total ${t.total_tokens} tok · ${t.duration_sec}s${extra}`;
+        } catch { /* not JSON: show as is */ }
+    }
+    if (ev.title === 'Token usage') {          // one summary line per question: the sum of its LLM calls
+        try {
+            const t = JSON.parse(ev.message);
+            return `${t.calls} call${t.calls === 1 ? '' : 's'} · in ${t.input_tokens}${t.cached_input_tokens ? ` (${t.cached_input_tokens} cached)` : ''} / out ${t.output_tokens} tok` +
+                `${t.est_tokens_saved ? ` · saved ~${t.est_tokens_saved}` : ''} · ${t.runner} · mode ${t.token_mode}`;
         } catch { /* not JSON: show as is */ }
     }
     return ev.message;
@@ -868,11 +881,76 @@ function renderAttachStrip() {
     icons();
 }
 
+/* Runner switch: the list comes from the server's registry, so a newly registered runner shows up by itself. */
+async function loadRunners() {
+    const sel = $('runner-select');
+    if (!sel) { loadModels(); return; }
+    try {
+        const r = await (await fetch('/api/v1/runners')).json();
+        const list = r.runners || [];
+        sel.innerHTML = `<option value="">Default (${esc(r.default)})</option>` + list.map(x =>
+            `<option value="${esc(x.name)}"${x.configured ? '' : ' disabled'} title="${esc(x.configured ? (x.remote ? 'remote / paid runner' : 'local runner') : (x.error || 'not configured'))}">${esc(x.name)}${x.remote ? ' ☁' : ''}${x.configured ? '' : ' (not set up)'}</option>`).join('');
+        S.defaultRunner = r.default; S.serverTokenMode = r.token_mode || 'auto';
+        const ok = list.find(x => x.name === S.runner && x.configured);
+        if (S.runner && !ok) { S.runner = ''; LS.set('runner', ''); }      // saved runner is gone or no longer configured
+        sel.value = S.runner;
+        sel.title = sel.ariaLabel = `Runner (chat model backend; default ${r.default})`;
+        initTokenMode();
+    } catch { /* stays on Default */ }
+    sel.onchange = () => { S.runner = sel.value; LS.set('runner', S.runner); loadModels(); };         // a model not offered by the new runner falls back to Default inside loadModels
+    loadModels();
+}
+
+function initTokenMode() {
+    const sel = $('token-mode-select'); if (!sel) return;
+    sel.value = S.tokenMode || S.serverTokenMode || 'auto';
+    sel.onchange = () => { S.tokenMode = sel.value; LS.set('tokenMode', S.tokenMode); };
+    updateSettingsChip();
+}
+
+/* Chat settings chip: runner / model / token mode stay collapsed behind one chip so the message box keeps its width. */
+function updateSettingsChip() {
+    const chip = $('settings-chip'), lab = $('settings-chip-label'), badge = $('settings-chip-mode');
+    if (!chip || !lab) return;
+    const picked = id => { const s = $(id); const o = s && s.selectedOptions && s.selectedOptions[0]; return o ? o.textContent.trim() : ''; };
+    const model = picked('model-select').replace(/^Default \((.*)\)$/, '$1') || 'Default model';
+    const runner = S.runner || S.defaultRunner || 'default';
+    const mode = ($('token-mode-select') || {}).value || 'auto';
+    lab.textContent = model;
+    if (badge) { badge.textContent = mode; badge.classList.toggle('hidden', mode === 'auto'); }
+    chip.title = `Runner: ${runner} · Model: ${model} · Tokens: ${mode}. Click to change.`;
+}
+
+function toggleChatSettings(open) {
+    const panel = $('chat-settings-panel'), chip = $('settings-chip'); if (!panel || !chip) return;
+    const show = open === undefined ? panel.classList.contains('hidden') : !!open;
+    panel.classList.toggle('hidden', !show);
+    chip.setAttribute('aria-expanded', String(show));
+    if (show) { const first = $('runner-select'); if (first) first.focus(); }
+}
+
+function wireChatSettings() {
+    ['runner-select', 'model-select', 'token-mode-select'].forEach(id => { const el = $(id); if (el) el.addEventListener('change', updateSettingsChip); });
+    document.addEventListener('click', e => {
+        const box = $('chat-settings');
+        if (box && !box.contains(e.target)) toggleChatSettings(false);
+    });
+    document.addEventListener('keydown', e => {
+        const panel = $('chat-settings-panel');
+        if (e.key === 'Escape' && panel && !panel.classList.contains('hidden')) { toggleChatSettings(false); const c = $('settings-chip'); if (c) c.focus(); }
+    });
+}
+
 async function loadModels() {
     const sel = $('model-select'); if (!sel) return;
     try {
-        const r = await (await fetch('/api/v1/models')).json();
-        // The list comes from the runner configured on the server (LLM_RUNNER): Ollama tags or the Cloudflare CF_MODELS list.
+        let res = await fetch('/api/v1/models' + (S.runner ? `?runner=${encodeURIComponent(S.runner)}` : ''));
+        if (res.status === 400 && S.runner) {      // the picked runner is not usable (any more): back to the server default
+            S.runner = ''; LS.set('runner', ''); const rs = $('runner-select'); if (rs) rs.value = '';
+            res = await fetch('/api/v1/models');
+        }
+        const r = await res.json();
+        // The list comes from the chosen runner (the switch, else LLM_RUNNER): Ollama tags or the Cloudflare CF_MODELS list.
         const runner = r.runner || 'ollama';
         const short = m => String(m).replace(/^@cf\/[^/]+\//, '');    // @cf/google/gemma-4-26b-a4b-it -> gemma-4-26b-a4b-it
         const models = (r.models || []).filter(m => m !== r.default);
@@ -887,6 +965,7 @@ async function loadModels() {
         sel.value = S.model === r.default ? '' : S.model;
     } catch { /* stays on Default */ }
     sel.onchange = () => { S.model = sel.value; LS.set('model', S.model); };
+    updateSettingsChip();
 }
 
 async function sendChatMessage(e) {
@@ -949,14 +1028,14 @@ async function sendChatMessage(e) {
         const signal = S.abortController.signal;
         if (files.length) {
             const fd = new FormData();
-            fd.append('repo_id', S.repoId); fd.append('thread_id', S.threadId); fd.append('query', query); fd.append('web', S.web); fd.append('model', S.model);
+            fd.append('repo_id', S.repoId); fd.append('thread_id', S.threadId); fd.append('query', query); fd.append('web', S.web); fd.append('model', S.model); fd.append('runner', S.runner); fd.append('token_mode', S.tokenMode);
             files.forEach(f => fd.append('files', f, f.name));
             res = await fetch('/api/v1/chat/attach', { method: 'POST', body: fd, signal });
         } else {
             res = await fetch('/api/v1/chat', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ repo_id: S.repoId, thread_id: S.threadId, query, web: S.web, model: S.model }),
+                body: JSON.stringify({ repo_id: S.repoId, thread_id: S.threadId, query, web: S.web, model: S.model, runner: S.runner, token_mode: S.tokenMode }),
                 signal
             });
         }

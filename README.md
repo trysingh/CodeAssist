@@ -130,4 +130,28 @@ Chat and embeddings go through `services/runners/`; the backend is a config choi
 | `CF_AI_GATEWAY_URL` | *(empty)* | optional base URL override (AI Gateway) |
 
 Not supported on `cloudflare`: `num_ctx` (ignored), `ask_reasoning` (ignored). The decision model (`/v1/systemone`) stays Ollama-only.
-Setup and troubleshooting: `docs/CLOUDFLARE_SETUP.md`. New backend: implement `services/runners/base.Runner` and call `register_runner(name, factory)`.
+Setup and troubleshooting: `docs/CLOUDFLARE_SETUP.md`.
+
+### Switching runner and token mode from the UI
+Next to the model picker the chat box has a **runner** select (built from `GET /api/v1/runners`, so a newly registered runner shows up by itself; runners that are not configured are disabled and show the reason as a tooltip) and a **Tokens: Auto / Lean / Normal** select. Both are saved in the browser (`runner`, `tokenMode`) and sent with every chat call (`runner`, `token_mode`; a runner that is unknown or not configured is answered with HTTP 400). Picking a runner reloads the model list (`GET /api/v1/models?runner=name`); a saved model that the new runner does not offer falls back to Default. The switch only affects **chat**: embeddings always stay on `EMBEDDING_RUNNER`, otherwise the vector index would stop matching.
+
+### Token mode (fewer billed tokens on remote runners)
+Every ask-agent step resends the whole conversation, so on a paid runner the tool output the agent has already read is billed again on each step. `TOKEN_MODE` controls how much is resent. `normal` is exactly the behaviour of earlier versions (same prompts, byte for byte).
+
+| Setting (env) | Default | Meaning |
+|---|---|---|
+| `TOKEN_MODE` | `auto` | `auto` = `lean` for remote runners (`Runner.remote = True`, i.e. Cloudflare) and `normal` for Ollama; `lean` / `normal` force it. The UI toggle overrides it per question |
+| `LEAN_ASK_MAX_STEPS`, `LEAN_ASK_OBS_CHARS`, `LEAN_ASK_READ_CHARS`, `LEAN_ASK_SEED_CHARS` | 6, 40000, 12000, 4000 | lean value of `ask_max_steps` / `ask_obs_chars` / `ask_read_chars` / `ask_seed_chars` (normal: 10 / 90000 / 30000 / 8000). A lean budget is never above the normal one |
+| `LEAN_SKILL_PACK_MAX_CHARS`, `LEAN_CHANGE_CONTEXT_CHARS` | 6000, 40000 | lean value of `skill_pack_max_chars` / `change_context_chars`. The skill text is added only to edit requests (and to edit-like asks, core only), as in normal mode |
+| `LEAN_KEEP_FULL_OBS` | 2 | the newest N tool outputs are resent in full; older ones become one line, e.g. `OBSERVATION (read) [compacted: services/x.py lines 1-185, 6,420 chars already seen; read again if needed]`. The model's own replies, the system prompt and your question are never touched |
+| `LEAN_HISTORY_TURNS` | 6 | earlier chat messages sent along with the question |
+| `MAX_INPUT_TOKENS` / `CF_MAX_INPUT_TOKENS` | unset / 60000 | estimated-token cap (characters / 4) for one call; `0` = off. `CF_MAX_INPUT_TOKENS` is the Cloudflare default and applies in lean mode; `MAX_INPUT_TOKENS`, when set, overrides it for every runner and also applies in normal mode on remote runners (a safety net). Over the cap the agent drops the oldest earlier chat messages first, then compacts older tool output; it logs what it trimmed and never drops the system prompt or your latest message |
+| `CF_SESSION_AFFINITY` | `true` | Cloudflare: send `x-session-affinity: <stable id per repo + chat thread>` so repeated prompt prefixes can hit the prompt cache |
+| `SHOW_TOKEN_FOOTER` | `true` | add `_Tokens: 18.2k in (6.1k cached) · 0.9k out · 6 calls · runner cloudflare · mode lean (saved ~31k)_` under each ask answer |
+
+Telemetry: every LLM call event carries runner, mode, input / output / cached tokens and the estimated tokens saved, and each question ends with one "Token usage" event (sum over its calls). Both appear in the Telemetry tab. "Saved" is an estimate (characters not sent / 4) from compaction, history trimming, the input cap, the lean read and seed budgets; step and observation-total budgets are not counted. Cached tokens are shown when the server reports them.
+
+### How to add a runner
+1. Write a class in `services/runners/` with `name`, `remote` (True = paid/remote, makes `TOKEN_MODE=auto` lean), `max_input_tokens` (0 = no cap), `supports`, and the methods `check_config()` (raise `RunnerConfigError`, no network), `map_model(model, vision=False)`, `chat(model, **kw)` (a LangChain chat model), `embeddings(model=None, ...)` and `async list_models()`. See `services/runners/base.py` for the exact contract and `ollama_runner.py` / `cloudflare_runner.py` for examples.
+2. Register it: `register_runner("myrunner", MyRunner)` (the registry in `services/runners/__init__.py`).
+3. That is all: `LLM_RUNNER=myrunner` works, and it shows up in `GET /api/v1/runners` and the UI runner select. Call sites always use `make_chat()` / `resolve_model()`, which honour the per-request runner.

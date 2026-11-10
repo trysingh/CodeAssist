@@ -6,6 +6,24 @@ from typing import Any, Dict, List, Optional, Callable
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.outputs import LLMResult
 
+def _cached_of(usage) -> int:
+    """Cached prompt tokens a server reported: usage_metadata.input_token_details.cache_read, or OpenAI's
+    prompt_tokens_details.cached_tokens (also Cloudflare's), or a flat cached_tokens. 0 when not reported."""
+    if not isinstance(usage, dict):
+        return 0
+    for outer, inner in (("input_token_details", "cache_read"), ("prompt_tokens_details", "cached_tokens")):
+        d = usage.get(outer)
+        if isinstance(d, dict) and d.get(inner):
+            try:
+                return int(d[inner])
+            except (TypeError, ValueError):
+                return 0
+    try:
+        return int(usage.get("cached_tokens") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 class StdoutTelemetryCallback(BaseCallbackHandler):
     """
     Traces every LLM & Embedding request and outputs structured telemetry to stdout.
@@ -18,6 +36,14 @@ class StdoutTelemetryCallback(BaseCallbackHandler):
         self.emitter = emitter # Function to send data to frontend
         self.start_time = 0.0
         self.prompts: List[str] = []
+        self.ledger = None                      # the question's TokenLedger (services/token_budget.py), when one is open
+        self.runner, self.token_mode = "", ""
+        try:
+            from services.token_budget import current_ledger, effective_mode
+            from services.runners import current_runner_name
+            self.ledger, self.runner, self.token_mode = current_ledger(), current_runner_name(), effective_mode()
+        except Exception:
+            pass
         try:
             self.encoder = tiktoken.get_encoding("cl100k_base")
         except Exception:
@@ -44,6 +70,7 @@ class StdoutTelemetryCallback(BaseCallbackHandler):
         elapsed = time.perf_counter() - self.start_time
         input_tokens = 0
         output_tokens = 0
+        cached_tokens = 0
 
         # Extract native Ollama / LangChain usage metadata if present
         for gen_list in response.generations:
@@ -53,12 +80,16 @@ class StdoutTelemetryCallback(BaseCallbackHandler):
                 if isinstance(usage, dict):
                     input_tokens += usage.get("input_tokens") or usage.get("prompt_eval_count") or usage.get("prompt_tokens") or 0
                     output_tokens += usage.get("output_tokens") or usage.get("eval_count") or usage.get("completion_tokens") or 0
+                    cached_tokens += _cached_of(usage)
+                if not cached_tokens:           # OpenAI-shaped: response_metadata.token_usage.prompt_tokens_details.cached_tokens
+                    cached_tokens += _cached_of((getattr(msg, "response_metadata", None) or {}).get("token_usage"))
         # OpenAI-shaped servers report the totals once per call in llm_output["token_usage"]
         if input_tokens == 0 and output_tokens == 0:
             tu = (getattr(response, "llm_output", None) or {}).get("token_usage")
             if isinstance(tu, dict):
                 input_tokens = tu.get("prompt_tokens") or 0
                 output_tokens = tu.get("completion_tokens") or 0
+                cached_tokens = cached_tokens or _cached_of(tu)
 
         # Fallback to Rust-based tiktoken calculation
         if input_tokens == 0:
@@ -69,6 +100,15 @@ class StdoutTelemetryCallback(BaseCallbackHandler):
                     output_tokens += self._count_tokens(gen.text)
 
         total_tokens = input_tokens + output_tokens
+        cached_tokens = min(int(cached_tokens or 0), input_tokens)
+        saved_tokens = 0
+        if self.ledger is not None:
+            try:
+                saved_tokens = self.ledger.record(
+                    runner=self.runner, model=self.model_name, phase=str(self.phase), token_mode=self.token_mode,
+                    input_tokens=input_tokens, output_tokens=output_tokens, cached_input_tokens=cached_tokens).est_tokens_saved
+            except Exception:
+                pass
 
         telemetry_data = {
             "timestamp": time.strftime("%H:%M:%S"),
@@ -78,7 +118,11 @@ class StdoutTelemetryCallback(BaseCallbackHandler):
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
             "total_tokens": total_tokens,
-            "duration_sec": int(elapsed)
+            "duration_sec": int(elapsed),
+            "runner": self.runner,
+            "token_mode": self.token_mode,
+            "cached_input_tokens": cached_tokens,
+            "est_tokens_saved": saved_tokens,
         }
 
 
@@ -99,7 +143,9 @@ class StdoutTelemetryCallback(BaseCallbackHandler):
             from services.action_log import log_action
             log_action(phase="LLM", agent=str(self.phase), action="llm_call", status="ok",
                        detail=f"{self.model_name}: {input_tokens} in / {output_tokens} out",
-                       data={"input_tokens": input_tokens, "output_tokens": output_tokens, "total_tokens": total_tokens},
+                       data={"input_tokens": input_tokens, "output_tokens": output_tokens, "total_tokens": total_tokens,
+                             "runner": self.runner, "token_mode": self.token_mode, "cached_input_tokens": cached_tokens,
+                             "est_tokens_saved": saved_tokens},
                        model=self.model_name, duration_ms=int(elapsed * 1000), repo_id=self.repo_id or None)
         except Exception:
             pass

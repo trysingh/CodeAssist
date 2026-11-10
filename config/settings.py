@@ -1,7 +1,7 @@
 from pathlib import Path
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import AliasChoices, Field
-from typing import List
+from typing import List, Optional
 
 # Root project directory anchor (relative to settings.py)
 PROJECT_ROOT = Path(__file__).resolve().parent.parent if Path(__file__).resolve().parent.name == "core" else Path(__file__).resolve().parent
@@ -65,6 +65,29 @@ class EngineSettings(BaseSettings):
     cf_models_cache_s: int = Field(default=600, validation_alias=AliasChoices("ENGINE_CF_MODELS_CACHE_S", "CF_MODELS_CACHE_S"))
     cf_timeout_s: float = Field(default=120.0)
     cf_max_retries: int = Field(default=2)
+    # Cloudflare prompt caching: every call of one chat thread carries the same `x-session-affinity` header so the platform can
+    # route it to the instance that already holds the prompt prefix (cached input tokens are billed lower).
+    cf_session_affinity: bool = Field(default=True, validation_alias=AliasChoices("ENGINE_CF_SESSION_AFFINITY", "CF_SESSION_AFFINITY"))
+    # Input cap (estimated tokens, chars/4) per call. Cloudflare default 60000; 0 = off. MAX_INPUT_TOKENS (when set) overrides the
+    # runner's own value for every runner. The cap trims (oldest history first, then old tool output) and logs; it never drops the
+    # system prompt or the latest user message. It applies in lean mode; in normal mode only when MAX_INPUT_TOKENS is set explicitly.
+    cf_max_input_tokens: int = Field(default=60000, validation_alias=AliasChoices("ENGINE_CF_MAX_INPUT_TOKENS", "CF_MAX_INPUT_TOKENS"))
+    max_input_tokens: Optional[int] = Field(default=None, validation_alias=AliasChoices("ENGINE_MAX_INPUT_TOKENS", "MAX_INPUT_TOKENS"))
+
+    # ---- token mode (services/token_budget.py): spend fewer tokens on paid / remote runners ----
+    # "auto" = lean for remote runners (Cloudflare), normal for Ollama. "lean" / "normal" force it. The chat request may override it per question.
+    # normal = exactly the behaviour (and the prompts) of the versions before token modes existed.
+    token_mode: str = Field(default="auto", validation_alias=AliasChoices("ENGINE_TOKEN_MODE", "TOKEN_MODE"))
+    # Lean budgets: used instead of the normal one (never above it). Names mirror the normal setting: lean_<name>.
+    lean_ask_max_steps: int = Field(default=6, validation_alias=AliasChoices("ENGINE_LEAN_ASK_MAX_STEPS", "LEAN_ASK_MAX_STEPS"))
+    lean_ask_obs_chars: int = Field(default=40000, validation_alias=AliasChoices("ENGINE_LEAN_ASK_OBS_CHARS", "LEAN_ASK_OBS_CHARS"))
+    lean_ask_read_chars: int = Field(default=12000, validation_alias=AliasChoices("ENGINE_LEAN_ASK_READ_CHARS", "LEAN_ASK_READ_CHARS"))
+    lean_ask_seed_chars: int = Field(default=4000, validation_alias=AliasChoices("ENGINE_LEAN_ASK_SEED_CHARS", "LEAN_ASK_SEED_CHARS"))
+    lean_skill_pack_max_chars: int = Field(default=6000, validation_alias=AliasChoices("ENGINE_LEAN_SKILL_PACK_MAX_CHARS", "LEAN_SKILL_PACK_MAX_CHARS"))
+    lean_change_context_chars: int = Field(default=40000, validation_alias=AliasChoices("ENGINE_LEAN_CHANGE_CONTEXT_CHARS", "LEAN_CHANGE_CONTEXT_CHARS"))
+    lean_keep_full_obs: int = Field(default=2, validation_alias=AliasChoices("ENGINE_LEAN_KEEP_FULL_OBS", "LEAN_KEEP_FULL_OBS"))     # newest tool outputs sent in full; older ones become a one-line stub
+    lean_history_turns: int = Field(default=6, validation_alias=AliasChoices("ENGINE_LEAN_HISTORY_TURNS", "LEAN_HISTORY_TURNS"))     # prior chat messages kept (plus the current question)
+    show_token_footer: bool = Field(default=True, validation_alias=AliasChoices("ENGINE_SHOW_TOKEN_FOOTER", "SHOW_TOKEN_FOOTER"))     # "_Tokens: ..._" line under an ask answer
 
     llm_model: str = Field(default=DEFAULT_MODEL)
     llm_fallback_model: str = Field(default="")        # ENGINE_LLM_FALLBACK_MODEL: a LOCAL chat model used when the chosen model is refused for credits/usage (Ollama Cloud: HTTP 402). Empty = no fallback; the chat shows the reason instead
@@ -271,4 +294,4 @@ settings = EngineSettings()
 
 # Note: Call settings.ensure_dirs() during FastAPI lifespan/startup,
 # rather than at module import level, to avoid permission issues during builds/tests.
-settings.ensure_dirs()
+settings.ensure_dirs()

@@ -239,10 +239,44 @@
                                             data-mode="auto" aria-label="Web search mode">
                                             <span id="web-btn-label">🌐 Auto</span>
                                         </button>
-                                        <select id="model-select" aria-label="Reasoning model" title="Reasoning model"
-                                            class="order-3 sm:order-1 flex-1 sm:flex-none min-w-0 h-9 max-w-none sm:max-w-[9.5rem] px-2 rounded-xl text-xs bg-slate-100 dark:bg-slate-900 border border-slate-300 dark:border-slate-700 text-slate-900 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white focus:outline-none truncate">
-                                            <option value="">Default model</option>
+                                        <!-- Chat settings: one compact chip; runner / model / token mode open in a panel above the composer -->
+                                        <div id="chat-settings" class="relative order-3 sm:order-1 shrink-0 min-w-0">
+                                            <button id="settings-chip" type="button" onclick="toggleChatSettings()"
+                                                aria-expanded="false" aria-controls="chat-settings-panel" title="Chat settings"
+                                                class="h-9 max-w-[10.5rem] px-2.5 rounded-xl text-xs font-medium border border-slate-300 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white hover:bg-slate-200 dark:hover:bg-slate-800 aria-expanded:border-blue-500/50 aria-expanded:text-blue-300 flex items-center gap-1.5 transition-colors">
+                                                <i data-lucide="sliders-horizontal" class="w-3.5 h-3.5 shrink-0"></i>
+                                                <span id="settings-chip-label" class="truncate">Model</span>
+                                                <span id="settings-chip-mode" class="hidden shrink-0 px-1 rounded bg-blue-600/15 text-blue-300 text-[10px] uppercase"></span>
+                                            </button>
+                                            <div id="chat-settings-panel" role="dialog" aria-label="Chat settings"
+                                                class="hidden absolute bottom-full mb-2 left-0 z-30 w-72 max-w-[calc(100vw-2.5rem)] p-3 rounded-xl bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 shadow-xl space-y-2.5">
+                                                <div class="flex items-center justify-between">
+                                                    <span class="text-xs font-semibold text-slate-700 dark:text-slate-200">Chat settings</span>
+                                                    <button type="button" onclick="toggleChatSettings(false)" class="w-6 h-6 rounded-md text-slate-400 hover:text-slate-900 dark:hover:text-white hover:bg-slate-200 dark:hover:bg-slate-800 flex items-center justify-center" aria-label="Close settings">&#x2715;</button>
+                                                </div>
+                                                <label class="block text-[11px] font-medium text-slate-500">Runner
+                                                    <select id="runner-select" aria-label="Runner" title="Runner (chat model backend)"
+                                            class="mt-1 w-full h-9 px-2 rounded-lg text-xs bg-slate-100 dark:bg-slate-800 border border-slate-300 dark:border-slate-700 text-slate-900 dark:text-slate-200 focus:outline-none focus:border-blue-500/70">
+                                            <option value="">Default runner</option>
                                         </select>
+                                                </label>
+                                                <label class="block text-[11px] font-medium text-slate-500">Model
+                                                    <select id="model-select" aria-label="Reasoning model" title="Reasoning model"
+                                            class="mt-1 w-full h-9 px-2 rounded-lg text-xs bg-slate-100 dark:bg-slate-800 border border-slate-300 dark:border-slate-700 text-slate-900 dark:text-slate-200 focus:outline-none focus:border-blue-500/70">
+                                            <option value="">Default model</option>
+                                        </select>
+                                                </label>
+                                                <label class="block text-[11px] font-medium text-slate-500">Token mode
+                                                    <select id="token-mode-select" aria-label="Token mode" title="Token mode: Auto = lean on paid runners, Lean = fewer tokens, Normal = full context"
+                                            class="mt-1 w-full h-9 px-2 rounded-lg text-xs bg-slate-100 dark:bg-slate-800 border border-slate-300 dark:border-slate-700 text-slate-900 dark:text-slate-200 focus:outline-none focus:border-blue-500/70">
+                                            <option value="auto" title="Lean on paid (remote) runners, normal on local ones">Tokens: Auto</option>
+                                            <option value="lean" title="Smaller context, old tool output compacted">Tokens: Lean</option>
+                                            <option value="normal" title="Full context, as before">Tokens: Normal</option>
+                                        </select>
+                                                </label>
+                                                <p class="text-[10px] leading-snug text-slate-500">Auto = lean on paid runners, normal on local ones. Normal sends full context, as before. Saved in this browser.</p>
+                                            </div>
+                                        </div>
                                         <button id="stop-chat-btn" type="button"
                                             class="hidden order-4 ml-auto sm:ml-0 shrink-0 w-9 h-9 rounded-xl bg-red-600 hover:bg-red-500 text-white flex items-center justify-center transition-colors"
                                             aria-label="Stop" title="Stop generation">
@@ -478,7 +512,7 @@
     </div>
 
     <script src="/static/js/activity.js?v=1"></script>
-    <script src="/static/js/app.js?v=4"></script>
+    <script src="/static/js/app.js?v=5"></script>
 </body>
 
-</html>
+</html>

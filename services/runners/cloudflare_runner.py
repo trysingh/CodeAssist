@@ -10,7 +10,8 @@ Differences from Ollama that this class absorbs:
   * `num_ctx` does not exist (the context window is the model's): ignored;
   * json mode is `response_format={"type": "json_object"}`;
   * `reasoning` has no portable equivalent on this endpoint: ignored (best effort);
-  * the output cap is `max_tokens`.
+  * the output cap is `max_tokens`;
+  * prompt caching: the `x-session-affinity` header carries a stable id per repo + chat thread (settings.cf_session_affinity).
 """
 from __future__ import annotations
 
@@ -20,9 +21,11 @@ from typing import Any, List, Optional
 
 from config.settings import settings
 from services.runners.base import RunnerConfigError
+from services.runners.scope import current_session_key
 
 ACCOUNT_BASE = "https://api.cloudflare.com/client/v4/accounts/{account}/ai/v1"
 MODELS_SEARCH = "https://api.cloudflare.com/client/v4/accounts/{account}/ai/models/search"
+SESSION_AFFINITY_HEADER = "x-session-affinity"
 CHAT_TASK = "Text Generation"
 # Only Workers AI hosted models: the catalogue also lists proxied third-party models, which are billed and called differently.
 HOSTED_PREFIXES = ("@cf/", "@hf/")
@@ -37,7 +40,12 @@ def is_ollama_style(model: str) -> bool:
 
 class CloudflareRunner:
     name = "cloudflare"
+    remote = True
     supports = {"vision": True, "json": True, "reasoning": False, "num_ctx": False, "embeddings": True}
+
+    @property
+    def max_input_tokens(self) -> int:
+        return max(0, int(settings.cf_max_input_tokens))
 
     # ------------------------------------------------------------------ config
     def check_config(self) -> None:
@@ -83,6 +91,9 @@ class CloudflareRunner:
             kw["max_tokens"] = max_tokens
         if json_mode:
             kw["model_kwargs"] = {"response_format": {"type": "json_object"}}
+        sid = current_session_key()
+        if settings.cf_session_affinity and sid:       # same id for every call of one chat thread -> prompt-prefix cache hits
+            kw["default_headers"] = {SESSION_AFFINITY_HEADER: sid}
         return cls(**kw)
 
     def embeddings(self, model: Optional[str] = None, *, embeddings_cls: Any = None) -> Any:

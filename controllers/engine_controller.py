@@ -5,6 +5,7 @@ import sys
 import time
 import re
 import asyncio
+import contextlib
 import contextvars
 import uuid
 import orjson
@@ -30,6 +31,8 @@ from services.patch_service import join_diffs, make_diff
 from services.apply_service import apply_revision as apply_revision_to_disk
 from services.apply_service import disk_conflicts
 from services.model_calls import model_scope
+from services.runners import current_session_key, runner_scope, thread_scope
+from services.token_budget import budget, token_mode_scope
 from services import action_log as al
 from services.agentic_search import AgenticSearch
 from services.vectorize_jobs import DbJobStore, JobState, VectorizeJobManager
@@ -92,7 +95,7 @@ class EngineController:
             enabled=settings.reasoning_supervisor,
             guidance_provider=lambda brief, _policy: guidance_for(
                 brief, enabled=settings.skill_pack_enabled, pack_dir=settings.skill_pack_dir,
-                max_chars=settings.skill_pack_max_chars))
+                max_chars=budget("skill_pack_max_chars")))
 
     async def _warm_agentic(self, repo_id: str) -> None:
         """Build (or reuse) the repo's agentic searcher in the async path so the change graph's locator thread only reads it."""
@@ -599,7 +602,8 @@ class EngineController:
         return await self.db.list_repos()
 
     async def _chat_impl(self, repo_id: str, thread_id: str, query: str, web: str,
-                       attachments: Optional[List[dict]], model: str, request_id: Optional[str] = None) -> str:
+                       attachments: Optional[List[dict]], model: str, request_id: Optional[str] = None,
+                       runner: str = "", token_mode: str = "") -> str:
         """Actual chat execution - extracted for task tracking and cancellation support.
         Every step logged below carries `request_id` (the Activity timeline groups by it)."""
         await self.db.init_db()
@@ -615,7 +619,8 @@ class EngineController:
                     query, note = found.request, found.note()
                 elif not query.strip():
                     query = "Please review the attached content."
-            with repo_scope(repo_id), model_scope(model):
+            # runner / token_mode: the UI's per-request picks (validated by the API layer). Chat only: embeddings stay on settings.embedding_runner.
+            with repo_scope(repo_id), model_scope(model), runner_scope(runner), token_mode_scope(token_mode), thread_scope(repo_id, thread_id):
                 supervisor = getattr(self, "supervisor", None)
                 if supervisor is None or not supervisor.enabled or repo_id == GENERAL_REPO_ID:
                     return note + await self._route_chat(repo_id, thread_id, query, web)
@@ -644,7 +649,7 @@ class EngineController:
 
     async def chat_with_repo(self, repo_id: str, thread_id: str, query: str, web: str = "auto",
                              attachments: Optional[List[dict]] = None, model: str = "",
-                             request_id: Optional[str] = None) -> str:
+                             request_id: Optional[str] = None, runner: str = "", token_mode: str = "") -> str:
         """Attachments = prepared attachments of THIS message. Supports cancellation via stop_chat().
         request_id: the caller may pre-generate it (the API returns it with the answer); default = generated per turn."""
         if not hasattr(self, 'active_chats'):
@@ -657,7 +662,7 @@ class EngineController:
             if prev and not prev.done():
                 prev.cancel()
             task = asyncio.create_task(
-                self._chat_impl(repo_id, thread_id, query, web, attachments, model, request_id),
+                self._chat_impl(repo_id, thread_id, query, web, attachments, model, request_id, runner, token_mode),
                 name=f"chat-{thread_id}"
             )
             self.active_chats[thread_id] = task
@@ -790,12 +795,15 @@ class EngineController:
             return None
 
     async def propose_change(self, repo_id: str, request: str, base_rev: Optional[int] = None,
-                             context: str = "", plan: str = "", model: str = "") -> ChangeResult:
+                             context: str = "", plan: str = "", model: str = "",
+                             runner: str = "", token_mode: str = "") -> ChangeResult:
         await self.db.init_db()
         if not await self.db.get_repo(repo_id):
             raise ValueError(f"Repository ID '{repo_id}' not found.")
         await self._warm_agentic(repo_id)        # the change graph's locator thread only reads this cache
-        with model_scope(model):
+        # called from a chat turn the scopes are already set (and thread_scope must keep that thread); /changes sets its own
+        with model_scope(model), runner_scope(runner), token_mode_scope(token_mode), \
+                (contextlib.nullcontext() if current_session_key() else thread_scope(repo_id, "change")):
             return await self.change_service.run(repo_id, request, base_rev, context=context, plan=plan)
 
     async def list_revisions(self, repo_id: str) -> list:
@@ -929,4 +937,4 @@ class EngineController:
             f"Repository {repo_id} has been permanently deleted.", 
             level="SUCCESS", 
             repo_id=repo_id
-        )
+        )

@@ -9,12 +9,16 @@ from config.settings import settings
 
 class OllamaRunner:
     name = "ollama"
+    remote = False
+    max_input_tokens = 0
     supports = {"vision": True, "json": True, "reasoning": True, "num_ctx": True, "embeddings": True}
 
     def check_config(self) -> None:
         return None
 
     def map_model(self, model: str, *, vision: bool = False) -> str:
+        if (model or "").startswith(("@cf/", "@hf/")):      # a Cloudflare id from the UI picker after a per-request switch to Ollama
+            return settings.llm_model
         return model
 
     def chat(self, model: str, *, temperature: float = 0, max_tokens: Optional[int] = None, json_mode: bool = False,

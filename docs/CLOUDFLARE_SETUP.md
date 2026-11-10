@@ -117,6 +117,30 @@ Notes:
 - Workers AI does not host Gemma 4 31B. The closest option is `gemma-4-26b-a4b-it` (26B MoE, about 4B active, 256K context, per project notes). Output quality may differ.
 - The decision/router model (tev1 via `/v1/systemone`) still needs Ollama running locally.
 
+## 5b. Cost control: token mode, prompt caching, UI switch
+
+Cloudflare bills every token and the ask agent resends the whole conversation on each step, so `TOKEN_MODE=auto` (the default) runs **lean** on this runner. Settings (all optional, `.env`):
+
+```bash
+TOKEN_MODE=auto              # auto | lean | normal ; normal = exactly the old prompts
+LEAN_ASK_MAX_STEPS=6         # normal 10
+LEAN_ASK_OBS_CHARS=40000     # normal 90000
+LEAN_ASK_READ_CHARS=12000    # normal 30000
+LEAN_ASK_SEED_CHARS=4000     # normal 8000
+LEAN_SKILL_PACK_MAX_CHARS=6000
+LEAN_CHANGE_CONTEXT_CHARS=40000
+LEAN_KEEP_FULL_OBS=2         # older tool output is replaced by a one-line stub
+LEAN_HISTORY_TURNS=6
+CF_MAX_INPUT_TOKENS=60000    # estimated-token cap per call (lean mode); 0 = off
+# MAX_INPUT_TOKENS=...       # overrides the cap for every runner, also in normal mode on remote runners
+CF_SESSION_AFFINITY=true     # x-session-affinity header per repo + thread, for prompt caching
+SHOW_TOKEN_FOOTER=true       # "_Tokens: ..._" line under ask answers
+```
+
+- **Prompt caching:** with `CF_SESSION_AFFINITY=true` all calls of one chat thread carry the same `x-session-affinity` id (a hash, no repo or thread names). Whether a call was served from cache is reported by the API as cached prompt tokens; the footer and the Telemetry tab show them as "cached" when present. **[unverified]** Which models support caching and how cached tokens are billed was not checked against the Cloudflare docs; compare the cached counts and your dashboard.
+- **In the UI:** the runner select next to the model picker switches between configured runners per question (for example Ollama for quick questions, Cloudflare for hard ones); the **Tokens** select forces Auto / Lean / Normal. Embeddings never follow the runner select.
+- **What you see:** each answer ends with the token line, and the Telemetry tab lists per-call runner, mode, in / out / cached tokens and estimated saving, plus one summary per question.
+
 ## 6. Switching back and mixing runners
 
 - **Back to local:** set `LLM_RUNNER=ollama` (the default) and restart `python run.py`.

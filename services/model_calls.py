@@ -12,7 +12,8 @@ from typing import Awaitable, Callable, Optional
 
 from config.settings import settings
 from services.llm_errors import with_model_fallback
-from services.runners import MODEL_NAME, get_runner
+from services.runners import MODEL_NAME, get_runner, runner_scope           # noqa: F401  (runner_scope: re-exported next to model_scope)
+from services.token_budget import effective_mode, token_mode_scope           # noqa: F401  (same: the per-request token-mode pick)
 from contextlib import contextmanager
 from contextvars import ContextVar
 
@@ -40,10 +41,11 @@ def model_scope(model: str):
 def reasoning_model(default: str = "") -> str:
     return _model_override.get() or default or settings.llm_model
 
-async def list_chat_models() -> list:
-    """Chat models of the configured runner (Ollama: GET /api/tags, embedding models hidden). Never raises."""
+async def list_chat_models(runner: Optional[str] = None) -> list:
+    """Chat models of `runner` (None = the request's runner_scope, else settings.llm_runner; Ollama: GET /api/tags, embedding
+    models hidden). Never raises."""
     try:
-        return await get_runner().list_models()
+        return await get_runner(runner).list_models()
     except Exception:  # noqa: BLE001
         return []
 

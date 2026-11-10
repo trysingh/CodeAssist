@@ -42,6 +42,7 @@ from services.sandbox_service import CaseResult, SandboxService, SandboxVerdict
 from services import gates
 from services.action_log import action as _action
 from services.reasoning.baseline import flag, guidance_block, strip_guidance_echo
+from services.token_budget import budget
 from services.reasoning.stacking import stack_info, stack_note
 
 if TYPE_CHECKING:  # avoid importing chroma/ollama just to type-hint
@@ -736,7 +737,7 @@ class RepoChangeService:
             what = self._plan_lines(state.get("plan", ""), [path])
             done = await self._done_diff({**state, "working": working}, skip=[path], limit=5000)
             prompt = _GAP_PROMPT.format(request=state["request"], path=path, what="\n".join(what) or "(the plan names the file only)",
-                                        done=done or "(nothing yet)", text=text[: max(4000, settings.change_context_chars // 2)])
+                                        done=done or "(nothing yet)", text=text[: max(4000, budget('change_context_chars') // 2)])
             model = self._role_model("diagnoser")
             raw = (await self.llm_text(model, prompt, phase="GAP", repo_id=state["repo_id"], num_predict=700)).strip()
             self._log(state, f"GAP CHECK {path} ({model})", raw[:3000])
@@ -973,7 +974,7 @@ class RepoChangeService:
             if data is None:
                 continue
             text = data.decode("utf-8", errors="replace").replace("\r\n", "\n")
-            if used + len(text) > settings.change_context_chars:
+            if used + len(text) > budget('change_context_chars'):
                 dropped.append(p)       # reported below, never silent
                 continue
             used += len(text)
@@ -987,13 +988,13 @@ class RepoChangeService:
         lost = [p for p in dropped if p in planned]
         if lost and attempt == 1:       # nothing built yet: say so now instead of producing a half change
             return {"attempt": attempt, "status": "failed", "notes": notes,
-                    "errors": [f"Planned file(s) do not fit the context budget ({used} of {settings.change_context_chars} "
+                    "errors": [f"Planned file(s) do not fit the context budget ({used} of {budget('change_context_chars')} "
                                f"chars already used): {', '.join(lost)}. Split the request into smaller /change steps "
                                f"(one layer at a time) or raise ENGINE_CHANGE_CONTEXT_CHARS."]}
         if not blocks:
             return {"attempt": attempt, "status": "failed", "notes": notes,
                     "errors": [f"No target file fits the context budget "
-                               f"({settings.change_context_chars} chars): {', '.join(dropped)}"]}
+                               f"({budget('change_context_chars')} chars): {', '.join(dropped)}"]}
 
         fb = ""
         if state["feedback"]:
@@ -2079,4 +2080,4 @@ class RepoChangeService:
             {"persist": "persist", "patch": "patch", "fix_tasks": "fix_tasks", END: END})
         g.add_edge("fix_tasks", "apply_check")
         g.add_edge("persist", END)
-        return g.compile()
+        return g.compile()

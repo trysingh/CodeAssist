@@ -2,7 +2,8 @@
 
 A runner builds LangChain chat / embedding clients for one backend (Ollama, Cloudflare Workers AI, ...). Call sites never
 import a provider package; they ask `services.runners` for a client, so the backend is a config choice (settings.llm_runner /
-settings.embedding_runner). To add a runner: implement this protocol in a new module and `register_runner("name", Factory)`.
+settings.embedding_runner, or per request from the UI). To add a runner: implement this protocol in a new module and
+`register_runner("name", Factory)` (the runner list in the UI is built from the registry).
 """
 from __future__ import annotations
 
@@ -20,6 +21,10 @@ class RunnerConfigError(RuntimeError):
 @runtime_checkable
 class Runner(Protocol):
     name: str
+    # True = a remote / paid service (every token is billed): TOKEN_MODE=auto then runs lean. False = local (Ollama).
+    remote: bool
+    # Estimated-token cap for one call's input (0 = none); the ask agent trims history / old tool output to stay under it.
+    max_input_tokens: int
     # What the backend can do: {"vision": bool, "json": bool, "reasoning": bool, "num_ctx": bool, "embeddings": bool}
     supports: Dict[str, bool]
 

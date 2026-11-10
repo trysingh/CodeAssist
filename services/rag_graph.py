@@ -18,6 +18,7 @@ import asyncio
 from models.schemas import GENERAL_REPO_ID
 from services.model_calls import reasoning_arg, reasoning_model, chat_base_url
 from services.runners import make_chat
+from services.token_budget import budget, is_lean, note_saved, trim_history
 from services.llm_errors import ModelQuotaError, fallback_note, fallback_scope, with_model_fallback
 from services.agentic_search import AgenticSearch, RepoCorpus, needs_vectors
 from services.code_agent import EmptyModelReply, clean_reply, describe_meta, leads_from_context, reply_meta
@@ -29,7 +30,7 @@ try:  # soft import: the action log is optional here
 except Exception:  # noqa: BLE001
     def log_action(*_a, **_k):  # type: ignore[misc]
         return None
-MAX_FILE_CHARS = settings.change_context_chars
+MAX_FILE_CHARS = settings.change_context_chars          # the normal budget; call sites use token_budget.budget("change_context_chars")
 
 
 def _history_pairs(messages, limit: int = 6) -> List[tuple]:
@@ -121,6 +122,7 @@ class RAGWorkflowManager:
             r'(?<![\w.\-])' + re.escape(p.replace("\\", "/").split("/")[-1].lower()) + r'(?![\w])', query)]
         if named:
             blocks, used = [], 0
+            file_budget = budget("change_context_chars")
             for p in sorted(named):
                 chunks = await self.db_manager.get_file_chunks(repo_id, p)
                 text = "\n\n".join(c["content"] for c in chunks)
@@ -132,8 +134,8 @@ class RAGWorkflowManager:
                     except Exception:  # noqa: BLE001
                         pass
                 status = "COMPLETE"
-                if used + len(text) > MAX_FILE_CHARS:
-                    text, status = text[: max(0, MAX_FILE_CHARS - used)], "TRUNCATED (budget)"
+                if used + len(text) > file_budget:
+                    text, status = text[: max(0, file_budget - used)], "TRUNCATED (budget)"
                 used += len(text)
                 blocks.append(f"--- [FULL_FILE: {status}] {p} ({len(chunks)} chunks) ---\n{text}")
             meta = {"mode": "named", "confidence": 1.0, "reasons": [], "job_id": None, "vector_status": None}
@@ -227,7 +229,7 @@ class RAGWorkflowManager:
 
         search = AgenticSearch(corpus)
         result = await asyncio.to_thread(search.retrieve, question)
-        agentic_ctx = self._format_agentic(result.blocks, MAX_FILE_CHARS)
+        agentic_ctx = self._format_agentic(result.blocks, budget("change_context_chars"))
         meta.update(mode="agentic", confidence=result.confidence, reasons=list(result.reasons))
 
         if vectors_ready:                           # agentic blocks + semantic hits (mode "agentic" upgrades to hybrid once ready)
@@ -383,7 +385,9 @@ class RAGWorkflowManager:
         if self.code_agent and settings.ask_agent and repo_id != GENERAL_REPO_ID:
             # Investigate with find/grep/read tools (and sandbox-check any proposed edit). The retrieved chunks are only leads here.
             try:
-                leads = leads_from_context(state.get("context_str", ""), settings.ask_seed_chars)
+                leads = leads_from_context(state.get("context_str", ""), budget("ask_seed_chars"))
+                if is_lean():       # tokens the lean seed cap kept out of the prompt (for the telemetry footer)
+                    note_saved(len(leads_from_context(state.get("context_str", ""), settings.ask_seed_chars)) - len(leads))
                 text = await self.code_agent.answer(repo_id, self._system_prompt({**state, "context_str": leads}), state["messages"])
                 return {"messages": [AIMessage(content=text)]}
             except asyncio.CancelledError:
@@ -407,7 +411,11 @@ class RAGWorkflowManager:
         model = reasoning_model()
         think = reasoning_arg(settings.ask_reasoning)
         system_prompt = self._system_prompt(state)
-        messages_for_llm = [SystemMessage(content=system_prompt)] + state["messages"]
+        history = state["messages"]
+        if is_lean():       # lean: only the last lean_history_turns earlier messages travel with the question
+            history, dropped = trim_history(history, settings.lean_history_turns)
+            note_saved(dropped)
+        messages_for_llm = [SystemMessage(content=system_prompt)] + history
 
         async def _call(m: str):
             callback = StdoutTelemetryCallback(

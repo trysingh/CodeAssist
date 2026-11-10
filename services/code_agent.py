@@ -16,8 +16,9 @@ import fnmatch
 import json
 import re
 import time
+from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
@@ -29,6 +30,8 @@ from services.patch_service import Edit, apply_edits, parse_edits, resolve_edit_
 from services.reasoning.baseline import guidance_block, note_facts
 from services.reasoning.crosscheck import facts_from_sandbox
 from services.sandbox_service import is_test_file
+from services.token_budget import (budget, current_ledger, effective_mode, estimate_tokens, footer_text, is_lean, keep_full_obs,
+                                   ledger_scope, max_input_tokens, note_saved, summary_event, text_of, trim_history)
 
 PROTOCOL = """
 
@@ -266,13 +269,22 @@ class RepoTools:
         if a > n:
             return f"{p} has only {n} lines."
         width, used, last, rows = len(str(n)), 0, a - 1, []
+        cap = budget("ask_read_chars")
         for i in range(a, b + 1):
             row = f"{i:>{width}}| {lines[i - 1][:2000]}"
-            if rows and used + len(row) + 1 > settings.ask_read_chars:
+            if rows and used + len(row) + 1 > cap:
                 break
             rows.append(row)
             used += len(row) + 1
             last = i
+        if cap < settings.ask_read_chars and last < b:      # lean: chars this read would have returned under the normal budget
+            extra = 0
+            for i in range(last + 1, b + 1):
+                row = f"{i:>{width}}| {lines[i - 1][:2000]}"
+                if used + extra + len(row) + 1 > settings.ask_read_chars:
+                    break
+                extra += len(row) + 1
+            note_saved(extra)
         self._mark(p, a, last)
         head = f"FILE {p} ({n} lines), showing {a}-{last}"
         if last < b:
@@ -465,6 +477,63 @@ def _strip_line_numbers(e: Edit) -> Edit:
     return Edit(e.path, clean(e.search), clean(e.replace), e.index)
 
 
+# --------------------------------------------------------------------------- lean mode: old tool output -> one line
+_HISTORY_IDS: ContextVar[Optional[Set[int]]] = ContextVar("ask_history_ids", default=None)    # id()s of earlier chat messages (droppable)
+_OBS_HEAD = re.compile(r"OBSERVATION \(([^)]*)\):\n")
+_OBS_TAIL = re.compile(r"\n\n\[\d+ tool call\(s\) left\]\s*$")
+_READ_HEAD = re.compile(r"FILE (\S+) \(\d+ lines\), showing (\d+)-(\d+)")
+
+
+def _is_observation(m) -> bool:
+    return isinstance(m, HumanMessage) and isinstance(m.content, str) and m.content.startswith("OBSERVATION (")
+
+
+def observation_stub(name: str, args: dict, obs: str) -> str:
+    """`OBSERVATION (read) [compacted: services/x.py lines 1-185, 6,420 chars already seen; read again if needed]`"""
+    args = args if isinstance(args, dict) else {}
+    again = "read again if needed" if name == "read" else "run it again if needed"
+    r = _READ_HEAD.match(obs) if name == "read" else None
+    if r:
+        target = f"{r.group(1)} lines {r.group(2)}-{r.group(3)}"
+    elif name == "grep":
+        target = f"/{args.get('pattern') or args.get('regex') or args.get('query') or ''}/" + (f" in {args.get('path') or args.get('glob')}" if args.get("path") or args.get("glob") else "")
+    elif name == "find":
+        target = str(args.get("pattern") or args.get("name") or args.get("path") or "")
+    else:
+        target = str(args.get("path") or args.get("file") or "")
+    target = target.strip()[:120] or "(no target)"
+    return f"OBSERVATION ({name}) [compacted: {target}, {len(obs):,} chars already seen; {again}]"
+
+
+def compact_observations(msgs: list, keep: int, tools: Optional["RepoTools"] = None) -> Tuple[int, int]:
+    """Replace every OBSERVATION message except the newest `keep` by a one-line stub (in place). The system message, the user's
+    question, the model's own replies and the newest observations stay. -> (messages compacted, chars saved).
+    A compacted call is forgotten by `tools`, so asking for it again really runs it (instead of 'you already ran this')."""
+    idx = [i for i, m in enumerate(msgs) if _is_observation(m)]
+    old = idx[: len(idx) - keep] if keep > 0 else idx
+    n = saved = 0
+    for i in old:
+        content = msgs[i].content
+        head = _OBS_HEAD.match(content)
+        if not head or "[compacted:" in content[:head.end() + 40]:
+            continue
+        obs = _OBS_TAIL.sub("", content[head.end():])
+        name, args = head.group(1).strip(), {}
+        prev = msgs[i - 1] if i > 0 else None
+        act = parse_action(str(prev.content)) if isinstance(prev, AIMessage) else None
+        if act is not None and not act[2]:
+            name, args = act[0] or name, act[1]
+        stub = observation_stub(name, args, obs)
+        if len(stub) >= len(content):
+            continue
+        msgs[i] = HumanMessage(content=stub)
+        n += 1
+        saved += len(content) - len(stub)
+        if tools is not None and act is not None and not act[2]:
+            tools._memo.pop(act[0] + json.dumps(args if isinstance(args, dict) else {}, sort_keys=True, default=str), None)
+    return n, saved
+
+
 # --------------------------------------------------------------------------- agent
 @dataclass
 class Check:
@@ -479,13 +548,13 @@ class CodeAgent:
         self._custom_llm = llm is not None       # an injected model does not take the extra `reasoning` argument of _ollama
         self._emit_fn = emit
 
-    def _emit(self, msg: str, level: str = "INFO") -> None:
+    def _emit(self, msg: str, level: str = "INFO", title: str = "Ask agent") -> None:
         try:
             if self._emit_fn:
-                self._emit_fn("Ask agent", msg, level)
+                self._emit_fn(title, msg, level)
             else:
                 from services.notifier import notifier
-                notifier.notify("Ask agent", msg, level=level)
+                notifier.notify(title, msg, level=level)
         except Exception:  # noqa: BLE001
             pass
 
@@ -520,6 +589,11 @@ class CodeAgent:
                 h.note(chars=len(str(resp)))
             except Exception:  # noqa: BLE001
                 pass
+            led = current_ledger()
+            if led is not None:     # an injected model reports no usage and has no telemetry callback: record an estimate
+                from services.runners import current_runner_name
+                led.record(runner=current_runner_name(), model=str(model or ""), phase="ASK_AGENT", token_mode=effective_mode(),
+                           input_tokens=estimate_tokens(msgs), output_tokens=len(str(resp)) // 4)
             return resp
 
     async def _reply(self, repo_id: str, msgs: list) -> str:
@@ -547,19 +621,36 @@ class CodeAgent:
         if not snapshot:
             raise ValueError("the raw store has no files for this repo (re-ingest it)")
         tools = RepoTools(snapshot)
-        msgs: list = [SystemMessage(content=system + guidance_block() + PROTOCOL)] + list(history)   # guidance: core skill text for an edit-like ask, "" otherwise
-        final = await self._loop(repo_id, msgs, tools, settings.ask_max_steps)
-        report = ""
-        if settings.ask_validate:
-            final, report = await self._validate(repo_id, msgs, tools, snapshot, final)
-        return final.rstrip() + report + self._footer(tools)
+        with ledger_scope() as led:
+            history = list(history)
+            if is_lean():       # lean: the last lean_history_turns earlier messages + the current question
+                history, dropped = trim_history(history, settings.lean_history_turns)
+                led.add_saved(dropped)
+            msgs: list = [SystemMessage(content=system + guidance_block() + PROTOCOL)] + history   # guidance: core skill text for an edit-like ask, "" otherwise
+            last_q = max((i for i, m in enumerate(history) if isinstance(m, HumanMessage)), default=len(history) - 1)
+            hist_token = _HISTORY_IDS.set({id(m) for m in history[:last_q]})      # what the input cap may drop (oldest first)
+            try:
+                final = await self._loop(repo_id, msgs, tools, budget("ask_max_steps"))
+                report = ""
+                if settings.ask_validate:
+                    final, report = await self._validate(repo_id, msgs, tools, snapshot, final)
+            finally:
+                _HISTORY_IDS.reset(hist_token)
+            self._emit_usage(led)
+            return final.rstrip() + report + self._footer(tools, led)
+
+    def _emit_usage(self, led) -> None:
+        """One telemetry event per question: the sum of its LLM calls (the Telemetry tab shows it as a summary line)."""
+        if led.calls:
+            self._emit(json.dumps(summary_event(led), default=str), "INFO", title="Token usage")
 
     # ------------------------------------------------------------------ loop
     async def _loop(self, repo_id: str, msgs: list, tools: RepoTools, steps: int) -> str:
         """Tool calls until the model answers. `msgs` grows in place."""
         for left in range(steps, 0, -1):
-            if tools.chars > settings.ask_obs_chars:
+            if tools.chars > budget("ask_obs_chars"):
                 break
+            self._prepare(msgs, tools)
             reply = await self._reply(repo_id, msgs)
             act = parse_action(reply)
             if act is None:
@@ -578,11 +669,61 @@ class CodeAgent:
             msgs += [AIMessage(content=reply), HumanMessage(content=f"OBSERVATION ({name or 'error'}):\n{obs}\n\n[{left - 1} tool call(s) left]")]
         msgs.append(HumanMessage(content="The tool budget is used up. Answer now from what you have read. State what you could NOT verify. "
                                          "Do not write an ACTION line."))
+        self._prepare(msgs, tools)
         reply = await self._reply(repo_id, msgs)
         if parse_action(reply) is not None:
             reply = strip_tool_calls(reply) or ("I ran out of tool calls before I could answer. Ask again with a narrower question "
                                                         "or name the file.")
         return reply.strip()
+
+    # ------------------------------------------------------------------ token savings (lean mode / input cap)
+    def _prepare(self, msgs: list, tools: RepoTools) -> None:
+        """Before each model call. Lean: old tool output becomes a one-line stub. Then the input cap (if any) trims until the estimate fits.
+        Normal mode without MAX_INPUT_TOKENS touches nothing, so the prompt is exactly what it always was."""
+        try:
+            if is_lean():
+                n, saved = compact_observations(msgs, keep_full_obs(), tools)
+                if n:
+                    note_saved(saved)
+                    self._emit(f"lean: {n} older tool output(s) compacted (~{saved // 4} tokens not resent)")
+            cap = max_input_tokens()
+            if cap > 0:
+                self._enforce_cap(msgs, tools, cap)
+        except Exception as e:  # noqa: BLE001 - saving tokens must never break the answer
+            self._emit(f"token trimming skipped: {type(e).__name__}: {e}", "WARNING")
+
+    def _enforce_cap(self, msgs: list, tools: RepoTools, cap: int) -> None:
+        """Input cap (estimated tokens). Order: oldest earlier chat messages first, then more tool output (all but the newest).
+        The system prompt and the latest user message are never dropped."""
+        est = estimate_tokens(msgs)
+        if est <= cap:
+            return
+        hist = _HISTORY_IDS.get() or set()
+        dropped_msgs = removed = 0
+        while est > cap:
+            idx = next((i for i, m in enumerate(msgs) if i > 0 and id(m) in hist), None)
+            if idx is None:
+                break
+            removed += len(text_of(msgs[idx].content))
+            hist.discard(id(msgs[idx]))
+            del msgs[idx]
+            dropped_msgs += 1
+            est = estimate_tokens(msgs)
+        while len(msgs) > 1 and id(msgs[1]) in hist and isinstance(msgs[1], AIMessage):     # never start the chat with an assistant reply
+            removed += len(text_of(msgs[1].content))
+            hist.discard(id(msgs[1]))
+            del msgs[1]
+            dropped_msgs += 1
+        est = estimate_tokens(msgs)
+        compacted = 0
+        if est > cap:
+            n, saved = compact_observations(msgs, 1, tools)
+            compacted, removed = n, removed + saved
+            est = estimate_tokens(msgs)
+        note_saved(removed)
+        self._emit(f"input cap {cap} tokens: dropped {dropped_msgs} earlier message(s), compacted {compacted} tool output(s); "
+                   f"now ~{est} tokens" + ("" if est <= cap else " (still over: system prompt, question and newest tool output are kept)"),
+                   "INFO" if est <= cap else "WARNING")
 
     # ------------------------------------------------------------------ validation
     async def _validate(self, repo_id: str, msgs: list, tools: RepoTools, snapshot: Dict[str, bytes], final: str) -> Tuple[str, str]:
@@ -606,7 +747,7 @@ class CodeAgent:
                                           f"{chk.problems}\n\nFix them (use the tools if you need to read more) and reply with the complete, "
                                           "corrected answer including every edit block.")]
             try:
-                fixed = await self._loop(repo_id, msgs, tools, max(2, settings.ask_max_steps // 2))
+                fixed = await self._loop(repo_id, msgs, tools, max(2, budget("ask_max_steps") // 2))
             except EmptyModelReply as e:
                 self._emit(f"No reply while correcting the failed check: {e}", "WARNING")
                 return final, report + "\n\n_The model stopped replying while correcting the code above, so it stays unverified._"
@@ -689,10 +830,14 @@ class CodeAgent:
 
     # ------------------------------------------------------------------ footer
     @staticmethod
-    def _footer(tools: RepoTools) -> str:
+    def _footer(tools: RepoTools, ledger=None) -> str:
+        """Which tools / files the answer rests on, plus (ledger given, settings.show_token_footer) the token line."""
         if not tools.calls:
-            return "\n\n_No search tools were used: this answer comes from the semantic-search leads only._"
-        used = ", ".join(f"{n} x{c}" for n, c in sorted(tools.calls.items()))
-        read = tools.files_read()
-        shown = ", ".join(read[:6]) + (f" (+{len(read) - 6} more)" if len(read) > 6 else "")
-        return f"\n\n_Looked at with: {used}" + (f". Files read: {shown}_" if read else "_")
+            base = "\n\n_No search tools were used: this answer comes from the semantic-search leads only._"
+        else:
+            used = ", ".join(f"{n} x{c}" for n, c in sorted(tools.calls.items()))
+            read = tools.files_read()
+            shown = ", ".join(read[:6]) + (f" (+{len(read) - 6} more)" if len(read) > 6 else "")
+            base = f"\n\n_Looked at with: {used}" + (f". Files read: {shown}_" if read else "_")
+        line = footer_text(ledger.totals()) if (ledger is not None and settings.show_token_footer) else ""
+        return base + (f"\n\n{line}" if line else "")

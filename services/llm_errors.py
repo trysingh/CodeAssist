@@ -41,13 +41,21 @@ def is_cloud_model(model: str) -> bool:
     return bool(_CLOUD.search((model or "").strip()))
 
 
+def _active_runner() -> str:
+    try:
+        from services.runners import current_runner_name
+        return current_runner_name()
+    except Exception:  # noqa: BLE001
+        return settings.llm_runner
+
+
 class ModelQuotaError(RuntimeError):
     """The model endpoint refused the call because credits / usage ran out. Waiting does not fix it."""
 
     def __init__(self, model: str, status: int = 402, provider_message: str = "",
                  fallback_tried: str = "", fallback_error: str = "", runner: str = ""):
         self.model, self.status = model, status
-        self.runner = (runner or settings.llm_runner or "ollama").strip().lower()
+        self.runner = (runner or _active_runner() or "ollama").strip().lower()
         self.provider_message = (provider_message or "").strip()
         self.fallback_tried, self.fallback_error = fallback_tried, fallback_error
         super().__init__(self.user_message())
@@ -120,7 +128,7 @@ class ModelAuthError(RuntimeError):
 
     def __init__(self, model: str, status: int = 401, provider_message: str = "", runner: str = ""):
         self.model, self.status = model, status
-        self.runner = (runner or settings.llm_runner or "ollama").strip().lower()
+        self.runner = (runner or _active_runner() or "ollama").strip().lower()
         self.provider_message = (provider_message or "").strip()
         super().__init__(self.user_message())
 

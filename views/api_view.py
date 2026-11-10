@@ -14,8 +14,8 @@ from controllers.engine_controller import EngineController
 from models.schemas import ChatRequest
 from config.settings import settings
 from services.notifier import notifier
-from services.model_calls import list_chat_models
-from services.runners import RunnerConfigError, check_runner_config, resolve_model
+from services.runners import RunnerConfigError, check_runner_config
+from services.runner_info import check_chat_choice, models_payload, runners_payload
 from services.llm_errors import ModelAuthError, ModelQuotaError, auth_error_response, quota_error_response
 from services import action_log
 
@@ -37,6 +37,8 @@ class ChangeRequest(BaseModel):
     request: str
     base_rev: int | None = None
     model: str = ""
+    runner: str = ""
+    token_mode: str = ""
 
 _sink_registered = False
 
@@ -80,13 +82,25 @@ async def serve_dashboard(request: Request):
     """Serves the responsive dark-themed CodeRAG web dashboard."""
     return templates.TemplateResponse(request, "index.html")
 
+@app.get("/api/v1/runners")
+async def list_runners():
+    """Every registered runner for the UI switch: {"default", "runners": [{name, remote, configured, error}]}."""
+    return runners_payload()
+
 @app.get("/api/v1/models")
-async def list_models():
-    names = await list_chat_models()
-    default = resolve_model()       # Ollama: settings.llm_model; Cloudflare: an Ollama-style default maps to settings.cf_llm_model
-    if default not in names:
-        names.insert(0, default)
-    return {"default": default, "models": names, "runner": settings.llm_runner}
+async def list_models(runner: Optional[str] = None):
+    """Chat models of `runner` (default: the configured runner) and the default model that runner resolves to."""
+    try:
+        return await models_payload(runner)
+    except RunnerConfigError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+def _chat_choice(runner: str, token_mode: str):
+    """Per-request runner / token_mode from the UI -> validated (runner, token_mode); a clear 400 when unusable."""
+    try:
+        return check_chat_choice(runner, token_mode)
+    except (RunnerConfigError, ValueError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 @app.get("/static/{file_type}/{file_name}")
 async def serve_static(file_type: str, file_name: str):
@@ -187,6 +201,7 @@ async def get_thread_history(thread_id: str):
 @app.post("/api/v1/chat")
 async def chat_endpoint(req: ChatRequest):
     """Processes a user query inside a specific repository thread and persists messages. Supports cancellation (499)."""
+    runner, token_mode = _chat_choice(req.runner, req.token_mode)
     try:
         await controller.db.init_db()
         await controller.db.create_thread(req.thread_id, req.repo_id, req.thread_id)
@@ -194,7 +209,7 @@ async def chat_endpoint(req: ChatRequest):
         request_id = uuid.uuid4().hex[:12]      # groups this turn's Activity events; returned so the UI can open "Show steps"
         try:
             response = await controller.chat_with_repo(req.repo_id, req.thread_id, req.query, web=req.web, model=req.model,
-                                                       request_id=request_id)
+                                                       request_id=request_id, runner=runner, token_mode=token_mode)
         except asyncio.CancelledError:
             return JSONResponse(
                 status_code=499,
@@ -219,9 +234,12 @@ async def chat_with_attachments(
     query: str = Form(""),
     web: str = Form("auto"),
     model: str = Form(""),
+    runner: str = Form(""),
+    token_mode: str = Form(""),
     files: List[UploadFile] = File(...),
 ):
     """Chat turn with pasted/uploaded attachments (image, pdf, docx, text). Supports cancellation."""
+    runner, token_mode = _chat_choice(runner, token_mode)
     if len(files) > settings.max_attachments_per_message:
         raise HTTPException(status_code=413, detail=f"Max {settings.max_attachments_per_message} attachments per message.")
     limit = settings.max_attachment_mb * 1024 * 1024
@@ -248,7 +266,7 @@ async def chat_with_attachments(
     request_id = uuid.uuid4().hex[:12]
     try:
         response = await controller.chat_with_repo(repo_id, thread_id, query, web=web, attachments=prepared, model=model,
-                                                   request_id=request_id)
+                                                   request_id=request_id, runner=runner, token_mode=token_mode)
     except asyncio.CancelledError:
         return JSONResponse(
             status_code=499,
@@ -267,10 +285,12 @@ async def chat_with_attachments(
 @app.post("/api/v1/repos/{repo_id}/changes")
 async def propose_change(repo_id: str, req: ChangeRequest):
     """Skips the ask/change router: always runs the change agents. Returns a proposal; writes nothing to disk."""
+    runner, token_mode = _chat_choice(req.runner, req.token_mode)
     request_id = uuid.uuid4().hex[:12]
     try:
         with action_log.request_scope(request_id, None, repo_id=repo_id):
-            res = await controller.propose_change(repo_id, req.request, req.base_rev, model=req.model)
+            res = await controller.propose_change(repo_id, req.request, req.base_rev, model=req.model,
+                                                  runner=runner, token_mode=token_mode)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     return {**res.__dict__, "markdown": res.to_markdown(), "request_id": request_id}
