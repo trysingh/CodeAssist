@@ -11,6 +11,8 @@ import re
 from typing import Awaitable, Callable, Optional
 
 from config.settings import settings
+from services.llm_errors import with_model_fallback
+from services.runners import MODEL_NAME, get_runner
 from contextlib import contextmanager
 from contextvars import ContextVar
 
@@ -26,7 +28,7 @@ _model_override: ContextVar[str] = ContextVar("model_override", default="")
 def model_scope(model: str):
     """User's reasoning-model pick for this request. Empty/invalid = keep the current (default)."""
     model = (model or "").strip()
-    if not re.fullmatch(r"[\w.:/\-]{1,100}", model):
+    if not MODEL_NAME.fullmatch(model):
         yield
         return
     token = _model_override.set(model)
@@ -39,16 +41,11 @@ def reasoning_model(default: str = "") -> str:
     return _model_override.get() or default or settings.llm_model
 
 async def list_chat_models() -> list:
-    """Models on the Ollama endpoint (embedding models hidden). Never raises."""
+    """Chat models of the configured runner (Ollama: GET /api/tags, embedding models hidden). Never raises."""
     try:
-        import httpx
-        async with httpx.AsyncClient(timeout=3.0) as c:
-            r = await c.get(chat_base_url() + "/api/tags")
-            r.raise_for_status()
-            names = [m.get("name") or m.get("model") for m in r.json().get("models", [])]
+        return await get_runner().list_models()
     except Exception:  # noqa: BLE001
-        names = []
-    return sorted({n for n in names if n and "embed" not in n.lower()})
+        return []
 
 def _callbacks(model: str, repo_id: str, phase: str) -> list:
     try:
@@ -93,23 +90,19 @@ def reasoning_arg(value: str = ""):
 
 def _build(model: str, *, json_mode: bool, num_predict: Optional[int], num_ctx: int,
            repo_id: str, phase: str, reasoning=None):
-    from langchain_ollama import ChatOllama
-    kw = dict(model=model, base_url=chat_base_url(), temperature=0,
-              num_ctx=num_ctx, callbacks=_callbacks(model, repo_id, phase))
-    if num_predict:
-        kw["num_predict"] = num_predict     # never -1: cloud endpoints reject non-positive values
-    if json_mode:
-        kw["format"] = "json"
-    if reasoning is not None:               # only sent when asked for: models without a thinking mode can reject the flag
-        kw["reasoning"] = reasoning
-    return ChatOllama(**kw)
+    runner = get_runner()
+    model = runner.map_model(model)         # Cloudflare: an Ollama-style name becomes settings.cf_llm_model (Ollama: unchanged)
+    return runner.chat(model, temperature=0, max_tokens=num_predict, json_mode=json_mode, reasoning=reasoning,
+                       num_ctx=num_ctx, callbacks=_callbacks(model, repo_id, phase))
 
 
 async def ask_text(model: str, prompt: str, *, phase: str = "CHANGE", repo_id: str = "",
                    num_predict: Optional[int] = None, num_ctx: Optional[int] = None) -> str:
-    llm = _build(model, json_mode=False, num_predict=num_predict or settings.change_max_output_tokens,
-                 num_ctx=num_ctx or settings.change_num_ctx, repo_id=repo_id, phase=phase)
-    resp = await llm.ainvoke(prompt)
+    async def _call(m: str):
+        llm = _build(m, json_mode=False, num_predict=num_predict or settings.change_max_output_tokens,
+                     num_ctx=num_ctx or settings.change_num_ctx, repo_id=repo_id, phase=phase)
+        return await llm.ainvoke(prompt)
+    resp = await with_model_fallback(_call, model, phase=phase)     # 402 (cloud credits used up) -> settings.llm_fallback_model, or ModelQuotaError
     return resp.content if isinstance(resp.content, str) else str(resp.content)
 
 
@@ -133,9 +126,11 @@ def parse_json_loose(raw: str) -> Optional[dict]:
 async def ask_json(model: str, prompt: str, *, phase: str = "DECIDE", repo_id: str = "") -> Optional[dict]:
     """Chat-model call that must answer in JSON. Any failure returns None so callers fall back."""
     try:
-        llm = _build(model, json_mode=True, num_predict=2048, num_ctx=16384,
-                     repo_id=repo_id, phase=phase)
-        resp = await llm.ainvoke(prompt)
+        async def _call(m: str):
+            llm = _build(m, json_mode=True, num_predict=2048, num_ctx=16384,
+                         repo_id=repo_id, phase=phase)
+            return await llm.ainvoke(prompt)
+        resp = await with_model_fallback(_call, model, phase=phase)
         return parse_json_loose(resp.content if isinstance(resp.content, str) else str(resp.content))
     except Exception as exc:
         try:    # the success path is logged by the telemetry callback; a failed call never reaches it

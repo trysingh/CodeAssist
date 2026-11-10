@@ -3,22 +3,22 @@ import sys
 import os
 from typing import List
 from tenacity import retry, stop_after_attempt, wait_exponential
-from langchain_ollama import OllamaEmbeddings
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from config.settings import settings
 from models.schemas import ChunkDocument
 from services.chunking.strategies import count_tokens_rust
+from services.runners import get_embedding_runner
 
 class VectorStoreService:
     def __init__(self):
-        # Force Ollama Python SDK to honor remote base URL
-        os.environ["OLLAMA_HOST"] = settings.ollama_base_url
-        
-        self.embeddings = OllamaEmbeddings(
-            model=settings.embedding_model,
-            base_url=settings.ollama_base_url
-        )
+        # settings.embedding_runner picks the backend (independent of settings.llm_runner). Ollama: the runner also sets OLLAMA_HOST.
+        # Changing it changes the vectors: re-index with reset_repo_index.py.
+        self.embeddings = get_embedding_runner().embeddings()
+
+    @staticmethod
+    def _embedding_model_name() -> str:
+        return settings.cf_embedding_model if get_embedding_runner().name == "cloudflare" else settings.embedding_model
 
     def _get_vectorstore(self, repo_id: str) -> Chroma:
         collection_name = f"repo_{repo_id}"
@@ -75,7 +75,7 @@ class VectorStoreService:
 
         elapsed = time.perf_counter() - start_t
         sys.stdout.write(
-            f"[TELEMETRY TRACE] Phase=EMBED_BATCH | Model={settings.embedding_model} | "
+            f"[TELEMETRY TRACE] Phase=EMBED_BATCH | Model={self._embedding_model_name()} | "
             f"Chunks={len(lc_docs)} | InputTokens={total_input_tokens} | TimeSpent={elapsed:.3f}s\n"
         )
         sys.stdout.flush()

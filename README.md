@@ -71,6 +71,8 @@ SSE notifications gain `kind` (`log`, `action`, `job`), `request_id`, `thread_id
 | `REASONING_INTAKE_LLM` | `false` | let the chat model refine the intake brief (one extra call) |
 | `ACTION_LOG_ENABLED` | `true` | stream every step to the Activity log (SSE + telemetry table) |
 | `WATCH_ON_INGEST` | `true` | start the file watcher as soon as a repo is ingested |
+| `LLM_FALLBACK_MODEL` | *(empty)* | a LOCAL chat model (see `ollama list`) used when the chosen model is refused for credits / usage (Ollama Cloud HTTP 402). Empty = no fallback: the chat shows the reason |
+| `LLM_QUOTA_COOLDOWN_S` | `300` | after such a refusal, calls for that model go straight to the fallback for this many seconds (`0` = try the cloud model every time) |
 
 Existing repos ingested before v2 keep working: their chunks count as a ready vector index, so they stay on vector/hybrid retrieval.
 
@@ -111,3 +113,21 @@ with an unknown `/word` (for example `/apply`) gets an "Unknown command" reply w
 again for what the latest unapplied revision already implements (request >= 90% similar) returns that revision with its apply links and makes no model call; add "redo",
 "again", "regenerate" or "from scratch" to rebuild, or set `ENGINE_REPEAT_REQUEST_GUARD=false`. A short **Summary** (changed / apply / verified / next) heads each saved change.
 
+
+
+## Runners (inference backends)
+Chat and embeddings go through `services/runners/`; the backend is a config choice. The default, `ollama`, is the behaviour the app always had.
+
+| Setting (env, `ENGINE_` prefix optional) | Default | Meaning |
+|---|---|---|
+| `LLM_RUNNER` | `ollama` | `ollama` or `cloudflare` (Cloudflare Workers AI, OpenAI-compatible endpoint, needs `pip install langchain-openai`) |
+| `EMBEDDING_RUNNER` | `ollama` | separate from `LLM_RUNNER`: vectors of different models are not comparable, so switching it needs a re-index (`python reset_repo_index.py`) |
+| `CF_LIST_ALL_MODELS` | `true` | Cloudflare runner: the model picker lists all Workers AI text-generation models on the account (`CF_MODELS` first, cached `CF_MODELS_CACHE_S`=600 s); `false` = only `CF_MODELS` |
+| `CF_ACCOUNT_ID`, `CF_API_TOKEN` | *(empty)* | required for `cloudflare`; the app refuses to start without them |
+| `CF_LLM_MODEL` / `CF_VISION_MODEL` | `@cf/google/gemma-4-26b-a4b-it` | Ollama-style names (contain `:`, no `@`, e.g. `gemma4:31b-cloud`) are mapped to these when `LLM_RUNNER=cloudflare` |
+| `CF_EMBEDDING_MODEL` | `@cf/baai/bge-base-en-v1.5` | embedding model of the cloudflare embedding runner |
+| `CF_MODELS` | gemma-4-26b-a4b-it, gemma-3-12b-it | comma list offered in the UI model picker |
+| `CF_AI_GATEWAY_URL` | *(empty)* | optional base URL override (AI Gateway) |
+
+Not supported on `cloudflare`: `num_ctx` (ignored), `ask_reasoning` (ignored). The decision model (`/v1/systemone`) stays Ollama-only.
+Setup and troubleshooting: `docs/CLOUDFLARE_SETUP.md`. New backend: implement `services/runners/base.Runner` and call `register_runner(name, factory)`.

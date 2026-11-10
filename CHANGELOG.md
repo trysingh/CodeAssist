@@ -3,6 +3,14 @@
 ## v3.2 (unreleased)
 Fixes from re-running the same `/change` on v3.1.1 (revision 23 built on unapplied revision 22).
 ### Fixed
+- **Chat crashed with `ollama._types.ResponseError: Add usage credits or subscribe ... (status code: 402)`.** The default model `gemma4:31b-cloud`
+  runs on Ollama Cloud; when its credits / free usage run out ollama.com refuses every call with HTTP 402 (a provider limit, not a bug) and the
+  request ended as an unhandled 500. New `services/llm_errors.py`: the 402 (and a 429 that talks about usage / credits) is recognised and
+  becomes `ModelQuotaError`; the API answers HTTP 402 with a readable `detail` (the UI toast shows it) instead of a traceback. With
+  `ENGINE_LLM_FALLBACK_MODEL=<local model>` the call is retried once on that model, later calls skip the cloud model for
+  `ENGINE_LLM_QUOTA_COOLDOWN_S` seconds (default 300, 0 = always try the cloud model first) and the answer ends with a "Model note" line.
+  Wired into the answer step (`rag_graph`), the ask agent (`code_agent._ollama`) and `model_calls.ask_text` / `ask_json` (patcher, locator, ...).
+  A busy local Ollama answering 429 is not treated as a quota problem. Tests: `tests/test_llm_quota.py`.
 - **Stacked revisions were invisible.** A revision built on unapplied ones showed only its own delta (+6 -6). The reply now carries "Builds on unapplied
   revision(s) 22. Shown below: this revision's changes only. The cumulative change against your disk: <per-file stats> - use Download .patch (cumulative) or apply
   22 and 23 together." (`services/reasoning/stacking.stack_info`, called from `RepoChangeService._run`, rendered by `ChangeResult.to_markdown`). Same data as

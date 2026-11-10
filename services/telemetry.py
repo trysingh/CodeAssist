@@ -51,8 +51,14 @@ class StdoutTelemetryCallback(BaseCallbackHandler):
                 msg = getattr(gen, "message", None)
                 usage = getattr(msg, "usage_metadata", None) or getattr(gen, "generation_info", {})
                 if isinstance(usage, dict):
-                    input_tokens += usage.get("input_tokens") or usage.get("prompt_eval_count") or 0
-                    output_tokens += usage.get("output_tokens") or usage.get("eval_count") or 0
+                    input_tokens += usage.get("input_tokens") or usage.get("prompt_eval_count") or usage.get("prompt_tokens") or 0
+                    output_tokens += usage.get("output_tokens") or usage.get("eval_count") or usage.get("completion_tokens") or 0
+        # OpenAI-shaped servers report the totals once per call in llm_output["token_usage"]
+        if input_tokens == 0 and output_tokens == 0:
+            tu = (getattr(response, "llm_output", None) or {}).get("token_usage")
+            if isinstance(tu, dict):
+                input_tokens = tu.get("prompt_tokens") or 0
+                output_tokens = tu.get("completion_tokens") or 0
 
         # Fallback to Rust-based tiktoken calculation
         if input_tokens == 0:

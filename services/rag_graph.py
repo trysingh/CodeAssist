@@ -1,6 +1,9 @@
 from typing import Annotated, TypedDict, List
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
-from langchain_ollama import ChatOllama
+try:    # only the Ollama runner needs it; a Cloudflare-only install may not have langchain-ollama
+    from langchain_ollama import ChatOllama
+except ImportError:     # pragma: no cover
+    ChatOllama = None
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
@@ -14,6 +17,8 @@ from services.web_search_service import WebSearchService, decide_web, now_str
 import asyncio
 from models.schemas import GENERAL_REPO_ID
 from services.model_calls import reasoning_arg, reasoning_model, chat_base_url
+from services.runners import make_chat
+from services.llm_errors import ModelQuotaError, fallback_note, fallback_scope, with_model_fallback
 from services.agentic_search import AgenticSearch, RepoCorpus, needs_vectors
 from services.code_agent import EmptyModelReply, clean_reply, describe_meta, leads_from_context, reply_meta
 import hashlib
@@ -360,6 +365,19 @@ class RAGWorkflowManager:
         return system_prompt
 
     async def _generate_answer_node(self, state: AgentState) -> dict:
+        """The answer step. When the chosen model was refused for credits/usage and settings.llm_fallback_model answered
+        instead (services/llm_errors), the answer says so at its end."""
+        with fallback_scope() as events:
+            out = await self._generate_answer_inner(state)
+        note = fallback_note(events)
+        msgs = list(out.get("messages") or [])
+        if not note or not msgs:
+            return out
+        last = msgs[-1].content
+        msgs[-1] = AIMessage(content=(last if isinstance(last, str) else str(last)) + note)
+        return {**out, "messages": msgs}
+
+    async def _generate_answer_inner(self, state: AgentState) -> dict:
         repo_id = state.get("repo_id", "unknown_repo")
         note = ""       # appended to the single-shot answer when the agent could not produce one
         if self.code_agent and settings.ask_agent and repo_id != GENERAL_REPO_ID:
@@ -369,6 +387,8 @@ class RAGWorkflowManager:
                 text = await self.code_agent.answer(repo_id, self._system_prompt({**state, "context_str": leads}), state["messages"])
                 return {"messages": [AIMessage(content=text)]}
             except asyncio.CancelledError:
+                raise
+            except ModelQuotaError:     # credits used up and no (working) fallback model: the single-shot answer below would hit the same wall
                 raise
             except Exception as e:  # noqa: BLE001 - fall back to the old single-shot answer, never fail the chat
                 notifier.notify("Ask agent", f"fell back to a single-shot answer: {type(e).__name__}: {e}", level="WARNING")
@@ -385,27 +405,25 @@ class RAGWorkflowManager:
                 level="INFO"
             )
         model = reasoning_model()
-        callback = StdoutTelemetryCallback(
-            model_name=model, 
-            repo_id=repo_id,
-            phase="RAG_GENERATION", 
-            emitter=lambda data: notifier.notify("Telemetry Trace", data, level="INFO")
-            # emitter=emit_to_ui
-        )
-        
         think = reasoning_arg(settings.ask_reasoning)
-        llm = ChatOllama(
-            model=model,
-            base_url=chat_base_url(),
-            temperature=0.1,
-            num_ctx=settings.change_num_ctx,
-            callbacks=[callback],
-            **({"reasoning": think} if think is not None else {})
-        )
-        
         system_prompt = self._system_prompt(state)
         messages_for_llm = [SystemMessage(content=system_prompt)] + state["messages"]
-        response = await llm.ainvoke(messages_for_llm)
+
+        async def _call(m: str):
+            callback = StdoutTelemetryCallback(
+                model_name=m,
+                repo_id=repo_id,
+                phase="RAG_GENERATION",
+                emitter=lambda data: notifier.notify("Telemetry Trace", data, level="INFO")
+                # emitter=emit_to_ui
+            )
+            # ollama_cls: the Ollama runner builds THIS module's ChatOllama (the seam the tests patch); other runners ignore it
+            llm = make_chat(m, temperature=0.1, num_ctx=settings.change_num_ctx, callbacks=[callback], reasoning=think,
+                            ollama_cls=ChatOllama)
+            return await llm.ainvoke(messages_for_llm)
+
+        # 402 (Ollama Cloud credits used up) -> settings.llm_fallback_model once, or ModelQuotaError (HTTP 402 with a readable message)
+        response = await with_model_fallback(_call, model, phase="RAG_GENERATION")
         raw = response.content if isinstance(response.content, str) else str(response.content)
         text = clean_reply(raw)
         if not text:        # never store or show a blank answer: an empty assistant turn also confuses the next turn of the thread

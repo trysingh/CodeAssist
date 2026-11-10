@@ -15,11 +15,15 @@ from models.schemas import ChatRequest
 from config.settings import settings
 from services.notifier import notifier
 from services.model_calls import list_chat_models
+from services.runners import RunnerConfigError, check_runner_config, resolve_model
+from services.llm_errors import ModelAuthError, ModelQuotaError, auth_error_response, quota_error_response
 from services import action_log
 
 
 
 app = FastAPI(title="CodeRAG Pluggable Chunking & Multi-Thread RAG API")
+app.add_exception_handler(ModelQuotaError, quota_error_response)    # cloud model out of credits (HTTP 402 from Ollama): readable 402 instead of a 500 + traceback
+app.add_exception_handler(ModelAuthError, auth_error_response)      # bad / missing provider credentials (HTTP 401/403): readable 401
 controller = EngineController()
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -45,6 +49,11 @@ def register_action_sink() -> None:
 
 @app.on_event("startup")
 async def startup_event():
+    try:
+        check_runner_config()           # fail fast: e.g. LLM_RUNNER=cloudflare without CF_ACCOUNT_ID / CF_API_TOKEN
+    except RunnerConfigError as exc:
+        print(f"[startup] {exc}", flush=True)
+        raise
     await controller.db.init_db()
     notifier.bind(controller.db)        # persist notifications + thread-safe SSE fan-out (needs the running loop)
     register_action_sink()
@@ -74,9 +83,10 @@ async def serve_dashboard(request: Request):
 @app.get("/api/v1/models")
 async def list_models():
     names = await list_chat_models()
-    if settings.llm_model not in names:
-        names.insert(0, settings.llm_model)
-    return {"default": settings.llm_model, "models": names}
+    default = resolve_model()       # Ollama: settings.llm_model; Cloudflare: an Ollama-style default maps to settings.cf_llm_model
+    if default not in names:
+        names.insert(0, default)
+    return {"default": default, "models": names, "runner": settings.llm_runner}
 
 @app.get("/static/{file_type}/{file_name}")
 async def serve_static(file_type: str, file_name: str):

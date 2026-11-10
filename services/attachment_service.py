@@ -8,10 +8,14 @@ from typing import Any, Dict, List, Tuple
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_core.messages import HumanMessage
-from langchain_ollama import ChatOllama
+try:    # only the Ollama runner needs it
+    from langchain_ollama import ChatOllama
+except ImportError:     # pragma: no cover
+    ChatOllama = None
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from config.settings import settings
+from services.runners import make_chat
 
 MAX_TEXT_CHARS = 300_000      # hard cap on text kept per attachment
 OPENING_CHARS = 1200          # opening excerpt shown for large attachments
@@ -57,11 +61,7 @@ class AttachmentService:
         return kind, text.replace("\x00", "").strip()[:MAX_TEXT_CHARS]
 
     async def _ocr_image(self, data: bytes, mime: str) -> str:
-        llm = ChatOllama(
-            model=settings.vision_model or settings.llm_model,
-            base_url=settings.ollama_base_url,
-            temperature=0,
-        )
+        llm = make_chat(settings.vision_model or settings.llm_model, temperature=0, vision=True, ollama_cls=ChatOllama)
         b64 = base64.b64encode(data).decode()
         msg = HumanMessage(content=[
             {"type": "text", "text": OCR_PROMPT},

@@ -9,6 +9,7 @@ langchain-community>=0.3.0
 langchain-core>=0.3.0
 langchain-text-splitters>=0.3.0
 langchain-ollama>=0.2.0
+langchain-openai>=0.2.0      # needed only for LLM_RUNNER=cloudflare / EMBEDDING_RUNNER=cloudflare (imported lazily)
 langchain-chroma>=0.1.4
 langgraph>=0.2.0
 langgraph-checkpoint-sqlite>=2.0.0
@@ -37,3 +38,4 @@ lxml_html_clean>=0.2.0
 readability-lxml>=0.8.1
 playwright>=1.44.0           # optional: only if web_allow_playwright=True (then: playwright install chromium)
 playwright-stealth>=2.0.0    # optional
+langchain-openai

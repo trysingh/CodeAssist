@@ -1,0 +1,282 @@
+"""Provider-side quota failures of the chat model (Ollama Cloud: HTTP 402 "Add usage credits ...", or 429 at a usage limit).
+
+A cloud model tag (gemma4:31b-cloud, gpt-oss:120b-cloud, ...) is proxied by the local Ollama daemon to ollama.com and billed
+there. When the free allowance or the credits run out, ollama.com answers 402 and the langchain-ollama call raises
+`ollama.ResponseError(status_code=402)`. That is not a bug in this app and waiting does not help, so this module:
+
+  * recognises it (`as_quota_error`), duck-typed on `.status_code` so it needs neither the ollama package nor a server,
+  * retries ONCE on `settings.llm_fallback_model` (a LOCAL model) when one is configured (`with_model_fallback`), and
+    remembers for `settings.llm_quota_cooldown_s` that the cloud model is out, so a multi-turn agent does not knock on it
+    again for every turn,
+  * otherwise raises `ModelQuotaError`, which the API turns into HTTP 402 with a readable message (`quota_error_response`)
+    instead of an unhandled 500 with a 200-line traceback.
+
+Runner-aware: besides ollama's ResponseError it recognises OpenAI-style errors (openai.APIStatusError / httpx: `.status_code`
+or `.response.status_code`), which is what the Cloudflare Workers AI runner raises (daily neuron allocation used up = 429 with a
+quota text; bad / unauthorised token = 401 / 403 -> `ModelAuthError`). Messages name the active runner (settings.llm_runner).
+
+Imports only config.settings at module level (notifier / action_log are imported lazily), so there is no import cycle.
+"""
+from __future__ import annotations
+
+import asyncio
+import re
+import time
+from contextlib import contextmanager
+from contextvars import ContextVar
+from typing import Awaitable, Callable, Dict, List, Optional, Tuple, TypeVar
+
+from config.settings import settings
+from services.runners.base import MODEL_NAME as _MODEL_NAME     # same shape model_calls.model_scope accepts ('@' allowed: Cloudflare ids)
+
+T = TypeVar("T")
+
+PLANS_URL = "https://ollama.com/plans"
+_CLOUD = re.compile(r"[-:]cloud$", re.IGNORECASE)
+_QUOTA_TEXT = re.compile(r"credit|usage|quota|subscri|upgrade|/plans|neuron|allocation|daily limit", re.IGNORECASE)   # a busy LOCAL Ollama also answers 429 ("maximum pending requests"): that is not a quota
+
+
+def is_cloud_model(model: str) -> bool:
+    """gemma4:31b-cloud, gpt-oss:120b-cloud, gpt-oss:cloud ... (billed by ollama.com, not run locally)."""
+    return bool(_CLOUD.search((model or "").strip()))
+
+
+class ModelQuotaError(RuntimeError):
+    """The model endpoint refused the call because credits / usage ran out. Waiting does not fix it."""
+
+    def __init__(self, model: str, status: int = 402, provider_message: str = "",
+                 fallback_tried: str = "", fallback_error: str = "", runner: str = ""):
+        self.model, self.status = model, status
+        self.runner = (runner or settings.llm_runner or "ollama").strip().lower()
+        self.provider_message = (provider_message or "").strip()
+        self.fallback_tried, self.fallback_error = fallback_tried, fallback_error
+        super().__init__(self.user_message())
+
+    def user_message(self) -> str:
+        if self.runner == "cloudflare":
+            msg = (f"Model '{self.model}' was refused (HTTP {self.status}): Cloudflare Workers AI says the daily free allocation "
+                   "(10,000 neurons) or the plan limit is used up.")
+            if self.fallback_tried:
+                return (msg + f" The fallback model '{self.fallback_tried}' could not answer either ({self.fallback_error or 'no reply'}). "
+                        "Pick another model in the model selector or set LLM_RUNNER=ollama.")
+            return msg + (" Wait for the daily reset, move the account to Workers Paid, pick another model in the model selector,"
+                          " or set LLM_RUNNER=ollama in .env.")
+        who = "Ollama Cloud" if is_cloud_model(self.model) else "the model endpoint"
+        msg = f"Model '{self.model}' was refused (HTTP {self.status}): {who} says the usage credits or limit are used up."
+        if self.fallback_tried:
+            msg += f" The fallback model '{self.fallback_tried}' could not answer either ({self.fallback_error or 'no reply'})."
+            return msg + " Check that it is pulled (`ollama list`), or pick another model in the model selector."
+        return msg + (" Pick a local model in the model selector, set ENGINE_LLM_FALLBACK_MODEL=<a local model from `ollama list`>"
+                      f" in .env to switch automatically, or add credits ({PLANS_URL}).")
+
+
+def _chain(exc: BaseException):
+    seen = 0
+    while exc is not None and seen < 6:
+        yield exc
+        exc = exc.__cause__ or exc.__context__
+        seen += 1
+
+
+def _text_of(exc: BaseException) -> str:
+    body = getattr(exc, "body", None)                       # openai errors keep the provider's JSON here
+    return f"{getattr(exc, 'error', '') or ''} {getattr(exc, 'message', '') or ''} {exc} {body if body else ''}"
+
+
+def _status_of(e: BaseException):
+    """HTTP status of a provider error: `.status_code` (ollama.ResponseError, openai.APIStatusError) or `.response.status_code` (httpx)."""
+    status = getattr(e, "status_code", None)
+    if status is None:
+        status = getattr(getattr(e, "response", None), "status_code", None)
+    return status
+
+
+def quota_status(exc: BaseException) -> Optional[int]:
+    """402 always; 429 only when its text talks about usage / credits / plans / neurons. None = not a quota failure."""
+    for e in _chain(exc):
+        status = _status_of(e)
+        if status == 402:
+            return 402
+        if status == 429 and _QUOTA_TEXT.search(_text_of(e)):
+            return 429
+    return None
+
+
+def as_quota_error(exc: BaseException, model: str) -> Optional[ModelQuotaError]:
+    """exc as a ModelQuotaError, or None when it is some other failure (network, bad model name, ...)."""
+    if isinstance(exc, ModelQuotaError):
+        return exc
+    status = quota_status(exc)
+    if status is None:
+        return None
+    for e in _chain(exc):
+        if _status_of(e) == status:
+            return ModelQuotaError(model, status, str(getattr(e, "error", "") or e)[:300])
+    return ModelQuotaError(model, status, str(exc)[:300])
+
+
+class ModelAuthError(RuntimeError):
+    """The model endpoint refused the credentials (HTTP 401 / 403). Retrying or a fallback model does not help."""
+
+    def __init__(self, model: str, status: int = 401, provider_message: str = "", runner: str = ""):
+        self.model, self.status = model, status
+        self.runner = (runner or settings.llm_runner or "ollama").strip().lower()
+        self.provider_message = (provider_message or "").strip()
+        super().__init__(self.user_message())
+
+    def user_message(self) -> str:
+        head = f"Model '{self.model}' was refused (HTTP {self.status}): "
+        if self.runner == "cloudflare":
+            return head + ("Cloudflare Workers AI rejected the credentials. Check CF_API_TOKEN (needs Workers AI Read + Edit, no stray quotes "
+                           "or spaces) and CF_ACCOUNT_ID; see docs/CLOUDFLARE_SETUP.md.")
+        return head + "the endpoint rejected the credentials. For an Ollama Cloud model run `ollama signin` (or set OLLAMA_API_KEY)."
+
+
+def auth_status(exc: BaseException) -> Optional[int]:
+    """401 / 403 of a provider error (or anything it was raised from), else None."""
+    for e in _chain(exc):
+        if _status_of(e) in (401, 403):
+            return _status_of(e)
+    return None
+
+
+def as_auth_error(exc: BaseException, model: str) -> Optional[ModelAuthError]:
+    if isinstance(exc, ModelAuthError):
+        return exc
+    status = auth_status(exc)
+    return None if status is None else ModelAuthError(model, status, str(exc)[:300])
+
+
+def fallback_for(model: str) -> str:
+    """settings.llm_fallback_model when it is usable for `model` (set, valid, different), else ''.
+
+    "Different" is judged after the runner's mapping: on Cloudflare an Ollama-style fallback name maps to the same model as the
+    refused one, which would only repeat the refusal."""
+    fb = (settings.llm_fallback_model or "").strip()
+    if not fb or fb == (model or "").strip() or not _MODEL_NAME.fullmatch(fb):
+        return ""
+    try:
+        from services.runners import get_runner
+        r = get_runner()
+        if r.map_model(fb) == r.map_model(model):
+            return ""
+    except Exception:  # noqa: BLE001 - an unusable runner config is reported by the call itself
+        pass
+    return fb
+
+
+# ---------------------------------------------------------------- cooldown: model -> (until, status)
+_blocked: Dict[str, Tuple[float, int]] = {}
+
+
+def _block(model: str, status: int) -> None:
+    cooldown = max(0.0, float(settings.llm_quota_cooldown_s))
+    if cooldown:
+        _blocked[model] = (time.monotonic() + cooldown, status)
+
+
+def _blocked_status(model: str) -> Optional[int]:
+    until, status = _blocked.get(model, (0.0, 0))
+    return status if until > time.monotonic() else None
+
+
+def reset_quota_state() -> None:
+    """Forget every cooldown (tests; or after adding credits without restarting the server)."""
+    _blocked.clear()
+
+
+# ---------------------------------------------------------------- "a fallback answered" notes
+_events: ContextVar[Optional[List[dict]]] = ContextVar("llm_fallback_events", default=None)
+
+
+@contextmanager
+def fallback_scope():
+    """Collects the fallbacks that happen inside the block (also from child tasks: the list is shared by reference)."""
+    events: List[dict] = []
+    token = _events.set(events)
+    try:
+        yield events
+    finally:
+        _events.reset(token)
+
+
+def _record(src: str, dst: str, status: int) -> None:
+    events = _events.get()
+    if events is not None and not any(e["from"] == src and e["to"] == dst for e in events):
+        events.append({"from": src, "to": dst, "status": status})
+
+
+def fallback_note(events: List[dict]) -> str:
+    """Markdown line for the end of an answer that was produced by a fallback model ('' when none was)."""
+    if not events:
+        return ""
+    parts = [f"`{e['from']}` was refused (HTTP {e['status']}, usage credits/limit used up), so `{e['to']}` answered" for e in events]
+    return "\n\n---\n_Model note: " + "; ".join(parts) + ". Quality may differ from the usual model._"
+
+
+def _announce(src: str, dst: str, status: int, phase: str) -> None:
+    msg = f"{src} refused (HTTP {status}, credits/usage): continuing on {dst}" + (f" [{phase}]" if phase else "")
+    try:
+        from services.notifier import notifier
+        notifier.notify("Model fallback", msg, level="WARNING")
+    except Exception:  # noqa: BLE001 - reporting never changes the call
+        pass
+    try:
+        from services.action_log import log_action
+        log_action("LLM", "ModelFallback", "quota fallback", "info", msg[:300], model=dst)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+# ---------------------------------------------------------------- the helper the call sites use
+async def with_model_fallback(call: Callable[[str], Awaitable[T]], model: str, *, phase: str = "") -> T:
+    """`await call(model)`. When the provider refuses it for credits / usage (402; 429 with a quota text):
+
+      * settings.llm_fallback_model set  -> `await call(fallback)` once (and for settings.llm_quota_cooldown_s every
+        later call for `model` goes straight to the fallback),
+      * not set                          -> raises ModelQuotaError (readable message, mapped to HTTP 402 by the API).
+
+    Any other failure propagates unchanged; so does cancellation. `call` receives the model name to use and must build
+    a fresh client for it."""
+    fb = fallback_for(model)
+    status = _blocked_status(model) if fb else None
+    if status is None:
+        try:
+            return await call(model)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            quota = as_quota_error(exc, model)
+            if quota is None:
+                auth = as_auth_error(exc, model)
+                if auth is not None:        # wrong / missing credentials: a readable error, not a traceback (a fallback would fail the same way)
+                    raise auth from exc
+                raise
+            if not fb:
+                raise quota from exc
+            status = quota.status
+            _block(model, status)
+            _announce(model, fb, status, phase)
+    _record(model, fb, status)
+    try:
+        return await call(fb)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - the fallback failed too: say both facts
+        raise ModelQuotaError(model, status, fallback_tried=fb, fallback_error=f"{type(exc).__name__}: {exc}"[:200]) from exc
+
+
+# ---------------------------------------------------------------- API mapping
+async def auth_error_response(_request, exc: ModelAuthError):
+    """FastAPI exception handler: HTTP 401 + {"detail": <readable message>}."""
+    from fastapi.responses import JSONResponse
+    return JSONResponse(status_code=401, content={"detail": exc.user_message(), "error": "model_auth", "model": exc.model,
+                                                  "status": exc.status})
+
+
+async def quota_error_response(_request, exc: ModelQuotaError):
+    """FastAPI exception handler: HTTP 402 + {"detail": <readable message>}. The web UI shows `detail` in its error toast."""
+    from fastapi.responses import JSONResponse
+    return JSONResponse(status_code=402, content={
+        "detail": exc.user_message(), "error": "model_quota", "model": exc.model,
+        "status": exc.status, "fallback_tried": exc.fallback_tried or None})

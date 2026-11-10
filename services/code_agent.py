@@ -75,6 +75,12 @@ FILE: services/auth.py
 """
 
 _ACTION = re.compile(r"ACTION\s*:\s*", re.I)
+# Gemma-4 style native tool call, which some runners (e.g. Cloudflare Workers AI) pass through as plain text:
+#   <|tool_call>call:read{path: "services/x.py", start: 1, end: 185}<tool_call|>
+# Strings may also be wrapped in the <|"|> token instead of quotes. The closing tag is optional (the reply can be cut off).
+_NATIVE_CALL = re.compile(r"<\|tool_call\|?>\s*(?:call\s*:\s*)?([\w.\-]+)\s*(\{.*?\})?\s*(?:<\|?tool_call\|>|$)", re.S)
+_NATIVE_MARK = re.compile(r"<\|tool_call\|?>")
+_BARE_KEY = re.compile(r'([{,]\s*)([A-Za-z_][\w\-]*)\s*:')
 _NUM_PREFIX = re.compile(r"^ *\d+\|(?: |$)")
 _NESTED_QUANT = re.compile(r"\((?:[^()\\]|\\.)*[+*](?:[^()\\]|\\.)*\)\s*[+*{]")      # (a+)+ style: catastrophic backtracking
 _TOOLS = ("find", "grep", "ls", "read")
@@ -303,9 +309,30 @@ class RepoTools:
 
 
 # --------------------------------------------------------------------------- parsing helpers
+def _native_args(raw: str) -> Optional[dict]:
+    """Arguments of a native tool call: unquoted keys and <|"|> string tokens made into JSON."""
+    s = (raw or "{}").replace('<|"|>', '"')
+    d = parse_json_loose(s)
+    if not isinstance(d, dict):
+        d = parse_json_loose(_BARE_KEY.sub(r'\1"\2":', s))
+    return d if isinstance(d, dict) else None
+
+
+def strip_tool_calls(reply: str) -> str:
+    """The reply without any tool-call text (ACTION line or native call), for when no more tool calls are allowed."""
+    reply = _ACTION.split(reply or "")[0]
+    return _NATIVE_MARK.split(reply)[0].strip()
+
+
 def parse_action(reply: str) -> Optional[Tuple[str, dict, str]]:
     """(tool, args, error) when the reply is a tool call; None when it is a final answer."""
     reply = reply or ""
+    if not _ACTION.search(reply) and _NATIVE_MARK.search(reply):
+        n = _NATIVE_CALL.search(reply)
+        args = _native_args(n.group(2)) if n else None
+        if not n or args is None:
+            return "", {}, 'could not read that tool call. Use: ACTION: {"tool": "grep", "args": {"pattern": "..."}}'
+        return n.group(1).strip().lower(), args, ""
     m = _ACTION.search(reply)
     raw = reply[m.end():] if m else None
     if raw is None:
@@ -388,6 +415,19 @@ def reply_meta(resp) -> dict:
     """done_reason / token counts / thinking size of a LangChain AIMessage (whatever the server reported)."""
     rm = getattr(resp, "response_metadata", None) or {}
     meta = {k: rm[k] for k in ("model", "done_reason", "eval_count", "prompt_eval_count") if rm.get(k) is not None}
+    # OpenAI-shaped servers (Cloudflare Workers AI, ...): finish_reason / token_usage / usage_metadata, same meaning
+    if "done_reason" not in meta and rm.get("finish_reason") is not None:
+        meta["done_reason"] = rm["finish_reason"]               # "length" = ran out of output budget, like Ollama's done_reason
+    usage = rm.get("token_usage") if isinstance(rm.get("token_usage"), dict) else {}
+    um = getattr(resp, "usage_metadata", None) if isinstance(getattr(resp, "usage_metadata", None), dict) else {}
+    if "eval_count" not in meta:
+        n = usage.get("completion_tokens", um.get("output_tokens"))
+        if n is not None:
+            meta["eval_count"] = n
+    if "prompt_eval_count" not in meta:
+        n = usage.get("prompt_tokens", um.get("input_tokens"))
+        if n is not None:
+            meta["prompt_eval_count"] = n
     thinking = (getattr(resp, "additional_kwargs", None) or {}).get("reasoning_content")
     if thinking:
         meta["thinking_chars"] = len(str(thinking))
@@ -452,10 +492,14 @@ class CodeAgent:
     async def _ollama(self, messages, repo_id: str = "", reasoning=None) -> str:
         """One model turn. `reasoning` None = settings.ask_reasoning; False on the retry after a reply that ran out of budget while thinking."""
         from services.model_calls import _build, reasoning_arg, reasoning_model
+        from services.llm_errors import with_model_fallback
         think = reasoning if reasoning is not None else reasoning_arg(settings.ask_reasoning)
-        llm = _build(reasoning_model(), json_mode=False, num_predict=settings.change_max_output_tokens,
-                     num_ctx=settings.change_num_ctx, repo_id=repo_id, phase="ASK_AGENT", reasoning=think)
-        resp = await llm.ainvoke(messages)
+
+        async def _call(m: str):
+            llm = _build(m, json_mode=False, num_predict=settings.change_max_output_tokens,
+                         num_ctx=settings.change_num_ctx, repo_id=repo_id, phase="ASK_AGENT", reasoning=think)
+            return await llm.ainvoke(messages)
+        resp = await with_model_fallback(_call, reasoning_model(), phase="ASK_AGENT")    # 402 -> local fallback model, or ModelQuotaError
         text = resp.content if isinstance(resp.content, str) else str(resp.content)
         return ModelText(text, reply_meta(resp))
 
@@ -536,7 +580,7 @@ class CodeAgent:
                                          "Do not write an ACTION line."))
         reply = await self._reply(repo_id, msgs)
         if parse_action(reply) is not None:
-            reply = _ACTION.split(reply)[0].strip() or ("I ran out of tool calls before I could answer. Ask again with a narrower question "
+            reply = strip_tool_calls(reply) or ("I ran out of tool calls before I could answer. Ask again with a narrower question "
                                                         "or name the file.")
         return reply.strip()
 

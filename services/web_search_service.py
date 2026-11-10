@@ -132,8 +132,8 @@ async def decide_web(query: str, mode: str = "auto", *, repo_scoped: bool, noul_
 
 
 async def _llm_rewrite(text: str) -> str:
-    from langchain_ollama import ChatOllama
-    llm = ChatOllama(model=settings.llm_model, base_url=settings.ollama_base_url, temperature=0, num_ctx=2048)
+    from services.runners import make_chat
+    llm = make_chat(settings.llm_model, temperature=0, num_ctx=2048)
     return str((await llm.ainvoke(_REWRITE + text[:3000])).content)
 
 

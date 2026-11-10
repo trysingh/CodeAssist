@@ -135,8 +135,8 @@ def _clean(out: str) -> Optional[str]:
 
 
 async def _llm_extract(text: str, typed: str) -> str:
-    from langchain_ollama import ChatOllama
-    llm = ChatOllama(model=settings.llm_model, base_url=settings.ollama_base_url, temperature=0, num_ctx=4096)
+    from services.runners import make_chat
+    llm = make_chat(settings.llm_model, temperature=0, num_ctx=4096)
     note = f'The user also typed: "{typed[:200]}"\n' if typed else ""
     return str((await llm.ainvoke(_EXTRACT.format(typed=note) + text[:4000])).content)
 

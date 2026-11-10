@@ -43,7 +43,32 @@ class EngineSettings(BaseSettings):
     scrape_fast_deadline: float = 2.5
     scrape_max_concurrent_heavy: int = 3
 
+    # ---- inference runners (services/runners/) ----
+    # Which backend serves chat and embeddings. "ollama" (default) = the behaviour this app always had.
+    # "cloudflare" = Cloudflare Workers AI through its OpenAI-compatible endpoint (needs `pip install langchain-openai`, CF_ACCOUNT_ID, CF_API_TOKEN).
+    # Env: LLM_RUNNER / EMBEDDING_RUNNER / CF_* (the ENGINE_-prefixed spelling works too).
+    llm_runner: str = Field(default="ollama", validation_alias=AliasChoices("ENGINE_LLM_RUNNER", "LLM_RUNNER"))
+    # Separate on purpose: embeddings of different models are NOT interchangeable (even at equal dimensions).
+    # Changing it means re-indexing every repo: run reset_repo_index.py.
+    embedding_runner: str = Field(default="ollama", validation_alias=AliasChoices("ENGINE_EMBEDDING_RUNNER", "EMBEDDING_RUNNER"))
+    cf_account_id: str = Field(default="", validation_alias=AliasChoices("ENGINE_CF_ACCOUNT_ID", "CF_ACCOUNT_ID"))
+    cf_api_token: str = Field(default="", validation_alias=AliasChoices("ENGINE_CF_API_TOKEN", "CF_API_TOKEN"))
+    cf_llm_model: str = Field(default="@cf/google/gemma-4-26b-a4b-it", validation_alias=AliasChoices("ENGINE_CF_LLM_MODEL", "CF_LLM_MODEL"))
+    cf_vision_model: str = Field(default="@cf/google/gemma-4-26b-a4b-it", validation_alias=AliasChoices("ENGINE_CF_VISION_MODEL", "CF_VISION_MODEL"))
+    cf_embedding_model: str = Field(default="@cf/baai/bge-base-en-v1.5", validation_alias=AliasChoices("ENGINE_CF_EMBEDDING_MODEL", "CF_EMBEDDING_MODEL"))
+    cf_models: str = Field(default="@cf/google/gemma-4-26b-a4b-it,@cf/google/gemma-3-12b-it",   # comma list shown in the UI model picker
+                           validation_alias=AliasChoices("ENGINE_CF_MODELS", "CF_MODELS"))
+    cf_ai_gateway_url: str = Field(default="", validation_alias=AliasChoices("ENGINE_CF_AI_GATEWAY_URL", "CF_AI_GATEWAY_URL"))  # optional base URL override (AI Gateway)
+    # UI model picker: list every Workers AI text-generation model on the account (GET .../ai/models/search), CF_MODELS first.
+    # Off -> only CF_MODELS. The catalogue is cached for cf_models_cache_s; on any API error the picker falls back to CF_MODELS.
+    cf_list_all_models: bool = Field(default=True, validation_alias=AliasChoices("ENGINE_CF_LIST_ALL_MODELS", "CF_LIST_ALL_MODELS"))
+    cf_models_cache_s: int = Field(default=600, validation_alias=AliasChoices("ENGINE_CF_MODELS_CACHE_S", "CF_MODELS_CACHE_S"))
+    cf_timeout_s: float = Field(default=120.0)
+    cf_max_retries: int = Field(default=2)
+
     llm_model: str = Field(default=DEFAULT_MODEL)
+    llm_fallback_model: str = Field(default="")        # ENGINE_LLM_FALLBACK_MODEL: a LOCAL chat model used when the chosen model is refused for credits/usage (Ollama Cloud: HTTP 402). Empty = no fallback; the chat shows the reason instead
+    llm_quota_cooldown_s: float = Field(default=300.0) # after such a refusal, that model's later calls go straight to the fallback for this long (0 = try the cloud model on every call)
     embedding_model: str = Field(default="nomic-embed-text:latest")
     
     # Attachments (pasted images / files / large text)
@@ -222,6 +247,10 @@ class EngineSettings(BaseSettings):
     def ensure_dirs(self):
         self.storage_dir.mkdir(parents=True, exist_ok=True)
         (self.storage_dir / self.chroma_dir_name).mkdir(parents=True, exist_ok=True)
+
+    @property
+    def cf_model_list(self) -> List[str]:
+        return [m.strip() for m in (self.cf_models or "").split(",") if m.strip()]
 
     @property
     def sqlite_url(self) -> str:

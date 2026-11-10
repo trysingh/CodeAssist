@@ -872,10 +872,19 @@ async function loadModels() {
     const sel = $('model-select'); if (!sel) return;
     try {
         const r = await (await fetch('/api/v1/models')).json();
-        sel.innerHTML = `<option value="">Default (${esc(r.default)})</option>` +
-            r.models.map(m => `<option value="${esc(m)}">${esc(m)}</option>`).join('');
-        if (!r.models.includes(S.model)) S.model = '';
-        sel.value = S.model;
+        // The list comes from the runner configured on the server (LLM_RUNNER): Ollama tags or the Cloudflare CF_MODELS list.
+        const runner = r.runner || 'ollama';
+        const short = m => String(m).replace(/^@cf\/[^/]+\//, '');    // @cf/google/gemma-4-26b-a4b-it -> gemma-4-26b-a4b-it
+        const models = (r.models || []).filter(m => m !== r.default);
+        sel.innerHTML = `<option value="" title="${esc(r.default)} (${esc(runner)})">Default (${esc(short(r.default))})</option>` +
+            `<optgroup label="${esc(runner)} models">` +
+            models.map(m => `<option value="${esc(m)}" title="${esc(m)}">${esc(short(m))}</option>`).join('') +
+            `</optgroup>`;
+        sel.title = sel.ariaLabel = `Reasoning model (runner: ${runner})`;
+        sel.dataset.runner = runner;
+        // A pick saved under another runner (e.g. an Ollama tag after switching to Cloudflare) falls back to Default.
+        if (S.model && S.model !== r.default && !models.includes(S.model)) { S.model = ''; LS.set('model', ''); }
+        sel.value = S.model === r.default ? '' : S.model;
     } catch { /* stays on Default */ }
     sel.onchange = () => { S.model = sel.value; LS.set('model', S.model); };
 }
