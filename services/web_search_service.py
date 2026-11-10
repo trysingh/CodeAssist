@@ -133,7 +133,7 @@ async def decide_web(query: str, mode: str = "auto", *, repo_scoped: bool, noul_
 
 async def _llm_rewrite(text: str) -> str:
     from services.runners import make_chat
-    llm = make_chat(settings.llm_model, temperature=0, num_ctx=2048)
+    llm = make_chat(settings.llm_model, temperature=0, num_ctx=2048, phase="WEB_REWRITE")
     return str((await llm.ainvoke(_REWRITE + text[:3000])).content)
 
 

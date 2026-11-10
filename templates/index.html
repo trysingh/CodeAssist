@@ -274,6 +274,9 @@
                                             <option value="normal" title="Full context, as before">Tokens: Normal</option>
                                         </select>
                                                 </label>
+                                                <label class="flex items-center gap-2 text-[11px] font-medium text-slate-500" title="While a request runs: a live timer toast with the elapsed time against the runner's per-call limit">
+                                                    <input id="task-timer-toggle" type="checkbox" checked class="rounded border-slate-300 dark:border-slate-600"> Show task timer
+                                                </label>
                                                 <p class="text-[10px] leading-snug text-slate-500">Auto = lean on paid runners, normal on local ones. Normal sends full context, as before. Saved in this browser.</p>
                                             </div>
                                         </div>
@@ -512,7 +515,7 @@
     </div>
 
     <script src="/static/js/activity.js?v=1"></script>
-    <script src="/static/js/app.js?v=5"></script>
+    <script src="/static/js/app.js?v=6"></script>
 </body>
 
 </html>

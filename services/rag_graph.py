@@ -19,7 +19,8 @@ from models.schemas import GENERAL_REPO_ID
 from services.model_calls import reasoning_arg, reasoning_model, chat_base_url
 from services.runners import make_chat
 from services.token_budget import budget, is_lean, note_saved, trim_history
-from services.llm_errors import ModelQuotaError, fallback_note, fallback_scope, with_model_fallback
+from services.llm_errors import (ModelQuotaError, ModelTimeoutError, ModelUnavailableError, fallback_note, fallback_scope,
+                                 with_model_fallback)
 from services.agentic_search import AgenticSearch, RepoCorpus, needs_vectors
 from services.code_agent import EmptyModelReply, clean_reply, describe_meta, leads_from_context, reply_meta
 import hashlib
@@ -392,7 +393,8 @@ class RAGWorkflowManager:
                 return {"messages": [AIMessage(content=text)]}
             except asyncio.CancelledError:
                 raise
-            except ModelQuotaError:     # credits used up and no (working) fallback model: the single-shot answer below would hit the same wall
+            except (ModelQuotaError, ModelTimeoutError, ModelUnavailableError):
+                # credits used up / the endpoint hangs or is unreachable: the single-shot answer below would hit the same wall (and wait again)
                 raise
             except Exception as e:  # noqa: BLE001 - fall back to the old single-shot answer, never fail the chat
                 notifier.notify("Ask agent", f"fell back to a single-shot answer: {type(e).__name__}: {e}", level="WARNING")
@@ -420,6 +422,7 @@ class RAGWorkflowManager:
         async def _call(m: str):
             callback = StdoutTelemetryCallback(
                 model_name=m,
+                requested_model=m,
                 repo_id=repo_id,
                 phase="RAG_GENERATION",
                 emitter=lambda data: notifier.notify("Telemetry Trace", data, level="INFO")

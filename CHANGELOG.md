@@ -3,6 +3,14 @@
 ## v3.2 (unreleased)
 Fixes from re-running the same `/change` on v3.1.1 (revision 23 built on unapplied revision 22).
 ### Fixed
+- **Wrong default model and silent timeouts on `aistudio`.** The "Default" model pick sent `LLM_MODEL` (`gemma4:31b-cloud`), which the AI Studio table
+  mapped to Gemma 4 31B before `AISTUDIO_LLM_MODEL` was looked at. On every non-Ollama runner an empty name or `LLM_MODEL` now means the runner's configured
+  default (`/api/v1/models` `default`, the UI label and telemetry agree; role models that are Ollama tags use it too); telemetry rows carry `requested_model`
+  next to `model`, and each request logs "model resolved: runner=... picked=... -> id". A hung call (`APITimeoutError` ...) became an unhandled 500 and the UI
+  showed nothing: it is now `ModelTimeoutError` (HTTP 504, names the model, attempts and the setting to raise), an unreachable endpoint HTTP 503, any other
+  escaped error a JSON 500; the chat shows each as an error message plus toast. New `AISTUDIO_TIMEOUT_S` (180), `AISTUDIO_MAX_RETRIES` (1),
+  `OPENAI_COMPAT_TIMEOUT_S`, `OPENAI_COMPAT_MAX_RETRIES`, `AISTUDIO_REASONING_EFFORT`; `/api/v1/runners` returns `timeout_s` / `max_retries`; a live "task timer" toast.
+  Tests: `tests/test_defaults_timeouts.py`.
 - **Chat crashed with `ollama._types.ResponseError: Add usage credits or subscribe ... (status code: 402)`.** The default model `gemma4:31b-cloud`
   runs on Ollama Cloud; when its credits / free usage run out ollama.com refuses every call with HTTP 402 (a provider limit, not a bug) and the
   request ended as an unhandled 500. New `services/llm_errors.py`: the 402 (and a 429 that talks about usage / credits) is recognised and

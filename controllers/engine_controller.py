@@ -30,7 +30,7 @@ from models.schemas import GENERAL_REPO_ID
 from services.patch_service import join_diffs, make_diff
 from services.apply_service import apply_revision as apply_revision_to_disk
 from services.apply_service import disk_conflicts
-from services.model_calls import model_scope
+from services.model_calls import announce_model, model_scope
 from services.runners import current_session_key, runner_scope, thread_scope
 from services.token_budget import budget, token_mode_scope
 from services import action_log as al
@@ -621,6 +621,7 @@ class EngineController:
                     query = "Please review the attached content."
             # runner / token_mode: the UI's per-request picks (validated by the API layer). Chat only: embeddings stay on settings.embedding_runner.
             with repo_scope(repo_id), model_scope(model), runner_scope(runner), token_mode_scope(token_mode), thread_scope(repo_id, thread_id):
+                announce_model()            # "model resolved: runner=... picked=Default -> <real id>" (once per request)
                 supervisor = getattr(self, "supervisor", None)
                 if supervisor is None or not supervisor.enabled or repo_id == GENERAL_REPO_ID:
                     return note + await self._route_chat(repo_id, thread_id, query, web)
@@ -804,6 +805,7 @@ class EngineController:
         # called from a chat turn the scopes are already set (and thread_scope must keep that thread); /changes sets its own
         with model_scope(model), runner_scope(runner), token_mode_scope(token_mode), \
                 (contextlib.nullcontext() if current_session_key() else thread_scope(repo_id, "change")):
+            announce_model()                # no-op when the chat turn that called us already announced this request
             return await self.change_service.run(repo_id, request, base_rev, context=context, plan=plan)
 
     async def list_revisions(self, repo_id: str) -> list:

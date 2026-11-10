@@ -69,6 +69,8 @@ class CloudflareRunner(OpenAICompatRunner):
     def embedding_default(self) -> str:
         return settings.cf_embedding_model
 
+    timeout_setting = "CF_TIMEOUT_S"
+
     def timeout_s(self) -> float:
         return settings.cf_timeout_s
 

@@ -29,8 +29,10 @@ class StdoutTelemetryCallback(BaseCallbackHandler):
     Traces every LLM & Embedding request and outputs structured telemetry to stdout.
     Uses Rust-backed tiktoken for fallback token counting when local providers omit metadata.
     """
-    def __init__(self, model_name: str, repo_id: str,phase: str = "RAG_CHAT", emitter: Optional[Callable] = None):
-        self.model_name = model_name
+    def __init__(self, model_name: str, repo_id: str,phase: str = "RAG_CHAT", emitter: Optional[Callable] = None,
+                 requested_model: str = ""):
+        self.model_name = model_name                # the id the runner really calls (make_chat relabels it)
+        self.requested_model = requested_model      # the name the call site asked for (may be an Ollama-style default); "" = same
         self.repo_id = repo_id
         self.phase = phase
         self.emitter = emitter # Function to send data to frontend
@@ -115,6 +117,7 @@ class StdoutTelemetryCallback(BaseCallbackHandler):
             "repo_id": self.repo_id,
             "phase": self.phase,
             "model": self.model_name,
+            "requested_model": self.requested_model or self.model_name,
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
             "total_tokens": total_tokens,
@@ -144,7 +147,7 @@ class StdoutTelemetryCallback(BaseCallbackHandler):
             log_action(phase="LLM", agent=str(self.phase), action="llm_call", status="ok",
                        detail=f"{self.model_name}: {input_tokens} in / {output_tokens} out",
                        data={"input_tokens": input_tokens, "output_tokens": output_tokens, "total_tokens": total_tokens,
-                             "runner": self.runner, "token_mode": self.token_mode, "cached_input_tokens": cached_tokens,
+                             "requested_model": self.requested_model or self.model_name, "runner": self.runner, "token_mode": self.token_mode, "cached_input_tokens": cached_tokens,
                              "est_tokens_saved": saved_tokens},
                        model=self.model_name, duration_ms=int(elapsed * 1000), repo_id=self.repo_id or None)
         except Exception:

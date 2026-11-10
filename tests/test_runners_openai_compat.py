@@ -169,7 +169,9 @@ def test_mapping_follows_the_settings_and_the_table_is_extendable(monkeypatch):
     monkeypatch.setattr(settings, "aistudio_llm_model", "gemini-2.5-flash")
     monkeypatch.setattr(settings, "aistudio_vision_model", "gemini-2.5-pro")
     r = get_runner("aistudio")
-    assert r.map_model("qwen2.5-coder:7b") == "gemini-2.5-flash" and r.map_model("gemma4:31b-cloud") == G31   # the table wins over the default
+    # the global default (settings.llm_model) and an empty name mean AISTUDIO_LLM_MODEL; the table only maps OTHER explicit Ollama-style names
+    assert r.map_model("qwen2.5-coder:7b") == "gemini-2.5-flash" and r.map_model("gemma4:31b-cloud") == "gemini-2.5-flash"
+    assert r.map_model("gemma4:31b") == G31 and r.map_model("gemma4:26b") == G26
     assert r.map_model("qwen2.5-coder:7b", vision=True) == "gemini-2.5-pro" and r.map_model("", vision=True) == "gemini-2.5-pro"
     assert r.map_model(G26, vision=True) == G26                                  # an explicit AI Studio id is never remapped
     monkeypatch.setattr(asr, "MODEL_MAP", asr.MODEL_MAP + [(r"^gemma4:e4b", "gemma-4-e4b-it")])

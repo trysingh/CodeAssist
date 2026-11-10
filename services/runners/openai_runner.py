@@ -4,7 +4,8 @@ Configured purely by settings (no base URL = "not set up" in the UI):
     OPENAI_COMPAT_BASE_URL         e.g. https://openrouter.ai/api/v1, https://api.groq.com/openai/v1, http://localhost:8000/v1
     OPENAI_COMPAT_API_KEY          optional (local servers); sent as Authorization: Bearer
     OPENAI_COMPAT_MODELS           comma list shown in the picker (pinned)
-    OPENAI_COMPAT_LLM_MODEL        what an Ollama-style name (gemma4:31b-cloud) is mapped to
+    OPENAI_COMPAT_LLM_MODEL        what an empty name / Ollama-style name (gemma4:31b-cloud) is mapped to
+    OPENAI_COMPAT_TIMEOUT_S        seconds per attempt (default COMPAT_TIMEOUT_S = 120); OPENAI_COMPAT_MAX_RETRIES (default COMPAT_MAX_RETRIES = 2)
     OPENAI_COMPAT_EMBEDDING_MODEL  needed only when EMBEDDING_RUNNER=openai
     OPENAI_COMPAT_REMOTE           true (default) = billed service -> TOKEN_MODE=auto runs lean; false for a local server
     OPENAI_COMPAT_LIST_ALL_MODELS  also list GET {base}/models (cached)
@@ -30,6 +31,16 @@ class OpenAIRunner(OpenAICompatRunner):
     @property
     def max_input_tokens(self) -> int:      # type: ignore[override]
         return max(0, int(settings.openai_compat_max_input_tokens))
+
+    timeout_setting = "OPENAI_COMPAT_TIMEOUT_S"
+
+    def timeout_s(self) -> float:
+        t = settings.openai_compat_timeout_s
+        return settings.compat_timeout_s if t is None else t
+
+    def max_retries(self) -> int:
+        r = settings.openai_compat_max_retries
+        return settings.compat_max_retries if r is None else max(0, int(r))
 
     def check_config(self) -> None:
         if not (settings.openai_compat_base_url or "").strip():

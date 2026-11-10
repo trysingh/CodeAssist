@@ -50,20 +50,26 @@ def get_embedding_runner() -> Runner:
 
 
 def runner_status() -> List[dict]:
-    """Every registered runner: {"name", "label", "remote", "configured", "error"} (check_config only, never touches the network)."""
+    """Every registered runner: {"name", "label", "remote", "configured", "error", "timeout_s", "max_retries"} (check_config only, never touches
+    the network). timeout_s = seconds one request may take per attempt (None = no client-side limit, as for Ollama), max_retries = how often
+    the client repeats a timed-out / failed request: a hang costs up to timeout_s x (max_retries + 1)."""
     out = []
     for key in available_runners():
-        remote, err, label = False, None, key
+        remote, err, label, timeout_s, retries = False, None, key, None, 0
         try:
             r = _REGISTRY[key]()
             remote = bool(getattr(r, "remote", False))
             label = str(getattr(r, "label", "") or key)
+            t, n = getattr(r, "timeout_s", None), getattr(r, "max_retries", None)
+            timeout_s = float(t()) if callable(t) and t() else None
+            retries = int(n()) if callable(n) else 0
             r.check_config()
         except RunnerConfigError as exc:
             err = str(exc)
         except Exception as exc:  # noqa: BLE001 - a broken third-party runner must not break the list
             err = f"{type(exc).__name__}: {exc}"
-        out.append({"name": key, "label": label, "remote": remote, "configured": err is None, "error": err})
+        out.append({"name": key, "label": label, "remote": remote, "configured": err is None, "error": err,
+                    "timeout_s": timeout_s, "max_retries": retries})
     return out
 
 
@@ -77,13 +83,37 @@ def require_runner(name: Optional[str]) -> str:
     return key
 
 
-def make_chat(model: str, *, ollama_cls: Any = None, **kw: Any) -> Any:
+def _telemetry_callbacks(phase: str) -> list:
+    """Default telemetry for a chat client built without callbacks, so every call is counted (tokens, cached tokens, ledger)."""
+    try:
+        from services.action_log import current_repo_id
+        from services.model_calls import _callbacks
+        return _callbacks("", current_repo_id() or "", phase)
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def make_chat(model: str, *, ollama_cls: Any = None, phase: str = "CHAT", **kw: Any) -> Any:
     """Chat client from the LLM runner of this request (runner_scope, else settings.llm_runner; kwargs: see base.Runner.chat).
 
-    `ollama_cls`: the ChatOllama class the CALLING module holds (rag_graph.ChatOllama, patched by tests). Only the Ollama runner uses it."""
+    `ollama_cls`: the ChatOllama class the CALLING module holds (rag_graph.ChatOllama, patched by tests). Only the Ollama runner uses it.
+    `phase`: telemetry label used when the caller passes no callbacks (a telemetry callback is then added, so no call goes uncounted).
+    Telemetry callbacks are told the model id the runner really calls (model: gemma-4-31b-it) and the name that was asked for
+    (requested_model: gemma4:31b-cloud)."""
     runner = get_runner()
     if ollama_cls is not None and runner.name == "ollama":
         kw["chat_cls"] = ollama_cls
+    if kw.get("callbacks") is None:
+        kw["callbacks"] = _telemetry_callbacks(phase) or None
+    try:
+        actual = runner.map_model(model or settings.llm_model, vision=bool(kw.get("vision")))
+        for cb in kw.get("callbacks") or []:
+            if hasattr(cb, "model_name") and type(cb).__name__ == "StdoutTelemetryCallback":
+                if not getattr(cb, "requested_model", ""):
+                    cb.requested_model = model or settings.llm_model
+                cb.model_name = actual
+    except Exception:  # noqa: BLE001  - labelling only
+        pass
     return runner.chat(model, **kw)
 
 

@@ -34,7 +34,7 @@ from langgraph.graph import END, START, StateGraph
 from config.settings import settings
 from services import call_check, contract as ctr, patch_targets, preserve, splice, static_check, symbols as sym, tasks as tsk
 from services.decision import Choice, decide_choice
-from services.model_calls import LLMJson, LLMText, ask_json, ask_text, reasoning_model
+from services.model_calls import LLMJson, LLMText, ask_json, ask_text, reasoning_model, role_model
 from services.patch_service import (apply_edits, diff_stats, join_diffs, make_diff, parse_edits,
                                     resolve_edit_paths)
 from services.repo_store import RepoStore, StaleRevision
@@ -50,6 +50,16 @@ if TYPE_CHECKING:  # avoid importing chroma/ollama just to type-hint
     from services.vector_store import VectorStoreService
 
 _CHAT_DIFF_CHARS = 6000
+
+
+def _shown(model: str) -> str:
+    """The id the request's runner will really call for `model` (status lines show what runs, not the Ollama-style name asked for)."""
+    try:
+        from services.runners import resolve_model
+        return resolve_model(model) or model
+    except Exception:  # noqa: BLE001
+        return model
+
 _PLAN_PATH = re.compile(r"^\s*[-*\u2022]\s*`?([\w./\\-]+\.\w+)`?")
 
 
@@ -719,7 +729,7 @@ class RepoChangeService:
             prompt = _DIAGNOSE_PROMPT.format(request=state["request"], plan=plan, diff=diff or "(nothing changed yet)",
                                              failure=failure, earlier="\n".join(f"- {h}" for h in earlier) or "(none)")
             model = self._role_model("diagnoser")
-            self._emit(f"Attempt {state['attempt']} failed: diagnosing with {model} before the next try")
+            self._emit(f"Attempt {state['attempt']} failed: diagnosing with {_shown(model)} before the next try")
             raw = (await self.llm_text(model, prompt, phase="DIAGNOSE", repo_id=state["repo_id"], num_predict=1200)).strip()
             self._log(state, f"DIAGNOSE after attempt {state['attempt']} ({model})", raw[:4000])
             return raw[:2500] if "ROOT CAUSE" in raw.upper() else ""
@@ -931,7 +941,7 @@ class RepoChangeService:
                                      outline=await self._outline(state),
                                      known="\n".join(state["known"][:300]))
         model = reasoning_model(settings.patcher_model)
-        self._emit(f"Planning with {model}")
+        self._emit(f"Planning with {_shown(model)}")
         try:
             plan = (await self.llm_text(model, prompt, phase="PLAN", repo_id=state["repo_id"],
                                         num_predict=1024)).strip()
@@ -1042,9 +1052,10 @@ class RepoChangeService:
         prompt = _PROMPT.format(request=state["request"], context=self._ctx_block(state), plan=plan,
                                 feedback=fb, files="\n\n".join(blocks))
         model = reasoning_model(settings.patcher_model)
-        if settings.change_escalation_model and attempt - state.get("free", 0) >= flag('change_max_attempts', settings.change_max_attempts):
-            model = settings.change_escalation_model          # the last counted attempt gets the strongest model
-        self._emit(f"Attempt {attempt}: asking {model} for edits"
+        escalation = role_model(settings.change_escalation_model)      # an Ollama-style tag means nothing on another runner: no escalation there
+        if escalation and attempt - state.get("free", 0) >= flag('change_max_attempts', settings.change_max_attempts):
+            model = escalation                                  # the last counted attempt gets the strongest model
+        self._emit(f"Attempt {attempt}: asking {_shown(model)} for edits"
                    + (f" (focused on {', '.join(focus_all)})" if focus_all else ""))
         try:
             raw = await self.llm_text(model, prompt, phase="PATCH", repo_id=state["repo_id"],
@@ -1378,7 +1389,7 @@ class RepoChangeService:
             extra = feedback + (("\nYOUR PREVIOUS REPLY WAS UNUSABLE:\n- " + "\n- ".join(problems) + "\n") if problems else "")
             prompt = _TEST_PROMPT.format(request=state["request"], diff="\n".join(diffs)[:9000],
                                          sources="\n\n".join(sources), style=style, feedback=extra, path=path)
-            self._emit(f"Writing tests for the change with {model}" + (" (rewrite)" if fb else ""))
+            self._emit(f"Writing tests for the change with {_shown(model)}" + (" (rewrite)" if fb else ""))
             try:
                 raw = (await self.llm_text(model, prompt, phase="TESTS", repo_id=state["repo_id"],
                                            num_predict=settings.change_max_output_tokens)).strip()
@@ -1453,7 +1464,7 @@ class RepoChangeService:
             prompt = _CONTRACT_PROMPT.format(request=state["request"], context=self._ctx_block(state), plan=plan,
                                              limit=settings.change_contract_max_symbols, feedback=feedback, sigs=sigs,
                                              outline=outline, known="\n".join(state["known"][:200]))
-            self._emit(f"Designing the contract with {model}" + (" (repair)" if round_ else ""))
+            self._emit(f"Designing the contract with {_shown(model)}" + (" (repair)" if round_ else ""))
             data = await self.llm_json(model, prompt, phase="CONTRACT", repo_id=state["repo_id"])
             shared, sprob = [], []
             if data is None:
@@ -1551,7 +1562,7 @@ class RepoChangeService:
                      "\nPROBLEM WITH YOUR PREVIOUS REPLY (fix it):\n- " + "\n- ".join(problems) + "\n"
             prompt = _TEST_FIRST_PROMPT.format(request=request, context=context, plan=plan, sigs=sigs, style=style,
                                                feedback=fb, path=path)
-            self._emit(f"Writing {label} with {model}" + (" (rewrite)" if round_ else ""))
+            self._emit(f"Writing {label} with {_shown(model)}" + (" (rewrite)" if round_ else ""))
             try:
                 raw = (await self.llm_text(model, prompt, phase="TESTS", repo_id=state["repo_id"],
                                            num_predict=settings.change_max_output_tokens)).strip()
@@ -1622,7 +1633,7 @@ class RepoChangeService:
     def _role_model(role: str) -> str:
         """An explicit per-role model (designer / implementer / tester / reviewer) wins, even over the user's per-request pick, so
         the roles stay independent; otherwise the patcher model."""
-        return getattr(settings, f"{role}_model", "") or reasoning_model(settings.patcher_model)
+        return role_model(getattr(settings, f"{role}_model", "")) or reasoning_model(settings.patcher_model)
 
     async def _review(self, state: ChangeState) -> dict:
         """A reviewer with a fresh context (request, scope and final diff only) checks coverage per requirement and unrequested
@@ -1657,7 +1668,7 @@ class RepoChangeService:
             request=state["request"], scope=scope, unplanned=", ".join(unplanned) or "none",
             tests=", ".join(sorted(gen)) or "none", verification=self._verification(state.get("tests", {})), diff=diff)
         model = self._role_model("reviewer")
-        self._emit(f"Review with a fresh context ({model}, ~{len(prompt) // 4} tokens)")
+        self._emit(f"Review with a fresh context ({_shown(model)}, ~{len(prompt) // 4} tokens)")
         data = await self.llm_json(model, prompt, phase="REVIEW", repo_id=state["repo_id"])
         if not isinstance(data, dict):
             msg = "review skipped: the reviewer gave no usable answer"

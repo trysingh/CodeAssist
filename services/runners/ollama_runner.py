@@ -14,6 +14,15 @@ class OllamaRunner:
     max_input_tokens = 0
     supports = {"vision": True, "json": True, "reasoning": True, "num_ctx": True, "embeddings": True}
 
+    timeout_setting = ""
+
+    def timeout_s(self):
+        """ChatOllama is built without a request timeout (a local model may legitimately think for minutes): None = unlimited."""
+        return None
+
+    def max_retries(self) -> int:
+        return 0
+
     def check_config(self) -> None:
         return None
 

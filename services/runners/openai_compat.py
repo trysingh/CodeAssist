@@ -8,7 +8,9 @@ A subclass only says WHAT differs; everything below is shared:
     name / label / remote / supports / max_input_tokens
     base_url(), api_key(), check_config()          where to call and whether it is set up
     llm_default(vision), embedding_default()       the model ids that Ollama-style names (`gemma4:31b-cloud`) are mapped to
-    map_model(model, vision=)                      the mapping hook (default: Ollama-style -> llm_default)
+    map_model(model, vision=)                      the mapping (see "Default-model semantics" below), map_foreign() is its hook
+    timeout_s(), max_retries(), timeout_setting     per-attempt timeout, client retries, and the env name that raises the timeout (error messages)
+    chat_extra(model, reasoning)                    extra ChatOpenAI kwargs (AI Studio: reasoning_effort)
     json_enabled(model)                            send response_format=json_object for this model?
     extra_headers()                                default_headers hook (Cloudflare: session affinity)
     chat_class(cls, model)                         last chance to wrap the client class (AI Studio: system-prompt folding)
@@ -16,6 +18,14 @@ A subclass only says WHAT differs; everything below is shared:
     _fetch_catalog()                                the remote model catalogue (default: GET {base_url}/models, OpenAI list shape)
 
 To add another OpenAI-style backend: subclass OpenAICompatRunner, fill those in, `register_runner("name", Cls)`.
+
+Default-model semantics (every runner here; Ollama keeps its own ids):
+    * an empty name, or an Ollama-style name that equals settings.llm_model (the Ollama-side global default that a request carries when
+      the UI picker is on "Default"), means "this runner's configured default": AISTUDIO_LLM_MODEL / CF_LLM_MODEL / OPENAI_COMPAT_LLM_MODEL
+      (vision calls: the runner's vision default);
+    * any OTHER Ollama-style name (e.g. a fallback model) goes through map_foreign(): the base class returns the default again, AI Studio
+      first tries its MODEL_MAP table (gemma4:26b -> gemma-4-26b-a4b-it);
+    * a native id (gemini-2.5-flash, @cf/..., meta-llama/...) is used as is.
 """
 from __future__ import annotations
 
@@ -135,10 +145,21 @@ class OpenAICompatRunner:
         """Is `model` an id of another backend (an Ollama tag) that must be mapped?"""
         return is_ollama_style(model)
 
+    def is_default_alias(self, model: str) -> bool:
+        """An empty name, or the Ollama-style global default (settings.llm_model): both mean "my configured default"."""
+        m = (model or "").strip()
+        return not m or (self.is_foreign_name(m) and m == (settings.llm_model or "").strip())
+
+    def map_foreign(self, model: str, vision: bool = False) -> str:
+        """An Ollama-style name that is not the global default (a fallback / role model). Base: this runner's default."""
+        return self.llm_default(vision)
+
     def map_model(self, model: str, *, vision: bool = False) -> str:
         m = (model or "").strip()
-        if not m or self.is_foreign_name(m):
+        if self.is_default_alias(m):
             return self.llm_default(vision)
+        if self.is_foreign_name(m):
+            return self.map_foreign(m, vision)
         return m
 
     def json_enabled(self, model: str) -> bool:
@@ -150,11 +171,17 @@ class OpenAICompatRunner:
     def chat_class(self, cls: Any, model: str) -> Any:
         return cls
 
+    timeout_setting = "COMPAT_TIMEOUT_S"            # the env name that raises timeout_s() (named in the timeout error message)
+
     def timeout_s(self) -> float:
         return settings.compat_timeout_s
 
     def max_retries(self) -> int:
         return settings.compat_max_retries
+
+    def chat_extra(self, model: str, reasoning: Any = None) -> Dict[str, Any]:
+        """Extra ChatOpenAI keyword arguments for this model (default none; AI Studio: reasoning_effort)."""
+        return {}
 
     # model picker
     def pinned_models(self) -> List[str]:
@@ -240,6 +267,7 @@ class OpenAICompatRunner:
         headers = self.extra_headers()
         if headers:
             kw["default_headers"] = headers
+        kw.update(self.chat_extra(mapped, reasoning))
         return self.chat_class(cls, mapped)(**kw)
 
     def embeddings(self, model: Optional[str] = None, *, embeddings_cls: Any = None) -> Any:

@@ -61,7 +61,8 @@ class AttachmentService:
         return kind, text.replace("\x00", "").strip()[:MAX_TEXT_CHARS]
 
     async def _ocr_image(self, data: bytes, mime: str) -> str:
-        llm = make_chat(settings.vision_model or settings.llm_model, temperature=0, vision=True, ollama_cls=ChatOllama)
+        llm = make_chat(settings.vision_model or settings.llm_model, temperature=0, vision=True, ollama_cls=ChatOllama,
+                         phase="ATTACHMENT_OCR")
         b64 = base64.b64encode(data).decode()
         msg = HumanMessage(content=[
             {"type": "text", "text": OCR_PROMPT},

@@ -16,7 +16,8 @@ from config.settings import settings
 from services.notifier import notifier
 from services.runners import RunnerConfigError, check_runner_config
 from services.runner_info import check_chat_choice, models_payload, runners_payload
-from services.llm_errors import ModelAuthError, ModelQuotaError, auth_error_response, quota_error_response
+from services.llm_errors import (InternalErrorMiddleware, ModelAuthError, ModelQuotaError, ModelTimeoutError, ModelUnavailableError,
+                                 auth_error_response, quota_error_response, timeout_error_response, unavailable_error_response)
 from services import action_log
 
 
@@ -24,6 +25,9 @@ from services import action_log
 app = FastAPI(title="CodeRAG Pluggable Chunking & Multi-Thread RAG API")
 app.add_exception_handler(ModelQuotaError, quota_error_response)    # cloud model out of credits (HTTP 402 from Ollama): readable 402 instead of a 500 + traceback
 app.add_exception_handler(ModelAuthError, auth_error_response)      # bad / missing provider credentials (HTTP 401/403): readable 401
+app.add_exception_handler(ModelTimeoutError, timeout_error_response)            # the model endpoint hung (openai.APITimeoutError, httpx.ReadTimeout ...): readable 504 {"kind": "timeout"}
+app.add_exception_handler(ModelUnavailableError, unavailable_error_response)    # the model endpoint cannot be reached (connection refused / failed): readable 503
+app.add_middleware(InternalErrorMiddleware)     # anything else that escapes a route: JSON 500 {"detail": "Type: message", "kind": "internal"} + one logged traceback (HTTPException / validation errors never get here)
 controller = EngineController()
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -84,7 +88,7 @@ async def serve_dashboard(request: Request):
 
 @app.get("/api/v1/runners")
 async def list_runners():
-    """Every registered runner for the UI switch: {"default", "runners": [{name, label, remote, configured, error}]}."""
+    """Every registered runner for the UI switch: {"default", "runners": [{name, label, remote, configured, error, timeout_s, max_retries}]}."""
     return runners_payload()
 
 @app.get("/api/v1/models")

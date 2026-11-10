@@ -5,7 +5,9 @@
     models    gemma-4-31b-it, gemma-4-26b-a4b-it, gemini-* ... (GET {base}/models lists them, ids may carry a "models/" prefix)
 
 AI Studio specifics this class absorbs:
-  * Ollama-style names are mapped through MODEL_MAP (gemma4:31b-cloud -> gemma-4-31b-it ...), any other `x:y` -> AISTUDIO_LLM_MODEL;
+  * an empty name or the Ollama-style global default (ENGINE_LLM_MODEL = gemma4:31b-cloud, what a request carries when the UI picker is on
+    "Default") means AISTUDIO_LLM_MODEL (vision calls: AISTUDIO_VISION_MODEL); MODEL_MAP (gemma4:26b -> gemma-4-26b-a4b-it ...) only
+    applies to OTHER explicit Ollama-style names (e.g. a fallback model); any other `x:y` -> AISTUDIO_LLM_MODEL;
   * older Gemma on the Gemini API rejects system instructions: AISTUDIO_FOLD_SYSTEM (auto = on for gemma*) merges the system
     prompt into the first user message (see openai_compat.folding_chat_cls);
   * json mode (response_format=json_object) is sent for gemini-* only (AISTUDIO_JSON_MODE auto|on|off): Gemma gets plain text
@@ -26,7 +28,8 @@ API_KEY_URL = "https://aistudio.google.com/apikey"
 RATE_LIMITS_URL = "https://ai.google.dev/gemini-api/docs/rate-limits"
 
 # Ollama-style name (regex on the lower-cased name) -> AI Studio id. First match wins; extend here. Anything else with a ':'
-# goes to settings.aistudio_llm_model.
+# goes to settings.aistudio_llm_model. Applies only to an EXPLICIT Ollama-style name that is not settings.llm_model (the global
+# default always means AISTUDIO_LLM_MODEL, see OpenAICompatRunner.map_model) and never to a vision call.
 MODEL_MAP: List[Tuple[str, str]] = [
     (r"^gemma-?4:31b", "gemma-4-31b-it"),
     (r"^gemma-?4:26b", "gemma-4-26b-a4b-it"),
@@ -35,6 +38,7 @@ CHAT_PREFIXES = ("gemini", "gemma")
 # Not chat models (or not usable through chat/completions): embeddings, image / video / speech generation, live, AQA.
 _NOT_CHAT = re.compile(r"embed|imagen|veo|tts|audio|live|aqa|image", re.IGNORECASE)
 _MODES = ("auto", "on", "off")
+_EFFORTS = ("none", "minimal", "low", "medium", "high")
 
 
 def strip_models_prefix(model_id: str) -> str:
@@ -76,19 +80,39 @@ class GoogleAIStudioRunner(OpenAICompatRunner):
     def embedding_default(self) -> str:
         return settings.aistudio_embedding_model
 
+    timeout_setting = "AISTUDIO_TIMEOUT_S"
+
+    def timeout_s(self) -> float:
+        return settings.aistudio_timeout_s
+
+    def max_retries(self) -> int:
+        return max(0, int(settings.aistudio_max_retries))
+
     def map_model(self, model: str, *, vision: bool = False) -> str:
-        m = strip_models_prefix(model)
-        if not m:
-            return self.llm_default(vision)
-        if self.is_foreign_name(m):
-            if vision:
-                return self.llm_default(True)
-            low = m.lower()
-            for pattern, target in MODEL_MAP:
-                if re.match(pattern, low):
-                    return target
-            return self.llm_default()
-        return m
+        return super().map_model(strip_models_prefix(model), vision=vision)
+
+    def map_foreign(self, model: str, vision: bool = False) -> str:
+        if vision:
+            return self.llm_default(True)
+        low = model.lower()
+        for pattern, target in MODEL_MAP:
+            if re.match(pattern, low):
+                return target
+        return self.llm_default()
+
+    def reasoning_effort(self, reasoning: Any = None) -> str:
+        """The reasoning_effort to send, or '' (not sent). AISTUDIO_REASONING_EFFORT: '' never; none|minimal|low|medium|high always;
+        auto = follow the call's `reasoning` argument (ASK_REASONING: off -> none, low / medium / high -> that level)."""
+        v = (settings.aistudio_reasoning_effort or "").strip().lower()
+        if v == "auto":
+            if reasoning is False:
+                return "none"
+            return reasoning if isinstance(reasoning, str) and reasoning in _EFFORTS else ""
+        return v if v in _EFFORTS else ""
+
+    def chat_extra(self, model: str, reasoning: Any = None) -> dict:
+        effort = self.reasoning_effort(reasoning)
+        return {"reasoning_effort": effort} if effort else {}
 
     def fold_system(self, model: str) -> bool:
         mode = _mode(settings.aistudio_fold_system)

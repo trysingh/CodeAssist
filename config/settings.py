@@ -64,8 +64,8 @@ class EngineSettings(BaseSettings):
     # Off -> only CF_MODELS. The catalogue is cached for cf_models_cache_s; on any API error the picker falls back to CF_MODELS.
     cf_list_all_models: bool = Field(default=True, validation_alias=AliasChoices("ENGINE_CF_LIST_ALL_MODELS", "CF_LIST_ALL_MODELS"))
     cf_models_cache_s: int = Field(default=600, validation_alias=AliasChoices("ENGINE_CF_MODELS_CACHE_S", "CF_MODELS_CACHE_S"))
-    cf_timeout_s: float = Field(default=120.0)
-    cf_max_retries: int = Field(default=2)
+    cf_timeout_s: float = Field(default=120.0, validation_alias=AliasChoices("ENGINE_CF_TIMEOUT_S", "CF_TIMEOUT_S"))      # seconds per attempt
+    cf_max_retries: int = Field(default=2, validation_alias=AliasChoices("ENGINE_CF_MAX_RETRIES", "CF_MAX_RETRIES"))       # the client retries a timeout / 5xx this many times: worst case = timeout x (retries + 1)
     # Cloudflare prompt caching: every call of one chat thread carries the same `x-session-affinity` header so the platform can
     # route it to the instance that already holds the prompt prefix (cached input tokens are billed lower).
     cf_session_affinity: bool = Field(default=True, validation_alias=AliasChoices("ENGINE_CF_SESSION_AFFINITY", "CF_SESSION_AFFINITY"))
@@ -91,6 +91,13 @@ class EngineSettings(BaseSettings):
     # response_format=json_object: auto = gemini* only (Gemma relies on the loose JSON parser); on / off force it.
     aistudio_json_mode: str = Field(default="auto", validation_alias=AliasChoices("ENGINE_AISTUDIO_JSON_MODE", "AISTUDIO_JSON_MODE"))
     aistudio_max_input_tokens: int = Field(default=60000, validation_alias=AliasChoices("ENGINE_AISTUDIO_MAX_INPUT_TOKENS", "AISTUDIO_MAX_INPUT_TOKENS"))
+    # Seconds one request may take (per attempt) and how often a timeout / 5xx is retried. A hang costs timeout x (retries + 1): the default is ONE retry,
+    # not the client's two, so a slow model does not silently cost three waits.
+    aistudio_timeout_s: float = Field(default=180.0, validation_alias=AliasChoices("ENGINE_AISTUDIO_TIMEOUT_S", "AISTUDIO_TIMEOUT_S"))
+    aistudio_max_retries: int = Field(default=1, validation_alias=AliasChoices("ENGINE_AISTUDIO_MAX_RETRIES", "AISTUDIO_MAX_RETRIES"))
+    # reasoning_effort sent to the Gemini OpenAI-compatible endpoint: "" = never sent (default: the model decides); none | minimal | low | medium | high = sent on every
+    # call; "auto" = follow ASK_REASONING for the calls that carry it (off -> none, low / medium / high -> that level). Gemini thinking models accept it; Gemma may not.
+    aistudio_reasoning_effort: str = Field(default="", validation_alias=AliasChoices("ENGINE_AISTUDIO_REASONING_EFFORT", "AISTUDIO_REASONING_EFFORT"))
 
     # ---- generic OpenAI-compatible runner ("openai": OpenRouter, Groq, vLLM, LM Studio ...); no OPENAI_COMPAT_BASE_URL = not set up ----
     openai_compat_base_url: str = Field(default="", validation_alias=AliasChoices("ENGINE_OPENAI_COMPAT_BASE_URL", "OPENAI_COMPAT_BASE_URL"))
@@ -101,6 +108,9 @@ class EngineSettings(BaseSettings):
     openai_compat_remote: bool = Field(default=True, validation_alias=AliasChoices("ENGINE_OPENAI_COMPAT_REMOTE", "OPENAI_COMPAT_REMOTE"))   # true = billed: TOKEN_MODE=auto runs lean
     openai_compat_list_all_models: bool = Field(default=False, validation_alias=AliasChoices("ENGINE_OPENAI_COMPAT_LIST_ALL_MODELS", "OPENAI_COMPAT_LIST_ALL_MODELS"))
     openai_compat_max_input_tokens: int = Field(default=0, validation_alias=AliasChoices("ENGINE_OPENAI_COMPAT_MAX_INPUT_TOKENS", "OPENAI_COMPAT_MAX_INPUT_TOKENS"))
+    # None = use compat_timeout_s / compat_max_retries below
+    openai_compat_timeout_s: Optional[float] = Field(default=None, validation_alias=AliasChoices("ENGINE_OPENAI_COMPAT_TIMEOUT_S", "OPENAI_COMPAT_TIMEOUT_S"))
+    openai_compat_max_retries: Optional[int] = Field(default=None, validation_alias=AliasChoices("ENGINE_OPENAI_COMPAT_MAX_RETRIES", "OPENAI_COMPAT_MAX_RETRIES"))
     # shared by "aistudio" and "openai" (Cloudflare keeps its cf_* values)
     compat_timeout_s: float = Field(default=120.0)
     compat_max_retries: int = Field(default=2)

@@ -17,11 +17,20 @@ quota text; bad / unauthorised token = 401 / 403 -> `ModelAuthError`). Google AI
 RESOURCE_EXHAUSTED / "exceeded your current quota", 400 API_KEY_INVALID, 401 / 403 PERMISSION_DENIED. Messages name the active
 runner (the request's runner_scope, else settings.llm_runner).
 
+Timeouts and transport failures get the same treatment (never a bare 500, never a silent UI): a request that times out
+(openai.APITimeoutError / langchain_openai's OpenAITimeoutError, httpx.ReadTimeout / ConnectTimeout, asyncio.TimeoutError, ... matched by
+CLASS NAME along the exception's MRO, so no provider package is imported) becomes `ModelTimeoutError` (HTTP 504 {"detail", "kind": "timeout",
+"runner", "model", "timeout_s"}); a refused / unreachable connection (APIConnectionError, httpx.ConnectError) becomes `ModelUnavailableError`
+(HTTP 503); anything else that escapes a route is turned into HTTP 500 {"detail": "Type: message", "kind": "internal"} by
+`InternalErrorMiddleware` (the traceback is logged once).
+
 Imports only config.settings at module level (notifier / action_log are imported lazily), so there is no import cycle.
 """
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 import re
 import time
 from contextlib import contextmanager
@@ -32,6 +41,7 @@ from config.settings import settings
 from services.runners.base import MODEL_NAME as _MODEL_NAME     # same shape model_calls.model_scope accepts ('@' allowed: Cloudflare ids)
 
 T = TypeVar("T")
+log = logging.getLogger("coderag.errors")
 
 PLANS_URL = "https://ollama.com/plans"
 AISTUDIO_KEY_URL = "https://aistudio.google.com/apikey"
@@ -183,6 +193,122 @@ def as_auth_error(exc: BaseException, model: str) -> Optional[ModelAuthError]:
     return None if status is None else ModelAuthError(model, status, str(exc)[:300])
 
 
+# ---------------------------------------------------------------- timeouts / unreachable endpoint
+# Matched by class name along the MRO: openai.APITimeoutError, langchain_openai's OpenAITimeoutError, httpx.ReadTimeout / WriteTimeout /
+# ConnectTimeout / PoolTimeout (base TimeoutException), asyncio.TimeoutError / the builtin TimeoutError.
+_TIMEOUT_NAMES = frozenset({"APITimeoutError", "OpenAITimeoutError", "ReadTimeout", "WriteTimeout", "ConnectTimeout", "PoolTimeout",
+                            "TimeoutException", "TimeoutError"})
+# openai.APIConnectionError (its APITimeoutError subclass is tested FIRST), httpx.ConnectError, the builtin ConnectionError family.
+_CONNECT_NAMES = frozenset({"APIConnectionError", "ConnectError", "ConnectionError"})
+
+
+def _mro_names(e: BaseException) -> set:
+    return {c.__name__ for c in type(e).__mro__}
+
+
+def is_timeout(exc: BaseException) -> bool:
+    return any(_mro_names(e) & _TIMEOUT_NAMES for e in _chain(exc))
+
+
+def is_unreachable(exc: BaseException) -> bool:
+    return not is_timeout(exc) and any(_mro_names(e) & _CONNECT_NAMES for e in _chain(exc))
+
+
+def _runner_facts(model: str) -> dict:
+    """What the active runner is called, which id it really calls for `model`, its per-attempt timeout, attempts and timeout setting."""
+    name = _active_runner()
+    facts = {"runner": name, "label": name, "model": model, "timeout_s": None, "attempts": 1, "setting": ""}
+    try:
+        from services.runners import get_runner
+        r = get_runner()
+        facts["runner"] = str(getattr(r, "name", name) or name)
+        facts["label"] = str(getattr(r, "label", "") or facts["runner"])
+        try:
+            facts["model"] = r.map_model(model) or model
+        except Exception:  # noqa: BLE001
+            pass
+        t = getattr(r, "timeout_s", None)
+        t = t() if callable(t) else None
+        facts["timeout_s"] = float(t) if t else None
+        n = getattr(r, "max_retries", None)
+        facts["attempts"] = (int(n()) if callable(n) else 0) + 1
+        facts["setting"] = str(getattr(r, "timeout_setting", "") or "")
+    except Exception:  # noqa: BLE001 - the message is best effort; the error itself must still come out
+        pass
+    return facts
+
+
+def _fmt_s(value) -> str:
+    return f"{value:g}" if isinstance(value, (int, float)) else str(value)
+
+
+class ModelTimeoutError(RuntimeError):
+    """The model endpoint did not answer in time (on every attempt). Retrying the same call mostly repeats the wait."""
+
+    def __init__(self, model: str, timeout_s: Optional[float] = None, attempts: Optional[int] = None, runner: str = "",
+                 provider_message: str = "", setting: Optional[str] = None):
+        f = _runner_facts(model)
+        self.model = f["model"]                 # the id the runner really called
+        self.runner = (runner or f["runner"] or "ollama").strip().lower()
+        self.label = f["label"] if self.runner == f["runner"] else self.runner
+        self.timeout_s = f["timeout_s"] if timeout_s is None else timeout_s
+        self.attempts = f["attempts"] if attempts is None else attempts
+        self.setting = f["setting"] if setting is None else setting
+        self.provider_message = (provider_message or "").strip()
+        super().__init__(self.user_message())
+
+    def user_message(self) -> str:
+        how = f"within {_fmt_s(self.timeout_s)}s" if self.timeout_s else "in time"
+        tail = f"raise {self.setting}" if self.setting else "check that the server is reachable"
+        return (f"{self.label} did not answer {how} (model {self.model}, {self.attempts} attempt(s)). "
+                f"Try a faster model (e.g. a Gemini Flash model), Lean mode, or {tail}.")
+
+
+class ModelUnavailableError(RuntimeError):
+    """The model endpoint could not be reached at all (connection refused / failed / DNS)."""
+
+    def __init__(self, model: str, provider_message: str = "", runner: str = ""):
+        f = _runner_facts(model)
+        self.model = f["model"]
+        self.runner = (runner or f["runner"] or "ollama").strip().lower()
+        self.label = f["label"] if self.runner == f["runner"] else self.runner
+        self.provider_message = (provider_message or "").strip()
+        super().__init__(self.user_message())
+
+    def user_message(self) -> str:
+        hint = {"ollama": f"Is Ollama running at {settings.ollama_base_url}? (`ollama serve`)",
+                "aistudio": "Check the internet connection / proxy (generativelanguage.googleapis.com) or AISTUDIO_BASE_URL.",
+                "cloudflare": "Check the internet connection / proxy (api.cloudflare.com) or CF_AI_GATEWAY_URL.",
+                "openai": "Check OPENAI_COMPAT_BASE_URL and that the server is running."}.get(self.runner, "Check the endpoint URL and your network.")
+        return f"{self.label} could not be reached (model {self.model}): the connection failed. {hint}"
+
+
+def as_timeout_error(exc: BaseException, model: str) -> Optional[ModelTimeoutError]:
+    if isinstance(exc, ModelTimeoutError):
+        return exc
+    return ModelTimeoutError(model, provider_message=f"{type(exc).__name__}: {exc}"[:300]) if is_timeout(exc) else None
+
+
+def as_unavailable_error(exc: BaseException, model: str) -> Optional[ModelUnavailableError]:
+    if isinstance(exc, ModelUnavailableError):
+        return exc
+    return ModelUnavailableError(model, f"{type(exc).__name__}: {exc}"[:300]) if is_unreachable(exc) else None
+
+
+def _report_failure(title: str, msg: str, model: str, phase: str) -> None:
+    """Make the failure visible in the UI's telemetry list and Activity timeline (soft: reporting never changes the error)."""
+    try:
+        from services.notifier import notifier
+        notifier.notify(title, msg, level="ERROR")
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from services.action_log import log_action
+        log_action("LLM", phase or "LLM", "llm_call", "fail", msg[:300], model=model)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def fallback_for(model: str) -> str:
     """settings.llm_fallback_model when it is usable for `model` (set, valid, different), else ''.
 
@@ -272,8 +398,9 @@ async def with_model_fallback(call: Callable[[str], Awaitable[T]], model: str, *
         later call for `model` goes straight to the fallback),
       * not set                          -> raises ModelQuotaError (readable message, mapped to HTTP 402 by the API).
 
-    Any other failure propagates unchanged; so does cancellation. `call` receives the model name to use and must build
-    a fresh client for it."""
+    A timeout (ModelTimeoutError, HTTP 504) or an unreachable endpoint (ModelUnavailableError, HTTP 503) is raised as a readable
+    error too, without a fallback (the fallback would most likely wait just as long). Any other failure propagates unchanged; so
+    does cancellation. `call` receives the model name to use and must build a fresh client for it."""
     fb = fallback_for(model)
     status = _blocked_status(model) if fb else None
     if status is None:
@@ -287,6 +414,14 @@ async def with_model_fallback(call: Callable[[str], Awaitable[T]], model: str, *
                 auth = as_auth_error(exc, model)
                 if auth is not None:        # wrong / missing credentials: a readable error, not a traceback (a fallback would fail the same way)
                     raise auth from exc
+                slow = as_timeout_error(exc, model)
+                if slow is not None:        # a hang: say so (and which setting to raise) instead of a 500 with a 200-line traceback
+                    _report_failure("Model timeout", str(slow), slow.model, phase)
+                    raise slow from exc
+                down = as_unavailable_error(exc, model)
+                if down is not None:
+                    _report_failure("Model unreachable", str(down), down.model, phase)
+                    raise down from exc
                 raise
             if not fb:
                 raise quota from exc
@@ -316,3 +451,65 @@ async def quota_error_response(_request, exc: ModelQuotaError):
     return JSONResponse(status_code=402, content={
         "detail": exc.user_message(), "error": "model_quota", "model": exc.model,
         "status": exc.status, "fallback_tried": exc.fallback_tried or None})
+
+
+def timeout_payload(exc: ModelTimeoutError) -> Tuple[int, dict]:
+    return 504, {"detail": exc.user_message(), "kind": "timeout", "runner": exc.runner, "model": exc.model, "timeout_s": exc.timeout_s}
+
+
+def unavailable_payload(exc: ModelUnavailableError) -> Tuple[int, dict]:
+    return 503, {"detail": exc.user_message(), "kind": "unavailable", "runner": exc.runner, "model": exc.model}
+
+
+def internal_payload(exc: BaseException) -> Tuple[int, dict]:
+    """Last-resort 500 body: "<ExceptionType>: <message>" (short, no traceback) so the UI always has something to show."""
+    text = " ".join(str(exc).split())[:300]
+    return 500, {"detail": f"{type(exc).__name__}: {text}" if text else type(exc).__name__, "kind": "internal"}
+
+
+async def timeout_error_response(_request, exc: ModelTimeoutError):
+    """FastAPI exception handler: HTTP 504 + {"detail", "kind": "timeout", "runner", "model", "timeout_s"}."""
+    from fastapi.responses import JSONResponse
+    status, body = timeout_payload(exc)
+    return JSONResponse(status_code=status, content=body)
+
+
+async def unavailable_error_response(_request, exc: ModelUnavailableError):
+    """FastAPI exception handler: HTTP 503 + {"detail", "kind": "unavailable", "runner", "model"}."""
+    from fastapi.responses import JSONResponse
+    status, body = unavailable_payload(exc)
+    return JSONResponse(status_code=status, content=body)
+
+
+class InternalErrorMiddleware:
+    """Pure ASGI safety net: an exception that no handler took becomes HTTP 500 {"detail": "Type: message", "kind": "internal"} and its
+    traceback is logged ONCE (the default path logs it and answers a text/plain "Internal Server Error" the UI cannot show). It sits inside
+    the server-error layer and outside FastAPI's exception handling, so HTTPException, request validation errors and the registered
+    handlers (402 / 401 / 504 / 503) never reach it. Not applied once a response has started (streams): that error is re-raised."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http":
+            return await self.app(scope, receive, send)
+        started = False
+
+        async def tracking_send(message):
+            nonlocal started
+            if message.get("type") == "http.response.start":
+                started = True
+            await send(message)
+
+        try:
+            await self.app(scope, receive, tracking_send)
+        except Exception as exc:  # noqa: BLE001 - CancelledError is a BaseException and passes through
+            if started:
+                raise
+            log.error("Unhandled error in %s %s", scope.get("method", ""), scope.get("path", ""), exc_info=exc)
+            _report_failure("Request failed", f"{scope.get('path', '')}: {type(exc).__name__}: {exc}"[:300], "", "API")
+            status, body = internal_payload(exc)
+            payload = json.dumps(body).encode("utf-8")
+            await send({"type": "http.response.start", "status": status,
+                        "headers": [(b"content-type", b"application/json"), (b"content-length", str(len(payload)).encode())]})
+            await send({"type": "http.response.body", "body": payload})

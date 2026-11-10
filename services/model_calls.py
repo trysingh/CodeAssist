@@ -14,6 +14,7 @@ from config.settings import settings
 from services.llm_errors import with_model_fallback
 from services.runners import MODEL_NAME, get_runner, runner_scope           # noqa: F401  (runner_scope: re-exported next to model_scope)
 from services.token_budget import effective_mode, token_mode_scope           # noqa: F401  (same: the per-request token-mode pick)
+from collections import deque
 from contextlib import contextmanager
 from contextvars import ContextVar
 
@@ -38,8 +39,54 @@ def model_scope(model: str):
     finally:
         _model_override.reset(token)
 
+def role_model(name: str) -> str:
+    """A per-role model setting (PATCHER_MODEL, CHANGE_ESCALATION_MODEL, DIAGNOSER_MODEL ...) as the request's runner understands it.
+    On a non-Ollama runner an Ollama-style tag (qwen3-coder:30b, gemma4:31b-cloud) is not a model of that backend: '' = "use this runner's
+    default" (the caller then falls back to the patcher / global default, which resolves to the runner's configured model)."""
+    n = (name or "").strip()
+    if not n:
+        return ""
+    try:
+        foreign = getattr(get_runner(), "is_foreign_name", None)
+        if foreign is not None and foreign(n):
+            return ""
+    except Exception:  # noqa: BLE001 - an unusable runner config is reported by the call itself
+        pass
+    return n
+
+
 def reasoning_model(default: str = "") -> str:
-    return _model_override.get() or default or settings.llm_model
+    """The model NAME a call asks for: the user's pick, else the role setting `default` (Ollama-style names are ignored on other
+    runners, see role_model), else settings.llm_model. The runner maps it to its real id (resolve_model); '' / settings.llm_model
+    mean the runner's configured default."""
+    return _model_override.get() or role_model(default) or settings.llm_model
+
+
+_announced: deque = deque(maxlen=256)       # request ids whose "model resolved" line was already written
+
+
+def announce_model() -> None:
+    """Request start: tell the user which model this request really calls ("model resolved: runner=aistudio picked=Default ->
+    gemini-2.5-flash"), once per request. An Activity event and a telemetry-list line. Never raises."""
+    try:
+        from services import action_log as al
+        rid = al.current_request_id() or ""
+        if rid and rid in _announced:
+            return
+        if rid:
+            _announced.append(rid)
+        runner = get_runner()
+        pick = _model_override.get()
+        actual = runner.map_model(pick or settings.llm_model)
+        detail = f"model resolved: runner={runner.name} picked={pick or 'Default'} -> {actual}"
+        t = getattr(runner, "timeout_s", None)
+        t = t() if callable(t) else None
+        al.log_action("LLM", "ModelResolve", "model_resolved", "info", detail, model=actual,
+                      data={"runner": runner.name, "picked": pick or "Default", "model": actual, "timeout_s": t})
+        from services.notifier import notifier
+        notifier.notify("Model resolved", detail, level="INFO")
+    except Exception:  # noqa: BLE001
+        pass
 
 async def list_chat_models(runner: Optional[str] = None) -> list:
     """Chat models of `runner` (None = the request's runner_scope, else settings.llm_runner; Ollama: GET /api/tags, embedding
@@ -49,12 +96,13 @@ async def list_chat_models(runner: Optional[str] = None) -> list:
     except Exception:  # noqa: BLE001
         return []
 
-def _callbacks(model: str, repo_id: str, phase: str) -> list:
+def _callbacks(model: str, repo_id: str, phase: str, requested: str = "") -> list:
+    """Telemetry callback for one call. `model` = the id the runner really calls, `requested` = the name the caller asked for."""
     try:
         from services.notifier import notifier
         from services.telemetry import StdoutTelemetryCallback
         return [StdoutTelemetryCallback(
-            model_name=model, repo_id=repo_id, phase=phase,
+            model_name=model, repo_id=repo_id, phase=phase, requested_model=requested,
             emitter=lambda data: notifier.notify("Telemetry Trace", data, level="INFO"))]
     except Exception:
         return []
@@ -93,9 +141,9 @@ def reasoning_arg(value: str = ""):
 def _build(model: str, *, json_mode: bool, num_predict: Optional[int], num_ctx: int,
            repo_id: str, phase: str, reasoning=None):
     runner = get_runner()
-    model = runner.map_model(model)         # Cloudflare: an Ollama-style name becomes settings.cf_llm_model (Ollama: unchanged)
-    return runner.chat(model, temperature=0, max_tokens=num_predict, json_mode=json_mode, reasoning=reasoning,
-                       num_ctx=num_ctx, callbacks=_callbacks(model, repo_id, phase))
+    actual = runner.map_model(model)        # an empty / Ollama-style name becomes the runner's configured default (Ollama: unchanged)
+    return runner.chat(actual, temperature=0, max_tokens=num_predict, json_mode=json_mode, reasoning=reasoning,
+                       num_ctx=num_ctx, callbacks=_callbacks(actual, repo_id, phase, requested=model))
 
 
 async def ask_text(model: str, prompt: str, *, phase: str = "CHANGE", repo_id: str = "",

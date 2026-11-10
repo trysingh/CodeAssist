@@ -244,16 +244,58 @@ document.addEventListener('keydown', e => {
 });
 
 /* ================= Toasts & live notification stream ================= */
-function showToast(title, message, type = 'info') {
+function showToast(title, message, type = 'info', ms) {
     const container = $('toast-container');
     if (!container) return;
     const bar = { success: 'bg-emerald-500', error: 'bg-red-500', warning: 'bg-amber-500' }[type] || 'bg-blue-500';
     const toast = document.createElement('div');
     toast.className = 'pointer-events-auto flex rounded-xl border border-slate-300 dark:border-slate-700 shadow-2xl bg-white dark:bg-slate-800 text-slate-900 dark:text-white overflow-hidden cursor-pointer';
     toast.innerHTML = `<span class="w-1 ${bar} shrink-0"></span><div class="flex-1 min-w-0 px-3.5 py-3"><h5 class="text-xs font-semibold">${esc(title)}</h5><p class="text-[11px] text-slate-600 dark:text-slate-300 mt-0.5 break-words">${esc(message)}</p></div>`;
+    toast.dataset.msg = String(message);
     toast.onclick = () => toast.remove();
     container.appendChild(toast);
-    setTimeout(() => toast.remove(), 4500);
+    setTimeout(() => toast.remove(), ms || 4500);
+}
+
+/* ---- Failures: a failed request must never be silent. The server answers JSON {detail, kind?, ...} (402 quota, 401 credentials, 504 timeout,
+   503 unreachable, 500 internal); anything else (plain text, HTML, a dead connection) is described here as well. ---- */
+async function describeFailure(res) {
+    let detail = '', kind = '', body = null;
+    try { body = await res.clone().json(); } catch { /* not JSON */ }
+    if (body && typeof body === 'object') {
+        const d = body.detail;
+        if (typeof d === 'string') detail = d;
+        else if (Array.isArray(d)) detail = d.map(x => (x && (x.msg || x.message)) || (typeof x === 'string' ? x : JSON.stringify(x))).join('; ');   // 422 validation errors
+        else if (d && typeof d === 'object') detail = d.message || JSON.stringify(d);
+        kind = String(body.kind || body.error || '');
+    }
+    if (!detail) { try { detail = (await res.text()).replace(/\s+/g, ' ').trim().slice(0, 300); } catch { /* body unreadable */ } }
+    if (!detail) detail = `Server returned ${res.status}${res.statusText ? ' ' + res.statusText : ''}`;
+    const titles = { timeout: 'Model timeout', unavailable: 'Model unreachable', internal: 'Server error', model_quota: 'Model quota used up', model_auth: 'Model credentials rejected' };
+    const byStatus = { 401: 'Model credentials rejected', 402: 'Model quota used up', 413: 'Attachment too large', 415: 'Unsupported attachment', 503: 'Model unreachable', 504: 'Model timeout' };
+    const title = titles[kind] || byStatus[res.status] || (res.status >= 500 ? 'Server error' : `Request failed (HTTP ${res.status})`);
+    return { title, message: detail, kind, status: res.status };
+}
+
+function failureOf(err) {       // an Error thrown by the chat flow -> {title, message}
+    if (err && err.failure) return err.failure;
+    const m = (err && err.message) || String(err);
+    return { title: 'Message failed', message: /failed to fetch|networkerror|load failed|network request failed/i.test(m)
+        ? `Could not reach the CodeAssist server (${m}). Is it still running? Your message is back in the box.` : m };
+}
+
+function errorBubbleHtml(title, message) {
+    return `<div class="flex gap-3 group scroll-mt-4" role="alert">
+        <div class="msg-avatar w-7 h-7 mt-0.5 rounded-lg bg-red-500/15 border border-red-500/30 flex items-center justify-center text-red-400 shrink-0"><i data-lucide="alert-triangle" class="w-4 h-4"></i></div>
+        <div class="min-w-0 flex-1"><div class="text-sm rounded-xl border border-red-500/40 bg-red-500/10 text-red-700 dark:text-red-300 px-3.5 py-2.5 break-words">
+            <div class="font-semibold text-xs mb-0.5">${esc(title)}</div><div class="whitespace-pre-wrap">${esc(message)}</div></div></div></div>`;
+}
+
+function showFailure(f) {       // chat error bubble + error toast (longer than the default, and it replaces the same text from the event stream)
+    const col = $('chat-col');
+    if (col) { col.insertAdjacentHTML('beforeend', errorBubbleHtml(f.title, f.message)); icons(); col.lastElementChild.scrollIntoView({ block: 'nearest' }); }
+    document.querySelectorAll('#toast-container [data-msg]').forEach(t => { if (t.dataset.msg === String(f.message)) t.remove(); });
+    showToast(f.title, f.message, 'error', 12000);
 }
 
 function setConn(ok) {
@@ -312,7 +354,8 @@ function prettyMessage(ev) {
             const t = JSON.parse(ev.message);
             const extra = (t.cached_input_tokens ? ` · cached ${t.cached_input_tokens}` : '') + (t.est_tokens_saved ? ` · saved ~${t.est_tokens_saved}` : '') +
                 (t.runner ? ` · ${t.runner}` : '') + (t.token_mode ? ` · mode ${t.token_mode}` : '');
-            return `${t.phase} · ${t.model} · in ${t.input_tokens} / out ${t.output_tokens} / total ${t.total_tokens} tok · ${t.duration_sec}s${extra}`;
+            const asked = t.requested_model && t.requested_model !== t.model ? ` (asked ${t.requested_model})` : '';      // the id really called comes first
+            return `${t.phase} · ${t.model}${asked} · in ${t.input_tokens} / out ${t.output_tokens} / total ${t.total_tokens} tok · ${t.duration_sec}s${extra}`;
         } catch { /* not JSON: show as is */ }
     }
     if (ev.title === 'Token usage') {          // one summary line per question: the sum of its LLM calls
@@ -888,7 +931,7 @@ async function loadRunners() {
     try {
         const r = await (await fetch('/api/v1/runners')).json();
         const list = r.runners || [];
-        S.runnerLabels = {}; list.forEach(x => { S.runnerLabels[x.name] = x.label || x.name; });
+        S.runnerLabels = {}; S.runnerTimeouts = {}; list.forEach(x => { S.runnerLabels[x.name] = x.label || x.name; S.runnerTimeouts[x.name] = x.timeout_s; });
         sel.innerHTML = `<option value="">Default (${esc(runnerLabel(r.default))})</option>` + list.map(x =>
             `<option value="${esc(x.name)}"${x.configured ? '' : ' disabled'} title="${esc(x.configured ? `${x.label || x.name} (${x.name}): ${x.remote ? 'remote / paid runner' : 'local runner'}` : (x.error || 'not configured'))}">${esc(x.label || x.name)}${x.remote ? ' ☁' : ''}${x.configured ? '' : ' (not set up)'}</option>`).join('');
         S.defaultRunner = r.default; S.serverTokenMode = r.token_mode || 'auto';
@@ -934,6 +977,8 @@ function toggleChatSettings(open) {
 
 function wireChatSettings() {
     ['runner-select', 'model-select', 'token-mode-select'].forEach(id => { const el = $(id); if (el) el.addEventListener('change', updateSettingsChip); });
+    const tt = $('task-timer-toggle');       // "Show task timer": the live elapsed-time toast
+    if (tt) { tt.checked = taskTimerOn(); tt.addEventListener('change', () => { LS.set('taskTimer', tt.checked); if (!tt.checked) taskEnd('hide'); }); }
     document.addEventListener('click', e => {
         const box = $('chat-settings');
         if (box && !box.contains(e.target)) toggleChatSettings(false);
@@ -943,6 +988,8 @@ function wireChatSettings() {
         if (e.key === 'Escape' && panel && !panel.classList.contains('hidden')) { toggleChatSettings(false); const c = $('settings-chip'); if (c) c.focus(); }
     });
 }
+
+function shortModel(m) { return String(m).replace(/^@cf\/[^/]+\//, ''); }       // @cf/google/gemma-4-26b-a4b-it -> gemma-4-26b-a4b-it
 
 async function loadModels() {
     const sel = $('model-select'); if (!sel) return;
@@ -955,7 +1002,8 @@ async function loadModels() {
         const r = await res.json();
         // The list comes from the chosen runner (the switch, else LLM_RUNNER): Ollama tags or the Cloudflare CF_MODELS list.
         const runner = r.runner || 'ollama';
-        const short = m => String(m).replace(/^@cf\/[^/]+\//, '');    // @cf/google/gemma-4-26b-a4b-it -> gemma-4-26b-a4b-it
+        const short = shortModel;
+        S.defaultModel = r.default;
         const models = (r.models || []).filter(m => m !== r.default);
         sel.innerHTML = `<option value="" title="${esc(r.default)} (${esc(runnerLabel(runner))})">Default (${esc(short(r.default))})</option>` +
             `<optgroup label="${esc(runnerLabel(runner))} models">` +
@@ -971,30 +1019,113 @@ async function loadModels() {
     updateSettingsChip();
 }
 
+/* Stop: shared by the composer's stop button and the task toast. */
+async function stopChat() {
+    const ctl = S.abortController;
+    if (!ctl) return;
+    try {
+        const params = new URLSearchParams({ thread_id: S.threadId });
+        if (S.repoId) params.set('repo_id', S.repoId);
+        const res = await fetch(`/api/v1/chat/stop?${params.toString()}`, { method: 'POST' });
+        if (res.ok) {
+            ctl.abort();
+            showToast("Cancelled", "Chat request terminated.", "info");
+        } else if (res.status === 404) {
+            ctl.abort();
+        }
+    } catch (err) {
+        console.error("Stop request failed:", err);
+        ctl.abort();
+    }
+}
+
+/* ---- Task toast: a live elapsed-time counter while a chat / change request runs, against the runner's per-call timeout.
+   Colour: < 50% of the limit blue, 50-90% amber, > 90% red. A multi-step task legitimately outlives one call's limit: when the
+   activity stream reports a finished LLM call (action "llm_call") for THIS request, the per-call part restarts ("step N · this call
+   m:ss / T"), the total keeps running. Toggle: "Show task timer" in the chat settings (localStorage crag.taskTimer, default on). ---- */
+const TASK_LIMIT_FALLBACK_S = 120;
+const taskTimerOn = () => LS.get('taskTimer', true) !== false;
+const fmtClock = s => { s = Math.max(0, Math.floor(s)); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`; };
+
+function taskLimit() {
+    const t = S.runnerTimeouts && S.runnerTimeouts[S.runner || S.defaultRunner];
+    return { s: t > 0 ? t : TASK_LIMIT_FALLBACK_S, known: t > 0 };
+}
+
+function taskTone(ratio) { return ratio > 0.9 ? 'red' : ratio >= 0.5 ? 'amber' : 'blue'; }
+const TASK_TONES = { blue: ['bg-blue-500', 'text-blue-500'], amber: ['bg-amber-500', 'text-amber-500'], red: ['bg-red-500', 'text-red-500'], green: ['bg-emerald-500', 'text-emerald-500'] };
+
+function taskRender() {
+    const T = S.task; if (!T || !T.el) return;
+    const now = performance.now(), total = (now - T.t0) / 1000, call = (now - T.callT0) / 1000;
+    const ratio = call / T.limit;
+    const tone = TASK_TONES[taskTone(ratio)];
+    const q = sel => T.el.querySelector(sel);
+    const stepped = T.step > 0;
+    q('[data-t=time]').textContent = stepped ? `step ${T.step + 1} · this call ${fmtClock(call)} / ${fmtClock(T.limit)} · total ${fmtClock(total)}` : fmtClock(total);
+    q('[data-t=time]').className = `text-[11px] font-mono mt-0.5 ${tone[1]}`;
+    const bar = q('[data-t=bar]'); bar.style.width = Math.min(100, ratio * 100).toFixed(1) + '%';
+    bar.className = `h-full ${tone[0]} transition-[width] duration-700`;
+    q('[data-t=accent]').className = `w-1 ${tone[0]} shrink-0`;
+    q('[data-t=note]').textContent = ratio > 1
+        ? (stepped ? `This call is past the ${T.limit}s limit — it may be retrying. ` : '') + "Longer than one call's limit — the task may be on a later step or retrying."
+        : (T.known ? `limit ${T.limit}s per model call` : `about ${T.limit}s per model call (no hard limit on this runner)`) + (T.lastMs ? ` · last call ${fmtClock(T.lastMs / 1000)}` : '');
+}
+
+function taskStart() {
+    taskEnd('hide');
+    if (!taskTimerOn()) return;
+    const container = $('toast-container'); if (!container) return;
+    const lim = taskLimit();
+    const modelName = S.model ? shortModel(S.model) : (S.defaultModel ? shortModel(S.defaultModel) : 'default model');
+    const el = document.createElement('div');
+    el.className = 'pointer-events-auto flex rounded-xl border border-slate-300 dark:border-slate-700 shadow-2xl bg-white dark:bg-slate-800 text-slate-900 dark:text-white overflow-hidden';
+    el.setAttribute('role', 'status');
+    el.innerHTML = `<span data-t="accent" class="w-1 bg-blue-500 shrink-0"></span><div class="flex-1 min-w-0 px-3.5 py-3">
+        <div class="flex items-start justify-between gap-2"><h5 data-t="title" class="text-xs font-semibold min-w-0 break-words">${esc(`Working · ${runnerLabel(S.runner || S.defaultRunner)} · ${modelName}`)}</h5>
+            <button type="button" data-t="stop" class="shrink-0 text-[10px] font-medium px-2 py-0.5 rounded-md bg-red-600 hover:bg-red-500 text-white" title="Stop this request">Stop</button></div>
+        <p data-t="time" class="text-[11px] font-mono mt-0.5">0:00</p>
+        <div class="h-1 rounded bg-slate-200 dark:bg-slate-700 mt-1.5 overflow-hidden"><div data-t="bar" class="h-full w-0 bg-blue-500"></div></div>
+        <p data-t="note" class="text-[10px] text-slate-600 dark:text-slate-300 mt-1 break-words"></p></div>`;
+    el.querySelector('[data-t=stop]').onclick = () => stopChat();
+    container.appendChild(el);
+    const now = performance.now();
+    S.task = { el, t0: now, callT0: now, step: 0, lastMs: 0, limit: lim.s, known: lim.known, uids: new Set(), timer: setInterval(taskRender, 1000) };
+    taskRender();
+}
+
+/* An LLM call of this request finished (Activity event, kind action "llm_call"): the next call starts now. */
+function taskStep(ev) {
+    const T = S.task; if (!T) return;
+    if (ev.uid != null) { if (T.uids.has(String(ev.uid))) return; T.uids.add(String(ev.uid)); }
+    T.step += 1; T.callT0 = performance.now(); T.lastMs = Number(ev.duration_ms) || 0;
+    taskRender();
+}
+
+/* outcome: 'done' -> "Done in m:ss" (gone after 3 s); 'failed' -> "Failed after m:ss" (stays until clicked); 'hide'/'stopped' -> removed. */
+function taskEnd(outcome) {
+    const T = S.task; if (!T) return;
+    clearInterval(T.timer); S.task = null;
+    const el = T.el; if (!el) return;
+    const total = fmtClock((performance.now() - T.t0) / 1000);
+    if (outcome !== 'done' && outcome !== 'failed') { el.remove(); return; }
+    const failed = outcome === 'failed', tone = TASK_TONES[failed ? 'red' : 'green'];
+    el.querySelector('[data-t=accent]').className = `w-1 ${tone[0]} shrink-0`;
+    el.querySelector('[data-t=title]').textContent = failed ? `Failed after ${total}` : `Done in ${total}`;
+    el.querySelector('[data-t=title]').className = `text-xs font-semibold min-w-0 break-words ${tone[1]}`;
+    ['[data-t=stop]', '[data-t=time]', '[data-t=note]'].forEach(s => el.querySelector(s).remove());
+    el.querySelector('[data-t=bar]').parentElement.remove();
+    if (failed) { el.classList.add('cursor-pointer'); el.title = 'Click to dismiss'; el.onclick = () => el.remove(); }
+    else setTimeout(() => el.remove(), 3000);
+}
+
 async function sendChatMessage(e) {
     if (e) e.preventDefault();
     if (S.sending) return;
 
     S.abortController = new AbortController();
     const stopBtn = $('stop-chat-btn');
-    if (stopBtn) {
-        stopBtn.onclick = async () => {
-            try {
-                const params = new URLSearchParams({ thread_id: S.threadId });
-                if (S.repoId) params.set('repo_id', S.repoId);
-                const res = await fetch(`/api/v1/chat/stop?${params.toString()}`, { method: 'POST' });
-                if (res.ok) {
-                    S.abortController.abort();
-                    showToast("Cancelled", "Chat request terminated.", "info");
-                } else if (res.status === 404) {
-                    S.abortController.abort();
-                }
-            } catch (err) {
-                console.error("Stop request failed:", err);
-                S.abortController.abort();
-            }
-        };
-    }
+    if (stopBtn) stopBtn.onclick = stopChat;
     if (!S.repoId || !S.threadId) {
         showToast("Selection required", "Select a repository and thread first.", "warning");
         return;
@@ -1025,6 +1156,8 @@ async function sendChatMessage(e) {
     S.live = { id, threadId: S.threadId, requestId: null, uids: new Set(), query };
     const t0 = performance.now();
     const tick = setInterval(() => { const el = $(id + '_t'); if (el) el.textContent = Math.floor((performance.now() - t0) / 1000) + 's'; }, 1000);
+    let outcome = 'done';
+    taskStart();
 
     try {
         let res;
@@ -1043,11 +1176,15 @@ async function sendChatMessage(e) {
             });
         }
         if (res.status === 499) {
+            outcome = 'stopped';
             $(id)?.remove();
             showToast("Stopped", "Request cancelled by user.", "info");
             return;
         }
-        if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || `Server returned ${res.status}`);
+        if (!res.ok) {          // 402 / 401 / 504 / 503 / 500 ...: show the server's reason (JSON detail, else the text), never nothing
+            const failure = await describeFailure(res);
+            const er = new Error(failure.message); er.failure = failure; throw er;
+        }
         const result = await res.json();
         files.forEach(f => f._url && URL.revokeObjectURL(f._url));
         $(id)?.remove();
@@ -1065,15 +1202,18 @@ async function sendChatMessage(e) {
 
     } catch (err) {
         if (err.name === 'AbortError') {
+            outcome = 'stopped';
             $(id)?.remove();
             showToast("Stopped", "Request cancelled by user.", "info");
-        } else {
+        } else {            // HTTP error (err.failure) or the fetch itself failed (server down, connection reset)
+            outcome = 'failed';
             $(id)?.remove();
             input.value = query; autosize();
             S.files = files; renderAttachStrip();
-            showToast("Message failed", err.message, "error");
+            showFailure(failureOf(err));
         }
     } finally {
+        taskEnd(outcome);
         if (S.live?.requestId) S.act.done.add(S.live.requestId);   // stopped/failed: nothing more will close its open steps
         clearInterval(tick); S.liveStatus = null; S.live = null;
         S.sending = false; S.abortController = null; updateComposer(); input.focus();
@@ -1190,6 +1330,7 @@ function onActionEvent(raw) {
     addActionEvents([ev]);
     const L = S.live;
     if (!S.sending || !L || !liveMatches(ev)) return;
+    if (ev.action === 'llm_call') taskStep(ev);         // a model call of this request finished: the per-call timer restarts
     if (ev.uid != null) L.uids.add(String(ev.uid));
     if (!L.requestId && ev.request_id) { L.requestId = ev.request_id; S.act.queries[ev.request_id] = L.query; }
     S.act.liveDirty = true; scheduleRender();
