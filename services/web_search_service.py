@@ -10,6 +10,11 @@ when it would repeat the previous query (avoid=...).
 
 Privacy: only a rewritten, code-free search query is sent to SearXNG, never repo content.
 Safety:  scraped text is wrapped in <web_source> tags and marked untrusted in the prompt.
+
+Junk pages are recovered, never silently dropped: every page is assessed (scraper.quality). Garbled text is re-decoded; a page with no
+readable text (JS shell, text in images) gets a screenshot + vision-model OCR (scraper.visual) after the text pass, under its own time
+budget. Access walls (captcha / login / paywall / 401-402) are NEVER bypassed: the source falls back to its search snippet and is
+labelled "restricted". WebSource.method says how each source was obtained; footer() and recovery_note() tell the user.
 """
 from __future__ import annotations
 
@@ -25,6 +30,9 @@ import httpx
 
 from config.settings import settings
 from services.decision import decide_noul
+from services.scraper import quality as Q
+from services.scraper.quality import try_repair_encoding
+from services.vision import vision_available
 
 _WEB_PREFIX = re.compile(r"^\s*/web\b[:\s]*", re.IGNORECASE)
 _URL = re.compile(r"https?://[^\s<>\"')\]]+", re.IGNORECASE)
@@ -254,6 +262,12 @@ class WebSource:
     text: str = ""
     truncated: bool = False
     note: str = ""
+    status: str = ""      # scraper.quality status of the scraped text: OK | GARBLED | THIN | IMAGE_TEXT | RESTRICTED | OFF_TOPIC | FAILED
+    method: str = ""      # how `text` was obtained: text | re-decoded | visual-ocr | snippet-only | restricted | failed
+
+    @property
+    def readable(self) -> bool:
+        return bool(self.text) or bool(self.snippet)
 
 
 @dataclass
@@ -270,12 +284,42 @@ class WebContext:
             return f"\n\n---\n_Web: {self.note}; answered without it._" if self.note else ""
         def link(s: WebSource) -> str:
             title = re.sub(r"[\[\]]", "", s.title or s.url).strip()[:90] or s.url
-            return f"{s.n}. [{title}]({s.url.replace(' ', '%20').replace(')', '%29')})"
+            return f"{s.n}. [{title}]({s.url.replace(' ', '%20').replace(')', '%29')})" + _BADGE.get(s.method, "")
         searched = ""
         if self.query:                                   # shows that THIS message ran its own search
             shown = re.sub(r"[*`_]", "", self.query)
             searched = f"\n\n*Searched: {shown}" + (f" \u00b7 {self.date}" if self.date else "") + "*"
         return "\n\n---\n**Web sources**\n" + "\n".join(link(s) for s in used) + searched
+
+    @property
+    def degraded(self) -> bool:
+        """Some source could only be used as a snippet (restricted, unreadable, off-topic) or not at all."""
+        return any(s.method in ("restricted", "snippet-only", "failed") for s in self.sources)
+
+    def recovery_note(self) -> str:
+        """One line on what was recovered and how, e.g. '1 of 3 pages was image-based; recovered via OCR · 1 restricted (snippet only)'.
+        Empty when every page was read normally."""
+        total, parts = len(self.sources), []
+        ocr = [s for s in self.sources if s.method == "visual-ocr"]
+        for status, cause in (("IMAGE_TEXT", "image-based"), ("THIN", "script-rendered or empty as text"), ("GARBLED", "garbled")):
+            k = sum(1 for s in ocr if s.status == status)
+            if k:
+                parts.append(f"{k} of {total} pages {'were' if k > 1 else 'was'} {cause}; recovered via OCR")
+        fixed = sum(1 for s in self.sources if s.method == "re-decoded")
+        if fixed:
+            parts.append(f"{fixed} garbled page{'s' if fixed > 1 else ''} fixed by re-decoding")
+        for label, pick in (("restricted", lambda s: s.method == "restricted"),
+                            ("off-topic", lambda s: s.status == "OFF_TOPIC"),
+                            ("unreadable", lambda s: s.method in ("snippet-only", "failed") and s.status not in ("RESTRICTED", "OFF_TOPIC"))):
+            hit = [s for s in self.sources if pick(s)]
+            if hit:
+                parts.append(f"{len(hit)} {label}" + (" (snippet only)" if any(s.snippet for s in hit) else ""))
+        return " \u00b7 ".join(parts)
+
+
+_BADGE = {"visual-ocr": " \u00b7 read via screenshot OCR", "re-decoded": " \u00b7 encoding repaired",
+          "restricted": " \u00b7 \u26a0 restricted, snippet only", "snippet-only": " \u00b7 snippet only"}
+_OCR_NOTE = "[Recovered via screenshot OCR of the rendered page; may contain recognition errors.]"
 
 
 def _safe(text: str) -> str:
@@ -288,11 +332,41 @@ def _render(sources: List[WebSource]) -> str:
         body = s.text
         if body and s.truncated:
             body += "\n[TRUNCATED to fit the context budget; the page is longer than shown.]"
+        if body and s.method == "visual-ocr":
+            body = f"{_OCR_NOTE}\n{body}"
         if not body and s.snippet:
-            body = f"(search snippet only; page could not be read)\n{s.snippet}"
+            body = (f"(access-restricted page; search snippet only)\n{s.snippet}" if s.method == "restricted"
+                    else f"(search snippet only; page could not be read)\n{s.snippet}")
         if body:
             blocks.append(f'<web_source n="{s.n}" url="{s.url}" title="{_safe(s.title)[:120]}">\n{_safe(body)}\n</web_source>')
     return "\n\n".join(blocks)
+
+
+def _html_hint(res: Any) -> str:
+    """What the scraper kept of the page HTML (if anything) for the image/canvas/PDF signals; image URLs count as <img>."""
+    md = getattr(res, "metadata", None)
+    md = md if isinstance(md, dict) else {}
+    html = str(getattr(res, "html", None) or md.get("html_head") or "")
+    imgs = getattr(res, "images", None)
+    return html + ("<img>" * len(imgs) if isinstance(imgs, (list, tuple)) else "")
+
+
+def _status_code(res: Any) -> Optional[int]:
+    md = getattr(res, "metadata", None)
+    code = getattr(res, "status_code", None) or (md.get("status_code") if isinstance(md, dict) else None)
+    return code if isinstance(code, int) else None
+
+
+VisualFn = Callable[[str, str], Awaitable[str]]
+_VISUAL_STATUSES = (Q.THIN, Q.IMAGE_TEXT, Q.GARBLED)         # RESTRICTED is never here: no screenshot past a wall
+
+
+async def _default_visual(url: str, query: str) -> str:
+    """Screenshot the rendered page and read it with the vision model: query-focused text, or NO_RELEVANT_CONTENT."""
+    from services.scraper.visual import NO_RELEVANT, ocr_summarise, screenshot_tiles
+    budget = float(settings.web_visual_timeout_s)
+    tiles = await screenshot_tiles(url, max_tiles=settings.web_visual_max_tiles, timeout_s=budget * 0.6)
+    return await ocr_summarise(tiles, query) if tiles else NO_RELEVANT
 
 
 async def _default_scrape(url: str, allow_playwright: bool) -> Any:
@@ -307,10 +381,12 @@ async def _default_scrape(url: str, allow_playwright: bool) -> Any:
 class WebSearchService:
     def __init__(self, transport: Optional[httpx.AsyncBaseTransport] = None,
                  scrape_fn: Optional[Callable[[str, bool], Awaitable[Any]]] = None,
-                 plan_fn: Optional[Callable[..., Awaitable[str]]] = None):
+                 plan_fn: Optional[Callable[..., Awaitable[str]]] = None,
+                 visual_fn: Optional[VisualFn] = None):
         self._transport = transport            # tests inject httpx.MockTransport
         self._scrape = scrape_fn or _default_scrape
         self._plan = plan_fn or plan_query
+        self._visual = visual_fn or _default_visual      # (url, query) -> OCR text | "NO_RELEVANT_CONTENT"
 
     @staticmethod
     def _log(msg: str) -> None:
@@ -335,17 +411,70 @@ class WebSearchService:
                 break
         return out
 
-    async def _fill(self, s: WebSource) -> None:
+    async def _fill(self, s: WebSource, topic: str = "") -> None:
+        """scrape -> assess -> (GARBLED: re-decode, re-assess) -> mark. THIN / IMAGE_TEXT / GARBLED sources are left without text
+        for the recovery pass; RESTRICTED and OFF_TOPIC end here as snippet-only."""
         try:
             res = await self._scrape(s.url, settings.web_allow_playwright)
             text, cut = compose_page(res, settings.web_page_chars)
-            if getattr(res, "word_count", 0) < 40 or not text:
-                s.note = "page had too little readable text"
-                return
-            s.text, s.truncated = text, cut
+            hint, code = _html_hint(res), _status_code(res)
+            q = Q.assess(text, query=topic or None, html_head=hint, status_code=code)
             s.title = getattr(res, "title", None) or s.title
+            method = "text"
+            if q.status == Q.GARBLED:
+                fixed = try_repair_encoding(text)
+                q2 = Q.assess(fixed, query=topic or None, html_head=hint, status_code=code) if fixed != text else q
+                if fixed != text and q2.status not in (Q.GARBLED, Q.THIN, Q.IMAGE_TEXT):
+                    text, q, method = fixed, q2, "re-decoded"
+            if q.status == Q.OFF_TOPIC and not settings.web_offtopic_filter:
+                q = Q.Quality(Q.OK, "", q.metrics)
+            s.status, s.note = q.status, q.reason
+            if q.status == Q.OK:
+                s.text, s.truncated, s.method = text, cut, method
+            elif q.status == Q.RESTRICTED:
+                s.method = "restricted"                      # wall: snippet only, never retried or screenshotted
+            elif q.status == Q.OFF_TOPIC:
+                s.method = "snippet-only"
+            # THIN / IMAGE_TEXT / GARBLED: method stays "" until _recover decides
         except Exception as e:  # noqa: BLE001
-            s.note = f"{type(e).__name__}"
+            s.status, s.note = "FAILED", f"{type(e).__name__}"
+
+    async def _recover_one(self, s: WebSource, query: str) -> None:
+        from services.scraper.visual import NO_RELEVANT
+        try:
+            out = (await asyncio.wait_for(self._visual(s.url, query), settings.web_visual_timeout_s) or "").strip()
+        except Exception as e:  # noqa: BLE001 - timeout, no browser, model down: the page stays snippet-only
+            s.note = f"{s.note}; visual fallback failed ({type(e).__name__})".lstrip("; ")
+            return
+        if not out or NO_RELEVANT in out[:60]:
+            s.note = f"{s.note}; screenshot had no relevant content".lstrip("; ")
+            return
+        s.text, s.truncated = _cut_prose(out, settings.web_page_chars)
+        s.method = "visual-ocr"
+
+    async def _recover(self, sources: List[WebSource], query: str) -> None:
+        """Visual fallback for sources whose text failed. Own time budget (web_visual_timeout_s per page, pages in parallel);
+        runs after the text pass so a text-pass timeout never cancels it. RESTRICTED sources are never candidates."""
+        mode = str(settings.web_visual_fallback or "off").strip().lower()
+        todo = [s for s in sources if s.status in _VISUAL_STATUSES and not s.text]
+        if mode in ("off", "false", "0", "") or not todo:
+            return
+        if not vision_available():
+            self._log("visual fallback skipped: active runner has no vision capability")
+            for s in todo:
+                s.note = f"{s.note}; visual fallback unavailable (no vision model)".lstrip("; ")
+            return
+        if mode != "always":
+            todo = todo[: max(0, int(settings.web_visual_max_pages))]
+        await asyncio.gather(*(self._recover_one(s, query) for s in todo), return_exceptions=True)
+
+    @staticmethod
+    def _finalize(sources: List[WebSource]) -> None:
+        """Every source ends with a method: whatever is left without text falls back to its snippet (or failed)."""
+        for s in sources:
+            if not s.method:
+                s.method = "snippet-only" if s.snippet else "failed"
+                s.status = s.status or "FAILED"            # cancelled by the text-pass timeout
 
     async def gather(self, question: str, *, repo_scoped: bool, history: Optional[List[Tuple[str, str]]] = None,
                      avoid: Optional[List[str]] = None, now: Optional[datetime] = None) -> WebContext:
@@ -372,15 +501,18 @@ class WebSearchService:
 
         sources = [WebSource(i + 1, h["url"], h["title"], h["snippet"])
                    for i, h in enumerate(hits[: settings.web_max_pages])]
-        tasks = [asyncio.ensure_future(self._fill(s)) for s in sources]
+        topic = "" if urls else query                        # a URL the user pasted is on topic by definition
+        tasks = [asyncio.ensure_future(self._fill(s, topic)) for s in sources]
         _, pending = await asyncio.wait(tasks, timeout=max(1.0, settings.web_timeout_s - (time.monotonic() - t0)))
         for t in pending:
             t.cancel()
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
+        await self._recover(sources, query or question)      # own budget: not part of web_timeout_s
+        self._finalize(sources)
         ctx = WebContext(text=_render(sources), sources=sources, query=query, date=stamp)
         if not ctx.text:
             ctx.note = "no readable pages"
         self._log(f"query={query or '(urls)'!r}: {sum(1 for s in sources if s.text)}/{len(sources)} pages read "
-                  f"in {time.monotonic() - t0:.1f}s")
+                  f"in {time.monotonic() - t0:.1f}s" + "".join(f" [{s.n}:{s.status}->{s.method}]" for s in sources if s.method != "text"))
         return ctx

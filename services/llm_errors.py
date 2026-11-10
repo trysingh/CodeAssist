@@ -214,6 +214,21 @@ def is_unreachable(exc: BaseException) -> bool:
     return not is_timeout(exc) and any(_mro_names(e) & _CONNECT_NAMES for e in _chain(exc))
 
 
+def server_error_status(exc: BaseException) -> Optional[int]:
+    """HTTP 5xx the provider answered with (openai.InternalServerError, Google's 500 'Internal error encountered', 502/503/504), else None."""
+    for e in _chain(exc):
+        try:
+            st = _status_of(e)
+            st = int(st) if st is not None else None
+        except (TypeError, ValueError):
+            st = None
+        if st is not None and 500 <= st <= 599:
+            return st
+        if _mro_names(e) & {"InternalServerError"}:
+            return 500
+    return None
+
+
 def _runner_facts(model: str) -> dict:
     """What the active runner is called, which id it really calls for `model`, its per-attempt timeout, attempts and timeout setting."""
     name = _active_runner()
@@ -267,8 +282,9 @@ class ModelTimeoutError(RuntimeError):
 class ModelUnavailableError(RuntimeError):
     """The model endpoint could not be reached at all (connection refused / failed / DNS)."""
 
-    def __init__(self, model: str, provider_message: str = "", runner: str = ""):
+    def __init__(self, model: str, provider_message: str = "", runner: str = "", status: Optional[int] = None):
         f = _runner_facts(model)
+        self.status = status                    # None: connection failed; 5xx: the provider answered with a server error
         self.model = f["model"]
         self.runner = (runner or f["runner"] or "ollama").strip().lower()
         self.label = f["label"] if self.runner == f["runner"] else self.runner
@@ -280,6 +296,12 @@ class ModelUnavailableError(RuntimeError):
                 "aistudio": "Check the internet connection / proxy (generativelanguage.googleapis.com) or AISTUDIO_BASE_URL.",
                 "cloudflare": "Check the internet connection / proxy (api.cloudflare.com) or CF_AI_GATEWAY_URL.",
                 "openai": "Check OPENAI_COMPAT_BASE_URL and that the server is running."}.get(self.runner, "Check the endpoint URL and your network.")
+        if self.status and self.runner == "ollama":
+            return (f"{self.label} returned a server error (HTTP {self.status}) for model {self.model}. Check the Ollama log: the model may "
+                    "have failed to load (memory) or crashed. Retry, or pick another model in the model selector.")
+        if self.status:
+            return (f"{self.label} returned a server error (HTTP {self.status}) for model {self.model}. This is on the provider's side and "
+                    "usually temporary: retry in a moment, or pick another model in the model selector.")
         return f"{self.label} could not be reached (model {self.model}): the connection failed. {hint}"
 
 
@@ -292,7 +314,10 @@ def as_timeout_error(exc: BaseException, model: str) -> Optional[ModelTimeoutErr
 def as_unavailable_error(exc: BaseException, model: str) -> Optional[ModelUnavailableError]:
     if isinstance(exc, ModelUnavailableError):
         return exc
-    return ModelUnavailableError(model, f"{type(exc).__name__}: {exc}"[:300]) if is_unreachable(exc) else None
+    if is_unreachable(exc):
+        return ModelUnavailableError(model, f"{type(exc).__name__}: {exc}"[:300])
+    st = None if is_timeout(exc) else server_error_status(exc)
+    return ModelUnavailableError(model, f"{type(exc).__name__}: {exc}"[:300], status=st) if st else None
 
 
 def _report_failure(title: str, msg: str, model: str, phase: str) -> None:

@@ -1,5 +1,4 @@
 import asyncio
-import base64
 import io
 import re
 import sys
@@ -7,7 +6,6 @@ from typing import Any, Dict, List, Tuple
 
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
-from langchain_core.messages import HumanMessage
 try:    # only the Ollama runner needs it
     from langchain_ollama import ChatOllama
 except ImportError:     # pragma: no cover
@@ -16,6 +14,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from config.settings import settings
 from services.runners import make_chat
+from services.vision import image_message
 
 MAX_TEXT_CHARS = 300_000      # hard cap on text kept per attachment
 OPENING_CHARS = 1200          # opening excerpt shown for large attachments
@@ -63,12 +62,7 @@ class AttachmentService:
     async def _ocr_image(self, data: bytes, mime: str) -> str:
         llm = make_chat(settings.vision_model or settings.llm_model, temperature=0, vision=True, ollama_cls=ChatOllama,
                          phase="ATTACHMENT_OCR")
-        b64 = base64.b64encode(data).decode()
-        msg = HumanMessage(content=[
-            {"type": "text", "text": OCR_PROMPT},
-            {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
-        ])
-        res = await llm.ainvoke([msg])
+        res = await llm.ainvoke([image_message(OCR_PROMPT, data, mime)])
         return str(res.content)
 
     @staticmethod

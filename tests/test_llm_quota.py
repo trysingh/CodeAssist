@@ -129,10 +129,16 @@ def test_a_fallback_equal_to_the_model_is_no_fallback(monkeypatch):
 
 def test_other_failures_and_cancellation_pass_through_untouched(monkeypatch):
     monkeypatch.setattr(settings, "llm_fallback_model", LOCAL)
-    call = scripted(error=ResponseError("boom", 500))
+    call = scripted(error=ResponseError("boom", 400))
     with pytest.raises(ResponseError):
         run(with_model_fallback(call, CLOUD))
     assert call.seen == [CLOUD]                          # no fallback for a non-quota failure
+
+    from services.llm_errors import ModelUnavailableError
+    call = scripted(error=ResponseError("boom", 500))    # a server error is made readable (HTTP 503), still without a fallback
+    with pytest.raises(ModelUnavailableError):
+        run(with_model_fallback(call, CLOUD))
+    assert call.seen == [CLOUD]
 
     async def cancelled(m):
         raise asyncio.CancelledError()

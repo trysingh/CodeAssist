@@ -398,7 +398,7 @@ class ModelText(str):
 
 
 _THINK_SPANS = (        # (open, close): reasoning a model left inside its answer text
-    (re.compile(r"<(?:think|thinking|reasoning)>", re.I), re.compile(r"</(?:think|thinking|reasoning)>", re.I)),
+    (re.compile(r"<(?:think|thinking|thought|reasoning)>", re.I), re.compile(r"</(?:think|thinking|thought|reasoning)>", re.I)),  # <thought>: Gemma via Google AI Studio
     (re.compile(r"<\|channel>thought"), re.compile(r"<channel\|>")),                 # gemma-4 style markers
 )
 

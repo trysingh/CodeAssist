@@ -31,7 +31,9 @@ FILES = {
 
 
 def block(path, search, replace):
-    return f"FILE: {path}\n<<<<<<< SEARCH\n{search}\n=======\n{replace}\n>>>>>>> REPLACE\n"
+    """An edit block in the layout PROTOCOL rule 6 asks for: FILE line, then the markers inside a fenced code block."""
+    lang = "python" if path.endswith(".py") else ""
+    return f"FILE: {path}\n```{lang}\n<<<<<<< SEARCH\n{search}\n=======\n{replace}\n>>>>>>> REPLACE\n```\n"
 
 
 def act(tool, **args):
@@ -290,8 +292,8 @@ def test_new_failing_test_goes_back_and_unresolved_failures_are_reported(monkeyp
 def test_generated_repro_test_is_passed_as_new_test():
     code = block("app.py", "def discount(amount, pct):\n    return amount - amount * pct",
                  "def discount(amount, pct):\n    return amount * (1 - pct)")
-    test = ("FILE: tests/test_discount.py\n<<<<<<< SEARCH\n=======\n"
-            "from app import discount\n\n\ndef test_discount():\n    assert discount(100, 0.1) == 90\n>>>>>>> REPLACE\n")
+    test = ("FILE: tests/test_discount.py\n```python\n<<<<<<< SEARCH\n=======\n"
+            "from app import discount\n\n\ndef test_discount():\n    assert discount(100, 0.1) == 90\n>>>>>>> REPLACE\n```\n")
 
     async def go():
         store, rid = await make()
@@ -395,8 +397,8 @@ def test_suggested_fix_runs_through_the_real_sandbox_with_fail_to_pass_proof(mon
     }
     fix = block("shop.py", "def discount(amount, pct):\n    return amount - amount * pct",
                 "def discount(amount, pct):\n    return amount - amount * pct / 100")
-    repro = ("FILE: tests/test_discount_repro.py\n<<<<<<< SEARCH\n=======\n"
-             "from shop import discount\n\n\ndef test_ten_percent():\n    assert discount(200, 10) == 180\n>>>>>>> REPLACE\n")
+    repro = ("FILE: tests/test_discount_repro.py\n```python\n<<<<<<< SEARCH\n=======\n"
+             "from shop import discount\n\n\ndef test_ten_percent():\n    assert discount(200, 10) == 180\n>>>>>>> REPLACE\n```\n")
 
     async def go():
         store, rid = await make(files)

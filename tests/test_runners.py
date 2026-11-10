@@ -80,6 +80,7 @@ def test_a_new_runner_registers_in_one_line(monkeypatch):
 
 
 def test_settings_read_the_documented_env_names(monkeypatch):
+    monkeypatch.delenv("ENGINE_LLM_RUNNER", raising=False)        # conftest pins it; the plain documented name is under test here
     monkeypatch.setenv("LLM_RUNNER", "cloudflare")
     monkeypatch.setenv("CF_ACCOUNT_ID", "from-env")
     s = type(settings)()
@@ -223,7 +224,7 @@ def test_finish_reason_length_is_read_as_done_reason_length():
 
 
 def test_usage_metadata_is_used_when_token_usage_is_absent():
-    msg = AIMessage(content="x", response_metadata={"finish_reason": "stop"}, usage_metadata={"input_tokens": 3, "output_tokens": 4})
+    msg = AIMessage(content="x", response_metadata={"finish_reason": "stop"}, usage_metadata={"input_tokens": 3, "output_tokens": 4, "total_tokens": 7})   # real langchain_core requires total_tokens
     meta = reply_meta(msg)
     assert (meta["done_reason"], meta["eval_count"], meta["prompt_eval_count"]) == ("stop", 4, 3)
 
@@ -288,7 +289,7 @@ def test_auth_errors_become_a_readable_error_with_no_fallback(monkeypatch):
 
 def test_other_failures_still_propagate_unchanged():
     async def call(m):
-        raise APIStatusError("boom", 500)
+        raise APIStatusError("bad request", 400)       # a provider 5xx is mapped to ModelUnavailableError (test_real_run_regressions.py)
     with pytest.raises(APIStatusError):
         run(with_model_fallback(call, CF_DEFAULT))
 

@@ -274,7 +274,9 @@ class OpenAICompatRunner:
         self.check_config()
         cls = embeddings_cls or self._import("OpenAIEmbeddings")
         name = (model or "").strip()
-        if not name or is_ollama_style(name):       # settings.embedding_model is an Ollama name by default
+        # settings.embedding_model is an Ollama name ("nomic-embed-text:latest", or untagged "nomic-embed-text"): it means "the
+        # default embedding model", which on this runner is its own embedding model
+        if not name or is_ollama_style(name) or name == (settings.embedding_model or "").strip():
             name = self.embedding_default()
         # check_embedding_ctx_length=False: otherwise the client sends tiktoken token ids, which a non-OpenAI endpoint rejects
         return cls(model=name, base_url=self.base_url(), api_key=self.sdk_key(),

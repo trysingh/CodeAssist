@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import AliasChoices, Field
@@ -38,6 +39,14 @@ class EngineSettings(BaseSettings):
     web_auto_threshold: float = 0.75                   # P(needs web) required in "auto" mode inside a repo
     web_allow_playwright: bool = False                 # browser fallback: +4-12s per page, off for chat
     web_min_words: int = 120                           # scraper early-exit threshold
+    web_offtopic_filter: bool = True                   # drop a readable page that shares no keyword with the search query (keeps its snippet)
+    # Visual fallback for pages whose TEXT could not be read (JS shell, text in images/canvas, garbled): screenshot -> the configured
+    # vision model (vision_model, else llm_model) -> query-focused summary. Never used on access-restricted pages (captcha/login/paywall/401/402).
+    #   off = never | auto = failed pages only, at most web_visual_max_pages per question | always = every failed page (no page cap)
+    web_visual_fallback: str = "auto"
+    web_visual_max_pages: int = 1                      # auto mode: pages recovered by screenshot per question
+    web_visual_timeout_s: float = 20.0                 # own budget per recovered page (screenshot + OCR), after and apart from web_timeout_s
+    web_visual_max_tiles: int = 3                      # screenshot tiles (~1600px tall each) sent to the vision model per page
     scraper_timeout: int = 15
     playwright_headless: bool = True
     scrape_fast_deadline: float = 2.5
@@ -307,7 +316,9 @@ class EngineSettings(BaseSettings):
     # Keep the phrase ASCII-only,
     apply_confirmation_phrase: str = Field(default="TYPE_APPLY_TO_CONFIRM")   # env: ENGINE_APPLY_CONFIRMATION_PHRASE; empty = no check
     
-    model_config = SettingsConfigDict(env_prefix="ENGINE_", env_file=".env", extra="ignore")
+    # ENGINE_IGNORE_DOTENV=1 (set by tests/conftest.py): do not read .env, so a developer's real keys / runner never leak into tests
+    model_config = SettingsConfigDict(env_prefix="ENGINE_", env_file=None if os.getenv("ENGINE_IGNORE_DOTENV") else ".env",
+                                      extra="ignore")
 
     def ensure_dirs(self):
         self.storage_dir.mkdir(parents=True, exist_ok=True)
@@ -344,4 +355,4 @@ settings = EngineSettings()
 
 # Note: Call settings.ensure_dirs() during FastAPI lifespan/startup,
 # rather than at module import level, to avoid permission issues during builds/tests.
-settings.ensure_dirs()
+settings.ensure_dirs()

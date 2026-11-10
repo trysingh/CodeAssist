@@ -98,7 +98,9 @@ class RAGWorkflowManager:
             ctx = await self.web.gather(query, repo_scoped=scoped, history=_history_pairs(msgs[:-1]),
                                         avoid=[last_q] if last_q else None)
             n = sum(1 for s in ctx.sources if s.text)
-            notifier.notify("Web search", f"[{why}] {ctx.query or 'direct URL'} -> {n} page(s)", level="INFO")
+            rec = ctx.recovery_note() if hasattr(ctx, "recovery_note") else ""     # which sources were recovered / restricted, and how
+            notifier.notify("Web search", f"[{why}] {ctx.query or 'direct URL'} -> {n} page(s)" + (f" \u00b7 {rec}" if rec else ""),
+                            level="WARNING" if rec and getattr(ctx, "degraded", False) else "INFO")
             return {"web_context": ctx.text, "web_footer": ctx.footer(),
                     "web_query": ctx.query or "(direct URL)", "web_note": ctx.note}
         except Exception as e:  # noqa: BLE001
