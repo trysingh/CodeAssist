@@ -45,6 +45,7 @@ class EngineSettings(BaseSettings):
 
     # ---- inference runners (services/runners/) ----
     # Which backend serves chat and embeddings. "ollama" (default) = the behaviour this app always had.
+    # "aistudio" = Google AI Studio (Gemini API), "openai" = any OpenAI-compatible server: see their blocks below.
     # "cloudflare" = Cloudflare Workers AI through its OpenAI-compatible endpoint (needs `pip install langchain-openai`, CF_ACCOUNT_ID, CF_API_TOKEN).
     # Env: LLM_RUNNER / EMBEDDING_RUNNER / CF_* (the ENGINE_-prefixed spelling works too).
     llm_runner: str = Field(default="ollama", validation_alias=AliasChoices("ENGINE_LLM_RUNNER", "LLM_RUNNER"))
@@ -73,6 +74,37 @@ class EngineSettings(BaseSettings):
     # system prompt or the latest user message. It applies in lean mode; in normal mode only when MAX_INPUT_TOKENS is set explicitly.
     cf_max_input_tokens: int = Field(default=60000, validation_alias=AliasChoices("ENGINE_CF_MAX_INPUT_TOKENS", "CF_MAX_INPUT_TOKENS"))
     max_input_tokens: Optional[int] = Field(default=None, validation_alias=AliasChoices("ENGINE_MAX_INPUT_TOKENS", "MAX_INPUT_TOKENS"))
+
+    # ---- Google AI Studio (runner "aistudio", Gemini API through its OpenAI-compatible endpoint; docs/GOOGLE_AI_STUDIO_SETUP.md) ----
+    # Needs `pip install langchain-openai` and GEMINI_API_KEY (GOOGLE_API_KEY works too). Ollama-style model names are mapped to these ids.
+    aistudio_base_url: str = Field(default="https://generativelanguage.googleapis.com/v1beta/openai/", validation_alias=AliasChoices("ENGINE_AISTUDIO_BASE_URL", "AISTUDIO_BASE_URL"))
+    gemini_api_key: str = Field(default="", validation_alias=AliasChoices("ENGINE_GEMINI_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY"))
+    aistudio_llm_model: str = Field(default="gemma-4-31b-it", validation_alias=AliasChoices("ENGINE_AISTUDIO_LLM_MODEL", "AISTUDIO_LLM_MODEL"))
+    aistudio_vision_model: str = Field(default="gemma-4-31b-it", validation_alias=AliasChoices("ENGINE_AISTUDIO_VISION_MODEL", "AISTUDIO_VISION_MODEL"))
+    aistudio_embedding_model: str = Field(default="gemini-embedding-001", validation_alias=AliasChoices("ENGINE_AISTUDIO_EMBEDDING_MODEL", "AISTUDIO_EMBEDDING_MODEL"))
+    aistudio_models: str = Field(default="gemma-4-31b-it,gemma-4-26b-a4b-it",      # comma list shown first in the UI model picker
+                                 validation_alias=AliasChoices("ENGINE_AISTUDIO_MODELS", "AISTUDIO_MODELS"))
+    # Picker: also list GET {base}/models (gemini* / gemma* chat models, cached compat_models_cache_s). Off / any error -> AISTUDIO_MODELS only.
+    aistudio_list_all_models: bool = Field(default=True, validation_alias=AliasChoices("ENGINE_AISTUDIO_LIST_ALL_MODELS", "AISTUDIO_LIST_ALL_MODELS"))
+    # Older Gemma on the Gemini API rejects system instructions. auto = merge the system prompt into the first user message for gemma* ids; on / off force it.
+    aistudio_fold_system: str = Field(default="auto", validation_alias=AliasChoices("ENGINE_AISTUDIO_FOLD_SYSTEM", "AISTUDIO_FOLD_SYSTEM"))
+    # response_format=json_object: auto = gemini* only (Gemma relies on the loose JSON parser); on / off force it.
+    aistudio_json_mode: str = Field(default="auto", validation_alias=AliasChoices("ENGINE_AISTUDIO_JSON_MODE", "AISTUDIO_JSON_MODE"))
+    aistudio_max_input_tokens: int = Field(default=60000, validation_alias=AliasChoices("ENGINE_AISTUDIO_MAX_INPUT_TOKENS", "AISTUDIO_MAX_INPUT_TOKENS"))
+
+    # ---- generic OpenAI-compatible runner ("openai": OpenRouter, Groq, vLLM, LM Studio ...); no OPENAI_COMPAT_BASE_URL = not set up ----
+    openai_compat_base_url: str = Field(default="", validation_alias=AliasChoices("ENGINE_OPENAI_COMPAT_BASE_URL", "OPENAI_COMPAT_BASE_URL"))
+    openai_compat_api_key: str = Field(default="", validation_alias=AliasChoices("ENGINE_OPENAI_COMPAT_API_KEY", "OPENAI_COMPAT_API_KEY"))   # optional (local servers)
+    openai_compat_models: str = Field(default="", validation_alias=AliasChoices("ENGINE_OPENAI_COMPAT_MODELS", "OPENAI_COMPAT_MODELS"))      # comma list, pinned in the picker
+    openai_compat_llm_model: str = Field(default="", validation_alias=AliasChoices("ENGINE_OPENAI_COMPAT_LLM_MODEL", "OPENAI_COMPAT_LLM_MODEL"))
+    openai_compat_embedding_model: str = Field(default="", validation_alias=AliasChoices("ENGINE_OPENAI_COMPAT_EMBEDDING_MODEL", "OPENAI_COMPAT_EMBEDDING_MODEL"))
+    openai_compat_remote: bool = Field(default=True, validation_alias=AliasChoices("ENGINE_OPENAI_COMPAT_REMOTE", "OPENAI_COMPAT_REMOTE"))   # true = billed: TOKEN_MODE=auto runs lean
+    openai_compat_list_all_models: bool = Field(default=False, validation_alias=AliasChoices("ENGINE_OPENAI_COMPAT_LIST_ALL_MODELS", "OPENAI_COMPAT_LIST_ALL_MODELS"))
+    openai_compat_max_input_tokens: int = Field(default=0, validation_alias=AliasChoices("ENGINE_OPENAI_COMPAT_MAX_INPUT_TOKENS", "OPENAI_COMPAT_MAX_INPUT_TOKENS"))
+    # shared by "aistudio" and "openai" (Cloudflare keeps its cf_* values)
+    compat_timeout_s: float = Field(default=120.0)
+    compat_max_retries: int = Field(default=2)
+    compat_models_cache_s: int = Field(default=600, validation_alias=AliasChoices("ENGINE_COMPAT_MODELS_CACHE_S", "COMPAT_MODELS_CACHE_S"))
 
     # ---- token mode (services/token_budget.py): spend fewer tokens on paid / remote runners ----
     # "auto" = lean for remote runners (Cloudflare), normal for Ollama. "lean" / "normal" force it. The chat request may override it per question.
@@ -274,6 +306,14 @@ class EngineSettings(BaseSettings):
     @property
     def cf_model_list(self) -> List[str]:
         return [m.strip() for m in (self.cf_models or "").split(",") if m.strip()]
+
+    @property
+    def aistudio_model_list(self) -> List[str]:
+        return [m.strip() for m in (self.aistudio_models or "").split(",") if m.strip()]
+
+    @property
+    def openai_compat_model_list(self) -> List[str]:
+        return [m.strip() for m in (self.openai_compat_models or "").split(",") if m.strip()]
 
     @property
     def sqlite_url(self) -> str:

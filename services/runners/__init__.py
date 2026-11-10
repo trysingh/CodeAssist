@@ -7,7 +7,8 @@ Chat and embeddings are chosen separately (settings.llm_runner / settings.embedd
 embedding models are not comparable: changing the embedding runner needs a re-index (reset_repo_index.py).
 The chat runner can also be picked per request (the UI runner switch): `with runner_scope(name):` makes get_runner() / make_chat() /
 resolve_model() with no name use it. Embeddings IGNORE that scope and always use settings.embedding_runner.
-Add a backend: write a class following base.Runner and call register_runner("name", factory).
+Add a backend: write a class following base.Runner and call register_runner("name", factory). For any OpenAI-style API subclass
+openai_compat.OpenAICompatRunner (see aistudio_runner.py: ~100 lines). Built in: ollama, cloudflare, aistudio, openai.
 """
 from __future__ import annotations
 
@@ -15,11 +16,15 @@ from typing import Any, Callable, Dict, List, Optional
 
 from config.settings import settings
 from services.runners.base import MODEL_NAME, Runner, RunnerConfigError
+from services.runners.aistudio_runner import GoogleAIStudioRunner
 from services.runners.cloudflare_runner import CloudflareRunner
 from services.runners.ollama_runner import OllamaRunner
+from services.runners.openai_compat import OpenAICompatRunner
+from services.runners.openai_runner import OpenAIRunner
 from services.runners.scope import current_runner_name, current_session_key, runner_scope, session_key, thread_scope
 
-_REGISTRY: Dict[str, Callable[[], Runner]] = {"ollama": OllamaRunner, "cloudflare": CloudflareRunner}
+_REGISTRY: Dict[str, Callable[[], Runner]] = {"ollama": OllamaRunner, "cloudflare": CloudflareRunner, "aistudio": GoogleAIStudioRunner,
+                                              "openai": OpenAIRunner}
 
 
 def register_runner(name: str, factory: Callable[[], Runner]) -> None:
@@ -45,19 +50,20 @@ def get_embedding_runner() -> Runner:
 
 
 def runner_status() -> List[dict]:
-    """Every registered runner: {"name", "remote", "configured", "error"} (check_config only, never touches the network)."""
+    """Every registered runner: {"name", "label", "remote", "configured", "error"} (check_config only, never touches the network)."""
     out = []
     for key in available_runners():
-        remote, err = False, None
+        remote, err, label = False, None, key
         try:
             r = _REGISTRY[key]()
             remote = bool(getattr(r, "remote", False))
+            label = str(getattr(r, "label", "") or key)
             r.check_config()
         except RunnerConfigError as exc:
             err = str(exc)
         except Exception as exc:  # noqa: BLE001 - a broken third-party runner must not break the list
             err = f"{type(exc).__name__}: {exc}"
-        out.append({"name": key, "remote": remote, "configured": err is None, "error": err})
+        out.append({"name": key, "label": label, "remote": remote, "configured": err is None, "error": err})
     return out
 
 
@@ -87,11 +93,12 @@ def resolve_model(model: str = "", *, vision: bool = False) -> str:
 
 
 def check_runner_config() -> None:
-    """Fail fast (RunnerConfigError) when a selected runner is unusable. Called at startup; no network."""
-    get_runner().check_config()
+    """Fail fast (RunnerConfigError) when the CONFIGURED runners (settings.llm_runner, settings.embedding_runner) are unusable.
+    Called at startup; no network. Other registered runners (e.g. aistudio without a key) are only checked when picked in the UI."""
+    get_runner(settings.llm_runner).check_config()
     get_embedding_runner().check_config()
 
 
-__all__ = ["MODEL_NAME", "Runner", "RunnerConfigError", "available_runners", "check_runner_config", "current_runner_name",
+__all__ = ["MODEL_NAME", "Runner", "OpenAICompatRunner", "RunnerConfigError", "available_runners", "check_runner_config", "current_runner_name",
            "current_session_key", "get_embedding_runner", "get_runner", "make_chat", "register_runner", "require_runner",
            "resolve_model", "runner_scope", "runner_status", "session_key", "thread_scope"]

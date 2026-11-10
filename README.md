@@ -120,10 +120,10 @@ Chat and embeddings go through `services/runners/`; the backend is a config choi
 
 | Setting (env, `ENGINE_` prefix optional) | Default | Meaning |
 |---|---|---|
-| `LLM_RUNNER` | `ollama` | `ollama` or `cloudflare` (Cloudflare Workers AI, OpenAI-compatible endpoint, needs `pip install langchain-openai`) |
+| `LLM_RUNNER` | `ollama` | `ollama`, `cloudflare`, `aistudio` or `openai` (the last three speak an OpenAI-style API and need `pip install langchain-openai`; see the table below) |
 | `EMBEDDING_RUNNER` | `ollama` | separate from `LLM_RUNNER`: vectors of different models are not comparable, so switching it needs a re-index (`python reset_repo_index.py`) |
 | `CF_LIST_ALL_MODELS` | `true` | Cloudflare runner: the model picker lists all Workers AI text-generation models on the account (`CF_MODELS` first, cached `CF_MODELS_CACHE_S`=600 s); `false` = only `CF_MODELS` |
-| `CF_ACCOUNT_ID`, `CF_API_TOKEN` | *(empty)* | required for `cloudflare`; the app refuses to start without them |
+| `CF_ACCOUNT_ID`, `CF_API_TOKEN` | *(empty)* | required for `cloudflare`; the app refuses to start without them when `LLM_RUNNER` / `EMBEDDING_RUNNER` is `cloudflare` |
 | `CF_LLM_MODEL` / `CF_VISION_MODEL` | `@cf/google/gemma-4-26b-a4b-it` | Ollama-style names (contain `:`, no `@`, e.g. `gemma4:31b-cloud`) are mapped to these when `LLM_RUNNER=cloudflare` |
 | `CF_EMBEDDING_MODEL` | `@cf/baai/bge-base-en-v1.5` | embedding model of the cloudflare embedding runner |
 | `CF_MODELS` | gemma-4-26b-a4b-it, gemma-3-12b-it | comma list offered in the UI model picker |
@@ -131,6 +131,38 @@ Chat and embeddings go through `services/runners/`; the backend is a config choi
 
 Not supported on `cloudflare`: `num_ctx` (ignored), `ask_reasoning` (ignored). The decision model (`/v1/systemone`) stays Ollama-only.
 Setup and troubleshooting: `docs/CLOUDFLARE_SETUP.md`.
+
+### Available runners
+| Runner (`name`) | UI label | Remote (lean tokens in `auto`) | Needs | Notes |
+|---|---|---|---|---|
+| `ollama` | Ollama (local) | no | a running Ollama | default; the behaviour the app always had |
+| `cloudflare` | Cloudflare Workers AI | yes | `CF_ACCOUNT_ID`, `CF_API_TOKEN` | `docs/CLOUDFLARE_SETUP.md` |
+| `aistudio` | Google AI Studio | yes | `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) | Gemini API, OpenAI-compatible endpoint; `docs/GOOGLE_AI_STUDIO_SETUP.md` |
+| `openai` | OpenAI-compatible | `OPENAI_COMPAT_REMOTE` (default yes) | `OPENAI_COMPAT_BASE_URL` | any `/chat/completions` server, configured by settings only |
+
+Only the runners named by `LLM_RUNNER` and `EMBEDDING_RUNNER` are checked at startup. Any other runner that is not set up simply shows as "(not set up)" in the UI runner select, with the reason as tooltip, and a chat request that picks it is answered with HTTP 400.
+
+**Google AI Studio** (`aistudio`): `GEMINI_API_KEY`, `AISTUDIO_BASE_URL` (default `https://generativelanguage.googleapis.com/v1beta/openai/`), `AISTUDIO_LLM_MODEL` / `AISTUDIO_VISION_MODEL` (default `gemma-4-31b-it`), `AISTUDIO_EMBEDDING_MODEL` (`gemini-embedding-001`), `AISTUDIO_MODELS` (pinned picker list, default `gemma-4-31b-it,gemma-4-26b-a4b-it`), `AISTUDIO_LIST_ALL_MODELS` (`true`: also list `GET {base}/models`, gemini* / gemma* chat models, cached `COMPAT_MODELS_CACHE_S`=600 s), `AISTUDIO_FOLD_SYSTEM` (`auto|on|off`: merge the system prompt into the first user message; auto = for `gemma*` ids), `AISTUDIO_JSON_MODE` (`auto|on|off`: `response_format=json_object`; auto = `gemini*` only, Gemma relies on the loose JSON parser), `AISTUDIO_MAX_INPUT_TOKENS` (60000, lean mode). Ollama-style names map through a small table in `services/runners/aistudio_runner.py` (`gemma4:31b*` to `gemma-4-31b-it`, `gemma4:26b*` to `gemma-4-26b-a4b-it`, any other `x:y` to `AISTUDIO_LLM_MODEL`).
+
+**Generic OpenAI-compatible** (`openai`): `OPENAI_COMPAT_BASE_URL` (no value = not set up), `OPENAI_COMPAT_API_KEY` (optional for local servers), `OPENAI_COMPAT_MODELS` (pinned picker list), `OPENAI_COMPAT_LLM_MODEL` (what Ollama-style names map to; defaults to the first pinned model), `OPENAI_COMPAT_EMBEDDING_MODEL` (only for `EMBEDDING_RUNNER=openai`), `OPENAI_COMPAT_REMOTE` (`true`: billed service, so `TOKEN_MODE=auto` runs lean; `false` for a local server), `OPENAI_COMPAT_LIST_ALL_MODELS` (`true`: also list `GET {base}/models`), `OPENAI_COMPAT_MAX_INPUT_TOKENS` (0 = no cap). Examples **[unverified: base URLs taken from the providers' docs as known to the author, not tested here]**:
+```
+# OpenRouter
+OPENAI_COMPAT_BASE_URL=https://openrouter.ai/api/v1
+OPENAI_COMPAT_API_KEY=sk-or-...
+OPENAI_COMPAT_MODELS=qwen/qwen3-coder,meta-llama/llama-3.3-70b-instruct
+OPENAI_COMPAT_LLM_MODEL=qwen/qwen3-coder
+# Groq
+OPENAI_COMPAT_BASE_URL=https://api.groq.com/openai/v1
+OPENAI_COMPAT_API_KEY=gsk_...
+OPENAI_COMPAT_LLM_MODEL=llama-3.3-70b-versatile
+# local vLLM (no key, not billed)
+OPENAI_COMPAT_BASE_URL=http://localhost:8000/v1
+OPENAI_COMPAT_LLM_MODEL=Qwen/Qwen2.5-Coder-7B-Instruct
+OPENAI_COMPAT_REMOTE=false
+```
+Then `LLM_RUNNER=openai`, or pick it in the UI.
+
+**Embeddings on `aistudio` / `openai`**: `EMBEDDING_RUNNER=aistudio` (or `openai`) works, but vectors of different embedding models are not comparable: after changing `EMBEDDING_RUNNER` or the embedding model, re-index every repo (`python reset_repo_index.py`). The per-request runner picked in the UI never changes embeddings.
 
 ### Switching runner and token mode from the UI
 Next to the model picker the chat box has a **runner** select (built from `GET /api/v1/runners`, so a newly registered runner shows up by itself; runners that are not configured are disabled and show the reason as a tooltip) and a **Tokens: Auto / Lean / Normal** select. Both are saved in the browser (`runner`, `tokenMode`) and sent with every chat call (`runner`, `token_mode`; a runner that is unknown or not configured is answered with HTTP 400). Picking a runner reloads the model list (`GET /api/v1/models?runner=name`); a saved model that the new runner does not offer falls back to Default. The switch only affects **chat**: embeddings always stay on `EMBEDDING_RUNNER`, otherwise the vector index would stop matching.
@@ -152,6 +184,6 @@ Every ask-agent step resends the whole conversation, so on a paid runner the too
 Telemetry: every LLM call event carries runner, mode, input / output / cached tokens and the estimated tokens saved, and each question ends with one "Token usage" event (sum over its calls). Both appear in the Telemetry tab. "Saved" is an estimate (characters not sent / 4) from compaction, history trimming, the input cap, the lean read and seed budgets; step and observation-total budgets are not counted. Cached tokens are shown when the server reports them.
 
 ### How to add a runner
-1. Write a class in `services/runners/` with `name`, `remote` (True = paid/remote, makes `TOKEN_MODE=auto` lean), `max_input_tokens` (0 = no cap), `supports`, and the methods `check_config()` (raise `RunnerConfigError`, no network), `map_model(model, vision=False)`, `chat(model, **kw)` (a LangChain chat model), `embeddings(model=None, ...)` and `async list_models()`. See `services/runners/base.py` for the exact contract and `ollama_runner.py` / `cloudflare_runner.py` for examples.
+1. For any OpenAI-style API, subclass `OpenAICompatRunner` (`services/runners/openai_compat.py`) and fill in `name`, `label`, `remote`, `base_url()`, `api_key()`, `check_config()`, `llm_default()` / `embedding_default()` (plus optional hooks: `map_model`, `json_enabled`, `extra_headers`, `chat_class`, `pinned_models`, `_fetch_catalog`); `aistudio_runner.py` is a ~100 line example. For any other API write a class in `services/runners/` with `label` (shown in the UI), `name`, `remote` (True = paid/remote, makes `TOKEN_MODE=auto` lean), `max_input_tokens` (0 = no cap), `supports`, and the methods `check_config()` (raise `RunnerConfigError`, no network), `map_model(model, vision=False)`, `chat(model, **kw)` (a LangChain chat model), `embeddings(model=None, ...)` and `async list_models()`. See `services/runners/base.py` for the exact contract and `ollama_runner.py` / `cloudflare_runner.py` for examples.
 2. Register it: `register_runner("myrunner", MyRunner)` (the registry in `services/runners/__init__.py`).
 3. That is all: `LLM_RUNNER=myrunner` works, and it shows up in `GET /api/v1/runners` and the UI runner select. Call sites always use `make_chat()` / `resolve_model()`, which honour the per-request runner.

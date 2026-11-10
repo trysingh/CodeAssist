@@ -13,7 +13,9 @@ there. When the free allowance or the credits run out, ollama.com answers 402 an
 
 Runner-aware: besides ollama's ResponseError it recognises OpenAI-style errors (openai.APIStatusError / httpx: `.status_code`
 or `.response.status_code`), which is what the Cloudflare Workers AI runner raises (daily neuron allocation used up = 429 with a
-quota text; bad / unauthorised token = 401 / 403 -> `ModelAuthError`). Messages name the active runner (settings.llm_runner).
+quota text; bad / unauthorised token = 401 / 403 -> `ModelAuthError`). Google AI Studio (Gemini API) uses the same shape: 429
+RESOURCE_EXHAUSTED / "exceeded your current quota", 400 API_KEY_INVALID, 401 / 403 PERMISSION_DENIED. Messages name the active
+runner (the request's runner_scope, else settings.llm_runner).
 
 Imports only config.settings at module level (notifier / action_log are imported lazily), so there is no import cycle.
 """
@@ -32,8 +34,10 @@ from services.runners.base import MODEL_NAME as _MODEL_NAME     # same shape mod
 T = TypeVar("T")
 
 PLANS_URL = "https://ollama.com/plans"
+AISTUDIO_KEY_URL = "https://aistudio.google.com/apikey"
+AISTUDIO_LIMITS_URL = "https://ai.google.dev/gemini-api/docs/rate-limits"
 _CLOUD = re.compile(r"[-:]cloud$", re.IGNORECASE)
-_QUOTA_TEXT = re.compile(r"credit|usage|quota|subscri|upgrade|/plans|neuron|allocation|daily limit", re.IGNORECASE)   # a busy LOCAL Ollama also answers 429 ("maximum pending requests"): that is not a quota
+_QUOTA_TEXT = re.compile(r"credit|usage|quota|subscri|upgrade|/plans|neuron|allocation|daily limit|resource_exhausted|resource has been exhausted", re.IGNORECASE)   # a busy LOCAL Ollama also answers 429 ("maximum pending requests"): that is not a quota
 
 
 def is_cloud_model(model: str) -> bool:
@@ -69,6 +73,18 @@ class ModelQuotaError(RuntimeError):
                         "Pick another model in the model selector or set LLM_RUNNER=ollama.")
             return msg + (" Wait for the daily reset, move the account to Workers Paid, pick another model in the model selector,"
                           " or set LLM_RUNNER=ollama in .env.")
+        if self.runner == "aistudio":
+            msg = (f"Model '{self.model}' was refused (HTTP {self.status}): Google AI Studio says the quota or rate limit is used up "
+                   "(RESOURCE_EXHAUSTED: requests / tokens per minute or per day; limits differ per model and plan).")
+            if self.fallback_tried:
+                msg += f" The fallback model '{self.fallback_tried}' could not answer either ({self.fallback_error or 'no reply'})."
+            return msg + (f" Wait a minute and retry, pick another model in the model selector, check your limits in AI Studio ({AISTUDIO_LIMITS_URL}),"
+                          f" enable billing for the key's project ({AISTUDIO_KEY_URL}), or set LLM_RUNNER=ollama.")
+        if self.runner == "openai":
+            msg = f"Model '{self.model}' was refused (HTTP {self.status}): the OpenAI-compatible endpoint says the credits, quota or rate limit are used up."
+            if self.fallback_tried:
+                msg += f" The fallback model '{self.fallback_tried}' could not answer either ({self.fallback_error or 'no reply'})."
+            return msg + " Check the provider's dashboard (OPENAI_COMPAT_BASE_URL), pick another model, or set LLM_RUNNER=ollama."
         who = "Ollama Cloud" if is_cloud_model(self.model) else "the model endpoint"
         msg = f"Model '{self.model}' was refused (HTTP {self.status}): {who} says the usage credits or limit are used up."
         if self.fallback_tried:
@@ -137,14 +153,26 @@ class ModelAuthError(RuntimeError):
         if self.runner == "cloudflare":
             return head + ("Cloudflare Workers AI rejected the credentials. Check CF_API_TOKEN (needs Workers AI Read + Edit, no stray quotes "
                            "or spaces) and CF_ACCOUNT_ID; see docs/CLOUDFLARE_SETUP.md.")
+        if self.runner == "aistudio":
+            return head + ("Google AI Studio rejected the API key (API_KEY_INVALID / PERMISSION_DENIED). Check GEMINI_API_KEY (no stray quotes or "
+                           f"spaces; create one at {AISTUDIO_KEY_URL}), that the Generative Language API is allowed for its project, and that the "
+                           "model is available to your region and plan; see docs/GOOGLE_AI_STUDIO_SETUP.md.")
+        if self.runner == "openai":
+            return head + "the OpenAI-compatible endpoint rejected the credentials. Check OPENAI_COMPAT_API_KEY and OPENAI_COMPAT_BASE_URL."
         return head + "the endpoint rejected the credentials. For an Ollama Cloud model run `ollama signin` (or set OLLAMA_API_KEY)."
 
 
+_BAD_KEY_TEXT = re.compile(r"API_KEY_INVALID|API key not valid|API key expired", re.IGNORECASE)     # Google answers a wrong key with HTTP 400
+
+
 def auth_status(exc: BaseException) -> Optional[int]:
-    """401 / 403 of a provider error (or anything it was raised from), else None."""
+    """401 / 403 of a provider error (or anything it was raised from); 400 when its text says the API key is invalid. Else None."""
     for e in _chain(exc):
-        if _status_of(e) in (401, 403):
-            return _status_of(e)
+        status = _status_of(e)
+        if status in (401, 403):
+            return status
+        if status == 400 and _BAD_KEY_TEXT.search(_text_of(e)):
+            return 400
     return None
 
 

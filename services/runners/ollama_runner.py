@@ -9,6 +9,7 @@ from config.settings import settings
 
 class OllamaRunner:
     name = "ollama"
+    label = "Ollama (local)"
     remote = False
     max_input_tokens = 0
     supports = {"vision": True, "json": True, "reasoning": True, "num_ctx": True, "embeddings": True}

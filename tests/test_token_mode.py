@@ -403,7 +403,7 @@ def test_runners_payload_is_built_from_the_registry(monkeypatch):
     p = runners_payload()
     assert p["default"] == "ollama" and p["token_mode"] == "auto"
     by = {r["name"]: r for r in p["runners"]}
-    assert by["ollama"] == {"name": "ollama", "remote": False, "configured": True, "error": None}
+    assert by["ollama"] == {"name": "ollama", "label": "Ollama (local)", "remote": False, "configured": True, "error": None}
     assert by["cloudflare"]["remote"] is True and by["cloudflare"]["configured"] is True
     assert by["fake"]["remote"] is True and by["fake"]["configured"] is False and "not set up" in by["fake"]["error"]
     monkeypatch.setattr(settings, "cf_api_token", "")

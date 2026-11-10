@@ -888,18 +888,21 @@ async function loadRunners() {
     try {
         const r = await (await fetch('/api/v1/runners')).json();
         const list = r.runners || [];
-        sel.innerHTML = `<option value="">Default (${esc(r.default)})</option>` + list.map(x =>
-            `<option value="${esc(x.name)}"${x.configured ? '' : ' disabled'} title="${esc(x.configured ? (x.remote ? 'remote / paid runner' : 'local runner') : (x.error || 'not configured'))}">${esc(x.name)}${x.remote ? ' ☁' : ''}${x.configured ? '' : ' (not set up)'}</option>`).join('');
+        S.runnerLabels = {}; list.forEach(x => { S.runnerLabels[x.name] = x.label || x.name; });
+        sel.innerHTML = `<option value="">Default (${esc(runnerLabel(r.default))})</option>` + list.map(x =>
+            `<option value="${esc(x.name)}"${x.configured ? '' : ' disabled'} title="${esc(x.configured ? `${x.label || x.name} (${x.name}): ${x.remote ? 'remote / paid runner' : 'local runner'}` : (x.error || 'not configured'))}">${esc(x.label || x.name)}${x.remote ? ' ☁' : ''}${x.configured ? '' : ' (not set up)'}</option>`).join('');
         S.defaultRunner = r.default; S.serverTokenMode = r.token_mode || 'auto';
         const ok = list.find(x => x.name === S.runner && x.configured);
         if (S.runner && !ok) { S.runner = ''; LS.set('runner', ''); }      // saved runner is gone or no longer configured
         sel.value = S.runner;
-        sel.title = sel.ariaLabel = `Runner (chat model backend; default ${r.default})`;
+        sel.title = sel.ariaLabel = `Runner (chat model backend; default ${runnerLabel(r.default)})`;
         initTokenMode();
     } catch { /* stays on Default */ }
     sel.onchange = () => { S.runner = sel.value; LS.set('runner', S.runner); loadModels(); };         // a model not offered by the new runner falls back to Default inside loadModels
     loadModels();
 }
+
+function runnerLabel(name) { return (S.runnerLabels && S.runnerLabels[name]) || name || 'default'; }       // human label from /api/v1/runners; the id (name) is what requests and telemetry carry
 
 function initTokenMode() {
     const sel = $('token-mode-select'); if (!sel) return;
@@ -918,7 +921,7 @@ function updateSettingsChip() {
     const mode = ($('token-mode-select') || {}).value || 'auto';
     lab.textContent = model;
     if (badge) { badge.textContent = mode; badge.classList.toggle('hidden', mode === 'auto'); }
-    chip.title = `Runner: ${runner} · Model: ${model} · Tokens: ${mode}. Click to change.`;
+    chip.title = `Runner: ${runnerLabel(runner)} (${runner}) · Model: ${model} · Tokens: ${mode}. Click to change.`;
 }
 
 function toggleChatSettings(open) {
@@ -954,11 +957,11 @@ async function loadModels() {
         const runner = r.runner || 'ollama';
         const short = m => String(m).replace(/^@cf\/[^/]+\//, '');    // @cf/google/gemma-4-26b-a4b-it -> gemma-4-26b-a4b-it
         const models = (r.models || []).filter(m => m !== r.default);
-        sel.innerHTML = `<option value="" title="${esc(r.default)} (${esc(runner)})">Default (${esc(short(r.default))})</option>` +
-            `<optgroup label="${esc(runner)} models">` +
+        sel.innerHTML = `<option value="" title="${esc(r.default)} (${esc(runnerLabel(runner))})">Default (${esc(short(r.default))})</option>` +
+            `<optgroup label="${esc(runnerLabel(runner))} models">` +
             models.map(m => `<option value="${esc(m)}" title="${esc(m)}">${esc(short(m))}</option>`).join('') +
             `</optgroup>`;
-        sel.title = sel.ariaLabel = `Reasoning model (runner: ${runner})`;
+        sel.title = sel.ariaLabel = `Reasoning model (runner: ${runnerLabel(runner)})`;
         sel.dataset.runner = runner;
         // A pick saved under another runner (e.g. an Ollama tag after switching to Cloudflare) falls back to Default.
         if (S.model && S.model !== r.default && !models.includes(S.model)) { S.model = ''; LS.set('model', ''); }

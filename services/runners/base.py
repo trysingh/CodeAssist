@@ -1,9 +1,9 @@
 """Runner contract: what the app needs from an inference backend.
 
-A runner builds LangChain chat / embedding clients for one backend (Ollama, Cloudflare Workers AI, ...). Call sites never
+A runner builds LangChain chat / embedding clients for one backend (Ollama, Cloudflare Workers AI, Google AI Studio, any OpenAI-style server ...). Call sites never
 import a provider package; they ask `services.runners` for a client, so the backend is a config choice (settings.llm_runner /
-settings.embedding_runner, or per request from the UI). To add a runner: implement this protocol in a new module and
-`register_runner("name", Factory)` (the runner list in the UI is built from the registry).
+settings.embedding_runner, or per request from the UI). To add a runner: implement this protocol in a new module (or, for an OpenAI-style API, subclass
+openai_compat.OpenAICompatRunner) and `register_runner("name", Factory)` (the runner list in the UI is built from the registry).
 """
 from __future__ import annotations
 
@@ -21,6 +21,8 @@ class RunnerConfigError(RuntimeError):
 @runtime_checkable
 class Runner(Protocol):
     name: str
+    # Human name for the UI runner dropdown ("Ollama (local)", "Google AI Studio"); optional: the UI falls back to `name`.
+    label: str
     # True = a remote / paid service (every token is billed): TOKEN_MODE=auto then runs lean. False = local (Ollama).
     remote: bool
     # Estimated-token cap for one call's input (0 = none); the ask agent trims history / old tool output to stay under it.

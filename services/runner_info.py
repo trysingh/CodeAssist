@@ -21,7 +21,7 @@ async def models_payload(runner: Optional[str] = None) -> dict:
     name = require_runner(runner)
     with runner_scope(name):
         names = list(await list_chat_models())
-        default = resolve_model()       # Ollama: settings.llm_model; Cloudflare: an Ollama-style default maps to settings.cf_llm_model
+        default = resolve_model()       # Ollama: settings.llm_model; remote runners map an Ollama-style default (Cloudflare: cf_llm_model, AI Studio: gemma-4-31b-it ...)
         if default not in names:
             names.insert(0, default)
         return {"default": default, "models": names, "runner": current_runner_name()}

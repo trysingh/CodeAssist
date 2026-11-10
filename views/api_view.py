@@ -84,7 +84,7 @@ async def serve_dashboard(request: Request):
 
 @app.get("/api/v1/runners")
 async def list_runners():
-    """Every registered runner for the UI switch: {"default", "runners": [{name, remote, configured, error}]}."""
+    """Every registered runner for the UI switch: {"default", "runners": [{name, label, remote, configured, error}]}."""
     return runners_payload()
 
 @app.get("/api/v1/models")
