@@ -31,6 +31,9 @@ class EngineSettings(BaseSettings):
     web_enabled: bool = True                           # master switch; False = never touch the internet
     searxng_url: str = Field(default="http://localhost:8080/search",
                              validation_alias=AliasChoices("ENGINE_SEARXNG_URL", "SEARXNG_URL"))
+    # Who searches: app = SearXNG + scraper (always) | native = the runner's own web tool when it has one (Claude Code / Codex CLI), else app |
+    # auto = native only for a chat that is NOT repo-scoped (code/client names stay out of model-written queries), else app. Unknown = auto.
+    web_provider: str = Field(default="auto", validation_alias=AliasChoices("ENGINE_WEB_PROVIDER", "WEB_PROVIDER"))
     web_max_results: int = 5                           # results requested from SearXNG
     web_max_pages: int = 3                             # pages actually scraped per question
     web_page_chars: int = 5000                         # per-page text budget sent to the LLM
@@ -124,6 +127,24 @@ class EngineSettings(BaseSettings):
     compat_timeout_s: float = Field(default=120.0)
     compat_max_retries: int = Field(default=2)
     compat_models_cache_s: int = Field(default=600, validation_alias=AliasChoices("ENGINE_COMPAT_MODELS_CACHE_S", "COMPAT_MODELS_CACHE_S"))
+
+    # ---- subscription runners (docs/SUBSCRIPTION_RUNNERS.md): "claude_code" and "chatgpt_codex" shell out to the vendors' OFFICIAL CLIs, which the
+    # user logs into themselves (`claude` then /login, `codex login`). No API key and no OAuth token ever passes through this app. Chat only
+    # (EMBEDDING_RUNNER stays ollama). *_MODEL empty = the CLI picks its own default model.
+    claude_code_bin: str = Field(default="claude", validation_alias=AliasChoices("ENGINE_CLAUDE_CODE_BIN", "CLAUDE_CODE_BIN"))
+    claude_code_model: str = Field(default="", validation_alias=AliasChoices("ENGINE_CLAUDE_CODE_MODEL", "CLAUDE_CODE_MODEL"))
+    claude_code_models: str = Field(default="", validation_alias=AliasChoices("ENGINE_CLAUDE_CODE_MODELS", "CLAUDE_CODE_MODELS"))
+    claude_code_timeout_s: float = Field(default=300.0, validation_alias=AliasChoices("ENGINE_CLAUDE_CODE_TIMEOUT_S", "CLAUDE_CODE_TIMEOUT_S"))
+    claude_code_max_input_tokens: int = Field(default=150000, validation_alias=AliasChoices("ENGINE_CLAUDE_CODE_MAX_INPUT_TOKENS", "CLAUDE_CODE_MAX_INPUT_TOKENS"))
+    codex_bin: str = Field(default="codex", validation_alias=AliasChoices("ENGINE_CODEX_BIN", "CODEX_BIN"))
+    codex_model: str = Field(default="", validation_alias=AliasChoices("ENGINE_CODEX_MODEL", "CODEX_MODEL"))
+    # Comma list for the UI model picker (empty = the built-in list). The models a ChatGPT sign-in may use change often: run `codex`, then /model.
+    codex_models: str = Field(default="", validation_alias=AliasChoices("ENGINE_CODEX_MODELS", "CODEX_MODELS"))
+    # Native web search mode when Codex searches (WEB_PROVIDER native/auto): "live" = fresh pages, "cached" = OpenAI's search index
+    # (faster, fewer tokens, smaller prompt-injection surface, can lag). Anything else = live.
+    codex_web_mode: str = Field(default="live", validation_alias=AliasChoices("ENGINE_CODEX_WEB_MODE", "CODEX_WEB_MODE"))
+    codex_timeout_s: float = Field(default=300.0, validation_alias=AliasChoices("ENGINE_CODEX_TIMEOUT_S", "CODEX_TIMEOUT_S"))
+    codex_max_input_tokens: int = Field(default=100000, validation_alias=AliasChoices("ENGINE_CODEX_MAX_INPUT_TOKENS", "CODEX_MAX_INPUT_TOKENS"))
 
     # ---- token mode (services/token_budget.py): spend fewer tokens on paid / remote runners ----
     # "auto" = lean for remote runners (Cloudflare), normal for Ollama. "lean" / "normal" force it. The chat request may override it per question.

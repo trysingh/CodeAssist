@@ -139,6 +139,8 @@ Setup and troubleshooting: `docs/CLOUDFLARE_SETUP.md`.
 | `cloudflare` | Cloudflare Workers AI | yes | `CF_ACCOUNT_ID`, `CF_API_TOKEN` | `docs/CLOUDFLARE_SETUP.md` |
 | `aistudio` | Google AI Studio | yes | `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) | Gemini API, OpenAI-compatible endpoint; `docs/GOOGLE_AI_STUDIO_SETUP.md` |
 | `openai` | OpenAI-compatible | `OPENAI_COMPAT_REMOTE` (default yes) | `OPENAI_COMPAT_BASE_URL` | any `/chat/completions` server, configured by settings only |
+| `claude_code` | Claude (subscription via Claude Code CLI) | yes | the official `claude` CLI, logged in (`/login`) | no API key; chat only; `docs/SUBSCRIPTION_RUNNERS.md` |
+| `chatgpt_codex` | ChatGPT (subscription via Codex CLI) | yes | the official `codex` CLI, logged in (`codex login`) | no API key; chat only; `docs/SUBSCRIPTION_RUNNERS.md` |
 
 Only the runners named by `LLM_RUNNER` and `EMBEDDING_RUNNER` are checked at startup. Any other runner that is not set up simply shows as "(not set up)" in the UI runner select, with the reason as tooltip, and a chat request that picks it is answered with HTTP 400.
 

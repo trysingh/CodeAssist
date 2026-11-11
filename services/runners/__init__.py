@@ -8,7 +8,8 @@ embedding models are not comparable: changing the embedding runner needs a re-in
 The chat runner can also be picked per request (the UI runner switch): `with runner_scope(name):` makes get_runner() / make_chat() /
 resolve_model() with no name use it. Embeddings IGNORE that scope and always use settings.embedding_runner.
 Add a backend: write a class following base.Runner and call register_runner("name", factory). For any OpenAI-style API subclass
-openai_compat.OpenAICompatRunner (see aistudio_runner.py: ~100 lines). Built in: ollama, cloudflare, aistudio, openai.
+openai_compat.OpenAICompatRunner (see aistudio_runner.py: ~100 lines). Built in: ollama, cloudflare, aistudio, openai, claude_code, chatgpt_codex
+(the last two run the user's logged-in official CLIs, chat only: docs/SUBSCRIPTION_RUNNERS.md).
 """
 from __future__ import annotations
 
@@ -17,14 +18,16 @@ from typing import Any, Callable, Dict, List, Optional
 from config.settings import settings
 from services.runners.base import MODEL_NAME, Runner, RunnerConfigError
 from services.runners.aistudio_runner import GoogleAIStudioRunner
+from services.runners.claude_code_runner import ClaudeCodeRunner
 from services.runners.cloudflare_runner import CloudflareRunner
+from services.runners.codex_runner import CodexRunner
 from services.runners.ollama_runner import OllamaRunner
 from services.runners.openai_compat import OpenAICompatRunner
 from services.runners.openai_runner import OpenAIRunner
 from services.runners.scope import current_runner_name, current_session_key, runner_scope, session_key, thread_scope
 
 _REGISTRY: Dict[str, Callable[[], Runner]] = {"ollama": OllamaRunner, "cloudflare": CloudflareRunner, "aistudio": GoogleAIStudioRunner,
-                                              "openai": OpenAIRunner}
+                                              "openai": OpenAIRunner, "claude_code": ClaudeCodeRunner, "chatgpt_codex": CodexRunner}
 
 
 def register_runner(name: str, factory: Callable[[], Runner]) -> None:
@@ -50,15 +53,16 @@ def get_embedding_runner() -> Runner:
 
 
 def runner_status() -> List[dict]:
-    """Every registered runner: {"name", "label", "remote", "configured", "error", "timeout_s", "max_retries"} (check_config only, never touches
+    """Every registered runner: {"name", "label", "remote", "configured", "error", "timeout_s", "max_retries", "native_web"} (native_web = the runner can search the web itself; check_config only, never touches
     the network). timeout_s = seconds one request may take per attempt (None = no client-side limit, as for Ollama), max_retries = how often
     the client repeats a timed-out / failed request: a hang costs up to timeout_s x (max_retries + 1)."""
     out = []
     for key in available_runners():
-        remote, err, label, timeout_s, retries = False, None, key, None, 0
+        remote, err, label, timeout_s, retries, native_web = False, None, key, None, 0, False
         try:
             r = _REGISTRY[key]()
             remote = bool(getattr(r, "remote", False))
+            native_web = bool((getattr(r, "supports", None) or {}).get("web_search", False))
             label = str(getattr(r, "label", "") or key)
             t, n = getattr(r, "timeout_s", None), getattr(r, "max_retries", None)
             timeout_s = float(t()) if callable(t) and t() else None
@@ -69,7 +73,7 @@ def runner_status() -> List[dict]:
         except Exception as exc:  # noqa: BLE001 - a broken third-party runner must not break the list
             err = f"{type(exc).__name__}: {exc}"
         out.append({"name": key, "label": label, "remote": remote, "configured": err is None, "error": err,
-                    "timeout_s": timeout_s, "max_retries": retries})
+                    "timeout_s": timeout_s, "max_retries": retries, "native_web": native_web})
     return out
 
 
@@ -93,6 +97,15 @@ def _telemetry_callbacks(phase: str) -> list:
         return []
 
 
+def _user_picked_model() -> str:
+    """The model the user picked for this request in the UI ('' = Default)."""
+    try:
+        from services.model_calls import _model_override      # lazy: model_calls imports this package
+        return _model_override.get() or ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def make_chat(model: str, *, ollama_cls: Any = None, phase: str = "CHAT", **kw: Any) -> Any:
     """Chat client from the LLM runner of this request (runner_scope, else settings.llm_runner; kwargs: see base.Runner.chat).
 
@@ -101,6 +114,9 @@ def make_chat(model: str, *, ollama_cls: Any = None, phase: str = "CHAT", **kw: 
     Telemetry callbacks are told the model id the runner really calls (model: gemma-4-31b-it) and the name that was asked for
     (requested_model: gemma4:31b-cloud)."""
     runner = get_runner()
+    web = kw.pop("web", False)
+    if web and (getattr(runner, "supports", None) or {}).get("web_search"):
+        kw["web"] = True                # only runners with a native web tool take the argument; the others keep their signature
     if ollama_cls is not None and runner.name == "ollama":
         kw["chat_cls"] = ollama_cls
     if kw.get("callbacks") is None:
@@ -111,6 +127,8 @@ def make_chat(model: str, *, ollama_cls: Any = None, phase: str = "CHAT", **kw: 
             if hasattr(cb, "model_name") and type(cb).__name__ == "StdoutTelemetryCallback":
                 if not getattr(cb, "requested_model", ""):
                     cb.requested_model = model or settings.llm_model
+                if cb.requested_model == settings.llm_model and actual != settings.llm_model and not _user_picked_model():
+                    cb.requested_model = "Default"      # nothing picked in the UI: the Ollama-style LLM_MODEL is only a placeholder here
                 cb.model_name = actual
     except Exception:  # noqa: BLE001  - labelling only
         pass
@@ -126,7 +144,10 @@ def check_runner_config() -> None:
     """Fail fast (RunnerConfigError) when the CONFIGURED runners (settings.llm_runner, settings.embedding_runner) are unusable.
     Called at startup; no network. Other registered runners (e.g. aistudio without a key) are only checked when picked in the UI."""
     get_runner(settings.llm_runner).check_config()
-    get_embedding_runner().check_config()
+    emb = get_embedding_runner()
+    if not emb.supports.get("embeddings", True):
+        raise RunnerConfigError(f"EMBEDDING_RUNNER={emb.name} cannot embed (that runner is chat only); keep EMBEDDING_RUNNER=ollama.")
+    emb.check_config()
 
 
 __all__ = ["MODEL_NAME", "Runner", "OpenAICompatRunner", "RunnerConfigError", "available_runners", "check_runner_config", "current_runner_name",

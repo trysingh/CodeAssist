@@ -12,7 +12,7 @@ class OllamaRunner:
     label = "Ollama (local)"
     remote = False
     max_input_tokens = 0
-    supports = {"vision": True, "json": True, "reasoning": True, "num_ctx": True, "embeddings": True}
+    supports = {"vision": True, "json": True, "reasoning": True, "num_ctx": True, "embeddings": True, "web_search": False}
 
     timeout_setting = ""
 

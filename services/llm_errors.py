@@ -50,6 +50,11 @@ _CLOUD = re.compile(r"[-:]cloud$", re.IGNORECASE)
 _QUOTA_TEXT = re.compile(r"credit|usage|quota|subscri|upgrade|/plans|neuron|allocation|daily limit|resource_exhausted|resource has been exhausted", re.IGNORECASE)   # a busy LOCAL Ollama also answers 429 ("maximum pending requests"): that is not a quota
 
 
+# Subscription runners: (CLI name, how to log in). The app only runs the vendor's CLI; the user logs in there.
+_CLI_RUNNERS = {"claude_code": ("Claude Code", "Run `claude` in a terminal and log in with /login."),
+                "chatgpt_codex": ("Codex", "Run `codex login` in a terminal (Sign in with ChatGPT).")}
+
+
 def is_cloud_model(model: str) -> bool:
     """gemma4:31b-cloud, gpt-oss:120b-cloud, gpt-oss:cloud ... (billed by ollama.com, not run locally)."""
     return bool(_CLOUD.search((model or "").strip()))
@@ -90,6 +95,12 @@ class ModelQuotaError(RuntimeError):
                 msg += f" The fallback model '{self.fallback_tried}' could not answer either ({self.fallback_error or 'no reply'})."
             return msg + (f" Wait a minute and retry, pick another model in the model selector, check your limits in AI Studio ({AISTUDIO_LIMITS_URL}),"
                           f" enable billing for the key's project ({AISTUDIO_KEY_URL}), or set LLM_RUNNER=ollama.")
+        if self.runner in _CLI_RUNNERS:
+            msg = (f"Model '{self.model}' was refused: your {_CLI_RUNNERS[self.runner][0]} subscription says the usage or rate limit is used up "
+                   "(e.g. the 5-hour window or a weekly cap).")
+            if self.fallback_tried:
+                msg += f" The fallback model '{self.fallback_tried}' could not answer either ({self.fallback_error or 'no reply'})."
+            return msg + " Wait for the reset shown by the CLI, pick another model or runner, or set LLM_RUNNER=ollama."
         if self.runner == "openai":
             msg = f"Model '{self.model}' was refused (HTTP {self.status}): the OpenAI-compatible endpoint says the credits, quota or rate limit are used up."
             if self.fallback_tried:
@@ -128,6 +139,8 @@ def _status_of(e: BaseException):
 def quota_status(exc: BaseException) -> Optional[int]:
     """402 always; 429 only when its text talks about usage / credits / plans / neurons. None = not a quota failure."""
     for e in _chain(exc):
+        if getattr(e, "cli_kind", "") == "quota":        # subscription CLI runners (cli_core.CLIRunError): usage / rate limit message
+            return 429
         status = _status_of(e)
         if status == 402:
             return 402
@@ -167,6 +180,8 @@ class ModelAuthError(RuntimeError):
             return head + ("Google AI Studio rejected the API key (API_KEY_INVALID / PERMISSION_DENIED). Check GEMINI_API_KEY (no stray quotes or "
                            f"spaces; create one at {AISTUDIO_KEY_URL}), that the Generative Language API is allowed for its project, and that the "
                            "model is available to your region and plan; see docs/GOOGLE_AI_STUDIO_SETUP.md.")
+        if self.runner in _CLI_RUNNERS:
+            return head + f"the {_CLI_RUNNERS[self.runner][0]} CLI is not logged in. {_CLI_RUNNERS[self.runner][1]} See docs/SUBSCRIPTION_RUNNERS.md."
         if self.runner == "openai":
             return head + "the OpenAI-compatible endpoint rejected the credentials. Check OPENAI_COMPAT_API_KEY and OPENAI_COMPAT_BASE_URL."
         return head + "the endpoint rejected the credentials. For an Ollama Cloud model run `ollama signin` (or set OLLAMA_API_KEY)."
@@ -178,6 +193,8 @@ _BAD_KEY_TEXT = re.compile(r"API_KEY_INVALID|API key not valid|API key expired",
 def auth_status(exc: BaseException) -> Optional[int]:
     """401 / 403 of a provider error (or anything it was raised from); 400 when its text says the API key is invalid. Else None."""
     for e in _chain(exc):
+        if getattr(e, "cli_kind", "") == "auth":         # subscription CLI runners: the CLI is not logged in
+            return 401
         status = _status_of(e)
         if status in (401, 403):
             return status

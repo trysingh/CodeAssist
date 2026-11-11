@@ -27,7 +27,8 @@ class Runner(Protocol):
     remote: bool
     # Estimated-token cap for one call's input (0 = none); the ask agent trims history / old tool output to stay under it.
     max_input_tokens: int
-    # What the backend can do: {"vision": bool, "json": bool, "reasoning": bool, "num_ctx": bool, "embeddings": bool}
+    # What the backend can do: {"vision": bool, "json": bool, "reasoning": bool, "num_ctx": bool, "embeddings": bool, "web_search": bool}.
+    # web_search = the backend can search the web itself; only then does make_chat forward chat(web=True) (settings.web_provider decides).
     supports: Dict[str, bool]
 
     def check_config(self) -> None:
@@ -39,7 +40,8 @@ class Runner(Protocol):
     def chat(self, model: str, *, temperature: float = 0, max_tokens: Optional[int] = None, json_mode: bool = False,
              reasoning: Any = None, num_ctx: Optional[int] = None, callbacks: Optional[list] = None,
              vision: bool = False, chat_cls: Any = None) -> Any:
-        """A LangChain chat model. `chat_cls` replaces the provider class (a patchable seam for the call sites / tests)."""
+        """A LangChain chat model. `chat_cls` replaces the provider class (a patchable seam for the call sites / tests).
+        A runner with supports["web_search"] also takes `web: bool = False` (allow its native web search for this call)."""
 
     def embeddings(self, model: Optional[str] = None, *, embeddings_cls: Any = None) -> Any:
         """A LangChain Embeddings object (model None = the configured embedding model of this runner)."""

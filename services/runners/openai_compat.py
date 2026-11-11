@@ -117,7 +117,7 @@ class OpenAICompatRunner:
     name = "openai"
     label = "OpenAI-compatible"
     remote = True
-    supports = {"vision": True, "json": True, "reasoning": False, "num_ctx": False, "embeddings": True}
+    supports = {"vision": True, "json": True, "reasoning": False, "num_ctx": False, "embeddings": True, "web_search": False}
     max_input_tokens = 0
     _CACHE: Dict[str, Any] = {}                     # per subclass (see cache()); module level state: get_runner() builds a new runner per call
 

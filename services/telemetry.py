@@ -83,6 +83,9 @@ class StdoutTelemetryCallback(BaseCallbackHandler):
                     input_tokens += usage.get("input_tokens") or usage.get("prompt_eval_count") or usage.get("prompt_tokens") or 0
                     output_tokens += usage.get("output_tokens") or usage.get("eval_count") or usage.get("completion_tokens") or 0
                     cached_tokens += _cached_of(usage)
+                actual = (getattr(msg, "response_metadata", None) or {}).get("actual_model")
+                if actual and isinstance(actual, str):
+                    self.model_name = actual    # a CLI runner called with "default" reports the model that really answered
                 if not cached_tokens:           # OpenAI-shaped: response_metadata.token_usage.prompt_tokens_details.cached_tokens
                     cached_tokens += _cached_of((getattr(msg, "response_metadata", None) or {}).get("token_usage"))
         # OpenAI-shaped servers report the totals once per call in llm_output["token_usage"]

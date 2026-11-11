@@ -39,7 +39,7 @@ class CloudflareRunner(OpenAICompatRunner):
     name = "cloudflare"
     label = "Cloudflare Workers AI"
     remote = True
-    supports = {"vision": True, "json": True, "reasoning": False, "num_ctx": False, "embeddings": True}
+    supports = {"vision": True, "json": True, "reasoning": False, "num_ctx": False, "embeddings": True, "web_search": False}
 
     @property
     def max_input_tokens(self) -> int:      # type: ignore[override]

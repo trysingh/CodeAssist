@@ -1,6 +1,25 @@
 # Changelog
 
 ## v3.2 (unreleased)
+### Added
+- **Subscription runners `claude_code` and `chatgpt_codex`** (`LLM_RUNNER=claude_code` / `chatgpt_codex`): chat through your existing Claude Pro/Max or ChatGPT
+  plan by running the vendors' official CLIs (`claude -p`, `codex exec`), which you log into yourself; no API key, and the app never reads their OAuth tokens
+  or credential files (personal, single-user use). Chat only (keep `EMBEDDING_RUNNER=ollama`; setting it to these fails at startup). A "not logged in" output
+  becomes `ModelAuthError`, a usage / rate-limit output (`usage limit`, `5-hour`, `429`) `ModelQuotaError` (so `LLM_FALLBACK_MODEL` and the cooldown work),
+  a hang `ModelTimeoutError`. New settings `CLAUDE_CODE_BIN/_MODEL/_TIMEOUT_S/_MAX_INPUT_TOKENS`, `CODEX_BIN/_MODEL/_TIMEOUT_S/_MAX_INPUT_TOKENS`.
+  Setup: `docs/SUBSCRIPTION_RUNNERS.md`. Tests: `tests/test_runners_cli_subscription.py`.
+- **Fix (Windows): subscription runners failed with `Cannot start 'codex'` (WinError 2).** npm installs the CLIs as `.cmd` shims, which
+  `subprocess` cannot start by bare name; they are now resolved and run as `node <entry.js>`. The Claude system prompt is passed with
+  `--system-prompt-file` instead of a multi-line argv string.
+- **Fix: `The 'gpt-5' model is not supported when using Codex with a ChatGPT account`.** The Codex picker now offers current models
+  (gpt-5.5, gpt-5.4, gpt-5.4-mini; override with `CODEX_MODELS`, Claude: `CLAUDE_CODE_MODELS`), and a model the CLI refuses is retried
+  once on the CLI's own default (logged; the reply's model_name says `default`).
+- **`CODEX_WEB_MODE=live|cached`** for Codex's native search (cached = OpenAI's index: faster, fewer tokens, smaller injection surface).
+  Telemetry: `requested_model` now says `Default` when nothing was picked in the UI (it showed the Ollama LLM_MODEL placeholder).
+- **Real model in telemetry for CLI runners on Default.** Claude: from `modelUsage` in `claude -p` JSON. Codex (its events name no model):
+  the `turn_context` line of its own session log `~/.codex/sessions/.../rollout-*-<thread_id>.jsonl`, else `model` in `~/.codex/config.toml`
+  (never auth.json). Telemetry `model` shows it; `requested_model` stays `Default`.
+- **Runner-aware web search (`WEB_PROVIDER=app|native|auto`, default `auto`).** The subscription runners can now search the web with their own tool instead of the app's SearXNG path: Claude gets `WebSearch,WebFetch` only, Codex `-c web_search="live"` (Codex's search is on by default, so it is now explicitly `"disabled"` otherwise). `auto` uses it only for chats that are not repo-scoped, so code and client names never reach model-written queries. New `supports["web_search"]` capability on every runner, `native_web` in the runner status, `choose_web_provider()` in `services/web_provider.py`. Native web turns are slower and use more subscription quota. See `docs/SUBSCRIPTION_RUNNERS.md`. Tests: `tests/test_web_provider.py`.
 Fixes from re-running the same `/change` on v3.1.1 (revision 23 built on unapplied revision 22).
 ### Fixed
 - **Wrong default model and silent timeouts on `aistudio`.** The "Default" model pick sent `LLM_MODEL` (`gemma4:31b-cloud`), which the AI Studio table

@@ -22,7 +22,7 @@ from services.runners.openai_compat import OpenAICompatRunner, is_ollama_style
 class OpenAIRunner(OpenAICompatRunner):
     name = "openai"
     label = "OpenAI-compatible"
-    supports = {"vision": True, "json": True, "reasoning": False, "num_ctx": False, "embeddings": True}
+    supports = {"vision": True, "json": True, "reasoning": False, "num_ctx": False, "embeddings": True, "web_search": False}
 
     @property
     def remote(self) -> bool:               # type: ignore[override]
