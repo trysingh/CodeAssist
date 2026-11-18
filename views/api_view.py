@@ -19,6 +19,7 @@ from services.runner_info import check_chat_choice, models_payload, runners_payl
 from services.llm_errors import (InternalErrorMiddleware, ModelAuthError, ModelQuotaError, ModelTimeoutError, ModelUnavailableError,
                                  auth_error_response, quota_error_response, timeout_error_response, unavailable_error_response)
 from services import action_log
+from views.voice_routes import router as voice_router
 
 
 
@@ -28,6 +29,7 @@ app.add_exception_handler(ModelAuthError, auth_error_response)      # bad / miss
 app.add_exception_handler(ModelTimeoutError, timeout_error_response)            # the model endpoint hung (openai.APITimeoutError, httpx.ReadTimeout ...): readable 504 {"kind": "timeout"}
 app.add_exception_handler(ModelUnavailableError, unavailable_error_response)    # the model endpoint cannot be reached (connection refused / failed): readable 503
 app.add_middleware(InternalErrorMiddleware)     # anything else that escapes a route: JSON 500 {"detail": "Type: message", "kind": "internal"} + one logged traceback (HTTPException / validation errors never get here)
+app.include_router(voice_router)    # /api/v1/voice/*: speech-to-text, clean-English prompt, trigger phrases, read-aloud (services/speech)
 controller = EngineController()
 
 BASE_DIR = Path(__file__).resolve().parent.parent

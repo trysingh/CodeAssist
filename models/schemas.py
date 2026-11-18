@@ -65,3 +65,9 @@ class ChatRequest(BaseModel):
     model: str = ""                 # empty = server default
     runner: str = ""                # empty = the server's LLM_RUNNER; else a registered, configured runner (GET /api/v1/runners)
     token_mode: str = ""            # empty = server setting; auto | lean | normal
+
+
+class VoiceTextRequest(BaseModel):
+    """POST /api/v1/voice/refine (a browser-mode transcript) and /api/v1/voice/speak (text to read aloud)."""
+    text: str
+    runner: str = ""                # empty = the server's LLM_RUNNER; an unknown / unconfigured runner is treated as empty

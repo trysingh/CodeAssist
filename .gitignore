@@ -8,10 +8,11 @@
 # Python cache
 *.pyc
 __pycache__/
+certs/  
 
 # Specific storage folders
 .engine_storage/
 
 # OS generated files (Recommended)
 .DS_Store
-Thumbs.db
+Thumbs.dbcerts/

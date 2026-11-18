@@ -115,6 +115,11 @@ again for what the latest unapplied revision already implements (request >= 90% 
 
 
 
+## Voice input
+Mic button next to the paperclip (or `Ctrl/Cmd+Shift+M`): speak English / Hindi / Punjabi / Hinglish, pause 2.5 s, and a clean English prompt is appended to the
+box for review. End with "go ahead now" (or "ab bhejo", "अब भेजो") to send it. Speech-to-text follows your runner (Gemini, Cloudflare Whisper, OpenAI-compatible,
+OpenAI) or a self-hosted `speaches` server (`STT_BASE_URL`), with the browser's speech recognition as fallback. Details: [docs/VOICE_SETUP.md](docs/VOICE_SETUP.md).
+
 ## Runners (inference backends)
 Chat and embeddings go through `services/runners/`; the backend is a config choice. The default, `ollama`, is the behaviour the app always had.
 

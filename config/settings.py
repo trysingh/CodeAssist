@@ -19,6 +19,10 @@ class EngineSettings(BaseSettings):
      # ---- web UI ----
     host: str = "0.0.0.0"          # local tool, no auth: keep it on loopback unless you add auth
     port: int = 2026 
+    # HTTPS (needed for the voice mic from other devices). Empty = auto-detect a cert pair in <repo>/certs/ (e.g. mkcert output); none -> plain http.
+    ssl_certfile: str = Field(default="", validation_alias=AliasChoices("ENGINE_SSL_CERTFILE", "SSL_CERTFILE"))
+    ssl_keyfile: str = Field(default="", validation_alias=AliasChoices("ENGINE_SSL_KEYFILE", "SSL_KEYFILE"))
+    ssl_auto: bool = Field(default=True, validation_alias=AliasChoices("ENGINE_SSL_AUTO", "SSL_AUTO"))   # false = never auto-detect certs/
     
     # Ollama Configuration
     ollama_base_url: str = Field(default="http://localhost:11434")
@@ -337,6 +341,43 @@ class EngineSettings(BaseSettings):
     # Keep the phrase ASCII-only,
     apply_confirmation_phrase: str = Field(default="TYPE_APPLY_TO_CONFIRM")   # env: ENGINE_APPLY_CONFIRMATION_PHRASE; empty = no check
     
+    # ---- voice input / read-aloud (services/speech/, docs/VOICE_SETUP.md) ----
+    # Dictation into the prompt box. The browser records, detects the end of speech (voice_pause_ms of silence), and the server transcribes and tidies
+    # the audio into a clean English prompt. The speech-to-text provider is chosen independently of the chat runner (like the embedding runner):
+    # auto = follow the runner (aistudio -> Gemini, cloudflare -> Workers AI Whisper, openai -> OPENAI_COMPAT_* /audio/transcriptions,
+    # chatgpt_codex -> OPENAI_API_KEY), then a self-hosted STT_BASE_URL, then any other configured cloud provider. Nothing usable = the browser's
+    # own Web Speech API (mode "browser"). A spoken trigger phrase at the END of an utterance submits the prompt; plain end-of-speech never does.
+    voice_enabled: bool = Field(default=True, validation_alias=AliasChoices("ENGINE_VOICE_ENABLED", "VOICE_ENABLED"))
+    voice_pause_ms: int = Field(default=2500, validation_alias=AliasChoices("ENGINE_VOICE_PAUSE_MS", "VOICE_PAUSE_MS"))               # silence that ends an utterance
+    voice_max_seconds: int = Field(default=120, validation_alias=AliasChoices("ENGINE_VOICE_MAX_SECONDS", "VOICE_MAX_SECONDS"))       # one recording, hard cap
+    voice_max_bytes: int = Field(default=10 * 1024 * 1024, validation_alias=AliasChoices("ENGINE_VOICE_MAX_BYTES", "VOICE_MAX_BYTES"))  # upload cap (413 above)
+    voice_trigger_phrases: str = Field(default="go ahead now,process now,go ahead,submit now,send it now,ab bhejo,process karo,bhej do,अब भेजो,प्रोसेस करो",
+                                       validation_alias=AliasChoices("ENGINE_VOICE_TRIGGER_PHRASES", "VOICE_TRIGGER_PHRASES"))      # comma list
+    voice_translate_to_english: bool = Field(default=True, validation_alias=AliasChoices("ENGINE_VOICE_TRANSLATE_TO_ENGLISH", "VOICE_TRANSLATE_TO_ENGLISH"))
+    voice_refine_timeout_s: float = Field(default=30.0, validation_alias=AliasChoices("ENGINE_VOICE_REFINE_TIMEOUT_S", "VOICE_REFINE_TIMEOUT_S"))   # chat-model tidy-up of a transcript
+    # False = audio only ever goes to the provider you named (STT_PROVIDER, or the runner's own) and STT_BASE_URL; no cloud fallback chain.
+    voice_cloud_fallback: bool = Field(default=True, validation_alias=AliasChoices("ENGINE_VOICE_CLOUD_FALLBACK", "VOICE_CLOUD_FALLBACK"))
+    # auto | aistudio | cloudflare | openai_compat | openai | local | browser
+    stt_provider: str = Field(default="auto", validation_alias=AliasChoices("ENGINE_STT_PROVIDER", "STT_PROVIDER"))
+    # "local" = any OpenAI-compatible /v1/audio/transcriptions server (e.g. `speaches` on a home server)
+    stt_base_url: str = Field(default="", validation_alias=AliasChoices("ENGINE_STT_BASE_URL", "STT_BASE_URL"))
+    stt_api_key: str = Field(default="", validation_alias=AliasChoices("ENGINE_STT_API_KEY", "STT_API_KEY"))
+    stt_model: str = Field(default="Systran/faster-whisper-large-v3-turbo", validation_alias=AliasChoices("ENGINE_STT_MODEL", "STT_MODEL"))
+    stt_timeout_s: float = Field(default=60.0, validation_alias=AliasChoices("ENGINE_STT_TIMEOUT_S", "STT_TIMEOUT_S"))
+    openai_api_key: str = Field(default="", validation_alias=AliasChoices("ENGINE_OPENAI_API_KEY", "OPENAI_API_KEY"))     # speech-to-text only (chatgpt_codex users)
+    openai_stt_base_url: str = Field(default="https://api.openai.com/v1", validation_alias=AliasChoices("ENGINE_OPENAI_STT_BASE_URL", "OPENAI_STT_BASE_URL"))
+    openai_stt_model: str = Field(default="gpt-4o-transcribe", validation_alias=AliasChoices("ENGINE_OPENAI_STT_MODEL", "OPENAI_STT_MODEL"))
+    openai_compat_stt_model: str = Field(default="whisper-large-v3-turbo", validation_alias=AliasChoices("ENGINE_OPENAI_COMPAT_STT_MODEL", "OPENAI_COMPAT_STT_MODEL"))
+    cf_stt_model: str = Field(default="@cf/openai/whisper-large-v3-turbo", validation_alias=AliasChoices("ENGINE_CF_STT_MODEL", "CF_STT_MODEL"))
+    aistudio_stt_model: str = Field(default="gemini-2.5-flash", validation_alias=AliasChoices("ENGINE_AISTUDIO_STT_MODEL", "AISTUDIO_STT_MODEL"))
+    # Read replies aloud (optional, off by default). ollama = Ollama's OpenAI-style /v1/audio/speech with a TTS model (Phonon: Apple Silicon only
+    # today); browser = the browser's speechSynthesis; off = never. On any server error the client falls back to speechSynthesis.
+    tts_enabled: bool = Field(default=False, validation_alias=AliasChoices("ENGINE_TTS_ENABLED", "TTS_ENABLED"))
+    tts_provider: str = Field(default="ollama", validation_alias=AliasChoices("ENGINE_TTS_PROVIDER", "TTS_PROVIDER"))
+    tts_model: str = Field(default="phonon", validation_alias=AliasChoices("ENGINE_TTS_MODEL", "TTS_MODEL"))
+    tts_base_url: str = Field(default="", validation_alias=AliasChoices("ENGINE_TTS_BASE_URL", "TTS_BASE_URL"))            # "" = ollama_base_url
+    tts_voice: str = Field(default="", validation_alias=AliasChoices("ENGINE_TTS_VOICE", "TTS_VOICE"))
+
     # ENGINE_IGNORE_DOTENV=1 (set by tests/conftest.py): do not read .env, so a developer's real keys / runner never leak into tests
     model_config = SettingsConfigDict(env_prefix="ENGINE_", env_file=None if os.getenv("ENGINE_IGNORE_DOTENV") else ".env",
                                       extra="ignore")

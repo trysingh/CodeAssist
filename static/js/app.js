@@ -1193,6 +1193,7 @@ async function sendChatMessage(e) {
         col.insertAdjacentHTML('beforeend', msgHtml('assistant', result.answer, `<span>${((performance.now() - t0) / 1000).toFixed(1)}s</span>`, [], rid));
         icons();
         col.lastElementChild.scrollIntoView({ block: 'start' }); // start reading at the top of the answer
+        try { window.CodeAssistVoice && CodeAssistVoice.onAssistantReply(result.answer); } catch (e) { /* read-aloud is optional */ }
         if (result && result.base_system) {
             const connLabel = document.getElementById('conn-label');
             if (connLabel) {

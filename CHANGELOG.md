@@ -2,6 +2,16 @@
 
 ## v3.2 (unreleased)
 ### Added
+- **Voice input for the prompt box** (mic button next to the paperclip, `Ctrl/Cmd+Shift+M`). Speak English, Hindi, Punjabi or a mix; after `VOICE_PAUSE_MS`
+  (2500) of silence the audio is transcribed and tidied into a clean English prompt that is APPENDED to the box for review (code identifiers, paths and commands
+  kept verbatim, fillers removed). Plain end-of-speech never submits; a spoken trigger phrase at the end (`VOICE_TRIGGER_PHRASES`: "go ahead now", "process now",
+  "ab bhejo", "अब भेजो", ...) strips itself and submits through the normal send path. Speech-to-text is chosen independently of the chat runner
+  (`STT_PROVIDER=auto|aistudio|cloudflare|openai_compat|openai|local|browser`): auto follows the runner (aistudio -> Gemini, cloudflare -> Workers AI Whisper,
+  openai -> `OPENAI_COMPAT_BASE_URL` transcriptions, chatgpt_codex -> `OPENAI_API_KEY` gpt-4o-transcribe), then a self-hosted OpenAI-compatible server
+  (`STT_BASE_URL`, e.g. `speaches` on a NUC), then any other configured provider (`VOICE_CLOUD_FALLBACK=false` keeps audio on the named provider); none usable =
+  the browser's Web Speech API. The English tidy-up uses the chosen chat runner and never blocks: any failure keeps the raw transcript. New routes
+  `GET /api/v1/voice/config`, `POST /voice/transcribe`, `/voice/refine`, `/voice/speak`; optional "Read replies aloud" (Ollama `phonon` TTS or the browser's voice).
+  Setup: `docs/VOICE_SETUP.md`. Code: `services/speech/`, `views/voice_routes.py`, `static/js/voice.js`. Tests: `tests/test_voice.py`, `tests/js/test_voice_trigger.mjs`.
 - **Subscription runners `claude_code` and `chatgpt_codex`** (`LLM_RUNNER=claude_code` / `chatgpt_codex`): chat through your existing Claude Pro/Max or ChatGPT
   plan by running the vendors' official CLIs (`claude -p`, `codex exec`), which you log into yourself; no API key, and the app never reads their OAuth tokens
   or credential files (personal, single-user use). Chat only (keep `EMBEDDING_RUNNER=ollama`; setting it to these fails at startup). A "not logged in" output

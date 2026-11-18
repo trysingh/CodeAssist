@@ -595,3 +595,10 @@ html.dark {
   .act-row-d { padding-left: 1rem; }
   .act-live { min-width: 0; }
 }
+
+/* ---- Voice input (static/js/voice.js): idle / listening (pulsing red, --lvl = live level 0..1) / processing / error ---- */
+#mic-btn[data-state="listening"] { color: #fff; background: #dc2626; box-shadow: 0 0 0 calc(2px + var(--lvl, 0) * 9px) rgba(239, 68, 68, .35); animation: mic-pulse 1.4s ease-in-out infinite; }
+#mic-btn[data-state="processing"] { color: #60a5fa; cursor: progress; }
+#mic-btn[data-state="error"] { color: #ef4444; }
+@keyframes mic-pulse { 0%, 100% { background-color: #dc2626; } 50% { background-color: #ef4444; } }
+@media (prefers-reduced-motion: reduce) { #mic-btn[data-state="listening"] { animation: none; } }

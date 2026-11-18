@@ -234,6 +234,13 @@
                                             aria-label="Attach files" title="Attach files">
                                             <i data-lucide="paperclip" class="w-4 h-4"></i>
                                         </button>
+                                        <!-- Voice input (static/js/voice.js): hidden until /api/v1/voice/config says it can work in this browser -->
+                                        <button id="mic-btn" type="button" style="display:none"
+                                            class="order-2 sm:order-1 shrink-0 w-9 h-9 rounded-xl text-slate-400 hover:text-white hover:bg-slate-800 disabled:opacity-40 flex items-center justify-center transition-colors"
+                                            aria-label="Voice input" aria-pressed="false" title="Voice input (Ctrl+Shift+M)" data-state="idle">
+                                            <span id="mic-ico-idle"><i data-lucide="mic" class="w-4 h-4"></i></span>
+                                            <span id="mic-ico-busy" class="hidden"><i data-lucide="loader-2" class="w-4 h-4 animate-spin"></i></span>
+                                        </button>
                                         <button id="web-btn" type="button" onclick="cycleWeb()"
                                             class="order-3 sm:order-1 shrink-0 h-9 px-2.5 rounded-xl text-xs font-medium border border-slate-300 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white hover:bg-slate-200 dark:hover:bg-slate-800 data-[mode=on]:border-blue-500/50 data-[mode=on]:text-blue-300 data-[mode=on]:bg-blue-600/10 data-[mode=off]:text-slate-500 transition-colors"
                                             data-mode="auto" aria-label="Web search mode">
@@ -277,6 +284,18 @@
                                                 <label class="flex items-center gap-2 text-[11px] font-medium text-slate-500" title="While a request runs: a live timer toast with the elapsed time against the runner's per-call limit">
                                                     <input id="task-timer-toggle" type="checkbox" checked class="rounded border-slate-300 dark:border-slate-600"> Show task timer
                                                 </label>
+                                                                <label class="block text-[11px] font-medium text-slate-500" title="Language the browser's speech recognition listens for (server transcription detects it by itself). The prompt is always written in English.">Voice language
+                                                    <select id="voice-lang" aria-label="Voice language"
+                                            class="mt-1 w-full h-9 px-2 rounded-lg text-xs bg-slate-100 dark:bg-slate-800 border border-slate-300 dark:border-slate-700 text-slate-900 dark:text-slate-200 focus:outline-none focus:border-blue-500/70">
+                                            <option value="auto">Auto (English India)</option>
+                                            <option value="en">English (India)</option>
+                                            <option value="hi">Hindi</option>
+                                            <option value="pa">Punjabi</option>
+                                        </select>
+                                                </label>
+                                                <label class="flex items-center gap-2 text-[11px] font-medium text-slate-500" title="Speak each finished reply (server TTS if configured, else the browser's voice)">
+                                                    <input id="voice-tts" type="checkbox" class="rounded border-slate-300 dark:border-slate-600"> Read replies aloud
+                                                </label>
                                                 <p class="text-[10px] leading-snug text-slate-500">Auto = lean on paid runners, normal on local ones. Normal sends full context, as before. Saved in this browser.</p>
                                             </div>
                                         </div>
@@ -292,6 +311,7 @@
                                         </button>
                                     </div>
                                 </form>
+                                <p id="voice-status" role="status" aria-live="polite" class="hidden max-w-3xl mx-auto text-[11px] text-slate-500 mt-1.5 px-2 truncate data-[kind=error]:text-red-500 data-[kind=warn]:text-amber-500"></p>
                                 <p class="max-w-3xl mx-auto text-[11px] text-slate-600 mt-1.5 px-2 hidden sm:block">
                                     Enter to send · Shift+Enter for a new line · / to focus · Paste images or files with
                                     Ctrl+V</p>
@@ -515,7 +535,8 @@
     </div>
 
     <script src="/static/js/activity.js?v=1"></script>
-    <script src="/static/js/app.js?v=6"></script>
+    <script src="/static/js/app.js?v=7"></script>
+    <script src="/static/js/voice.js?v=1"></script>
 </body>
 
 </html>

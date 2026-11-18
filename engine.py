@@ -9,10 +9,37 @@ Supports:
   > python engine.py serve --port 8000
 """
 import argparse
+import os
 import sys
 import uvicorn
 from views.cli_view import CLIView
 from config.settings import settings
+
+def _tls_options():
+    """uvicorn TLS kwargs, or {} for plain http. Never fails the launch: a bad/missing cert logs a warning and falls back to http.
+    Order: SSL_CERTFILE + SSL_KEYFILE (env / .env) -> first *.pem pair in <repo>/certs/ (mkcert names: X.pem + X-key.pem)."""
+    from pathlib import Path
+    cert, key = (settings.ssl_certfile or "").strip(), (settings.ssl_keyfile or "").strip()
+    if not (cert and key) and settings.ssl_auto:
+        certs = Path(__file__).resolve().parent / "certs"
+        for c in sorted(certs.glob("*.pem")) if certs.is_dir() else []:
+            k = c.with_name(c.stem + "-key.pem")
+            if not c.stem.endswith("-key") and k.is_file():
+                cert, key = str(c), str(k)
+                break
+    if not (cert and key):
+        return {}
+    if not (os.path.isfile(cert) and os.path.isfile(key)):
+        print(f"       WARNING: TLS cert/key not found ({cert}, {key}); serving plain http", flush=True)
+        return {}
+    try:
+        import ssl
+        ssl.create_default_context(ssl.Purpose.CLIENT_AUTH).load_cert_chain(cert, key)
+    except Exception as exc:  # noqa: BLE001
+        print(f"       WARNING: TLS cert unusable ({exc}); serving plain http", flush=True)
+        return {}
+    return {"ssl_certfile": cert, "ssl_keyfile": key}
+
 
 def main():
     parser = argparse.ArgumentParser(description="Scalable Multi-Strategy Code Chunking & RAG Engine")
@@ -39,7 +66,10 @@ def main():
         print(" = " * 30)
         print(f"       Trying to connect to Ollama at {settings.ollama_base_url}", flush=True)
         print(" = " * 30)
-        uvicorn.run("views.api_view:app", host=settings.host, port=settings.port, reload=False)
+        tls = _tls_options()
+        print(f"       Serving on {'https' if tls else 'http'}://{settings.host}:{settings.port}"
+              + (f" (cert {tls['ssl_certfile']})" if tls else ""), flush=True)
+        uvicorn.run("views.api_view:app", host=settings.host, port=settings.port, reload=False, **tls)
         return
 
     if args.command == "ingest":
